@@ -37,7 +37,7 @@ func vectorizerModule() string {
 	return "none"
 }
 
-const testClass = "WeaviatePluginTestArticle"
+const testClass = "Article"
 
 var rawClient *weaviate.Client // direct client for schema/seed work
 
