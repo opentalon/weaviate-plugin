@@ -1,0 +1,43 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: weaviate
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://weaviate.github.io/weaviate-helm
+    chart: weaviate
+    targetRevision: 17.8.0
+    helm:
+      values: |
+        image:
+          tag: 1.30.0
+        replicas: 1
+        storage:
+          size: 32Gi
+        authentication:
+          anonymous_access:
+            enabled: true
+        default_vectorizer_module: text2vec-contextionary
+        modules:
+          text2vec-contextionary:
+            enabled: true
+        grpcService:
+          enabled: true
+        resources:
+          requests:
+            cpu: "1"
+            memory: "2Gi"
+          limits:
+            cpu: "2"
+            memory: "4Gi"
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: weaviate
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

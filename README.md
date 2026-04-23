@@ -317,6 +317,73 @@ plugins:
 
 The orchestrator can call `sync_actions` at startup to index all plugin capabilities into the `MCPActions` collection. External systems can push knowledge articles via the HTTP API.
 
+## Kubernetes Deployment (ArgoCD)
+
+Deploy Weaviate to Kubernetes using the included ArgoCD Application manifest.
+
+### Prerequisites
+
+- Kubernetes 1.23+
+- ArgoCD installed in the `argocd` namespace
+- PersistentVolume provisioner available in the cluster
+
+### Deploy
+
+```bash
+kubectl apply -f deploy/weaviate/application.yaml
+```
+
+ArgoCD will automatically:
+- Create the `weaviate` namespace
+- Install Weaviate 1.30.0 via the official Helm chart (v17.8.0)
+- Enable `text2vec-contextionary` for semantic search
+- Provision a 32Gi persistent volume
+- Auto-sync and self-heal
+
+### Verify
+
+```bash
+# Check ArgoCD status
+argocd app get weaviate
+
+# Check pod is running
+kubectl -n weaviate get pods
+
+# Check readiness
+kubectl -n weaviate exec svc/weaviate -- wget -qO- http://localhost:8080/v1/.well-known/ready
+```
+
+### Connect the plugin
+
+Once Weaviate is running in-cluster, point the plugin at the Kubernetes service:
+
+```yaml
+plugins:
+  - name: weaviate
+    plugin: /usr/local/bin/weaviate-plugin
+    enabled: true
+    config:
+      host: "weaviate.weaviate.svc.cluster.local:8080"
+      scheme: "http"
+      collection: "Article"
+      fields: [title, body]
+      limit: 5
+      auto_create_schema: true
+```
+
+### Customization
+
+Edit the inline `helm.values` block in `deploy/weaviate/application.yaml` to adjust:
+
+| Setting | Default | Description |
+|---|---|---|
+| `image.tag` | `1.30.0` | Weaviate version |
+| `replicas` | `1` | Number of nodes (increase for HA) |
+| `storage.size` | `32Gi` | Persistent volume size |
+| `resources.requests.cpu` | `1` | CPU request |
+| `resources.requests.memory` | `2Gi` | Memory request |
+| `authentication.anonymous_access.enabled` | `true` | Set `false` and configure API keys for production |
+
 ## References
 
 - Weaviate Go client: https://github.com/weaviate/weaviate-go-client
