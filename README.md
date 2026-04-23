@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/opentalon/weaviate-plugin/actions/workflows/ci.yml/badge.svg)](https://github.com/opentalon/weaviate-plugin/actions/workflows/ci.yml)
 
-An [OpenTalon](https://github.com/opentalon/opentalon) plugin that performs semantic and hybrid search over a [Weaviate](https://github.com/weaviate/weaviate) vector database collection. Use it as a retrieval step (RAG) to fetch relevant context before the LLM generates a response.
+An [OpenTalon](https://github.com/opentalon/opentalon) plugin that performs semantic and hybrid search over a [Weaviate](https://github.com/weaviate/weaviate) vector database collection. Use it as a retrieval step (RAG) to fetch relevant context before the LLM generates a response, manage MCP action indexing, and ingest knowledge articles.
 
 ## Actions
 
@@ -11,6 +11,9 @@ An [OpenTalon](https://github.com/opentalon/opentalon) plugin that performs sema
 | `weaviate.search` | LLM tool | nearText semantic search — the LLM calls this when it decides retrieval is needed |
 | `weaviate.hybrid_search` | LLM tool | Hybrid BM25 + vector. `alpha`: `0` = keyword only, `1` = vector only (default `0.5`) |
 | `weaviate.prepare` | **preparer** | Automatic RAG: runs before every LLM call, enriches the user message with retrieved context |
+| `weaviate.sync_actions` | orchestrator | Upserts plugin action definitions into the `MCPActions` collection for retrieval-based tool filtering |
+| `weaviate.ingest` | LLM tool / API | Insert a single knowledge article into the `KnowledgeArticles` collection |
+| `weaviate.ingest_batch` | LLM tool / API | Batch insert multiple knowledge articles |
 
 `search` and `hybrid_search` accept `limit` and `fields` per-call overrides.
 
@@ -18,12 +21,12 @@ An [OpenTalon](https://github.com/opentalon/opentalon) plugin that performs sema
 
 **Tool mode** (default) — the LLM decides when to retrieve:
 ```
-user → LLM decides to call weaviate.search → results → LLM → answer
+user -> LLM decides to call weaviate.search -> results -> LLM -> answer
 ```
 
 **Preparer mode** — retrieval is automatic, invisible to the LLM as a tool choice:
 ```
-user message → weaviate.prepare(text=message) → [retrieved_context]…message → LLM → answer
+user message -> weaviate.prepare(text=message) -> [retrieved_context]...message -> LLM -> answer
 ```
 
 Use preparer mode when you always want retrieved context in the prompt (RAG-by-default). Use tool mode when retrieval should be conditional.
@@ -40,15 +43,89 @@ plugins:
     config:
       host: "localhost:8080"       # Weaviate address
       scheme: "http"               # "http" or "https"
-      collection: "Article"        # Weaviate class to search
-      fields:                      # fields to return in results
+      collection: "Article"        # Weaviate class for search/hybrid_search/prepare
+      fields:                      # fields to return in search results
         - title
         - body
         - url
       limit: 5                     # default result count
+
+      # Knowledge-augmented RAG (Phase 1)
+      actions_collection: "MCPActions"           # collection for indexed plugin capabilities (default)
+      knowledge_collection: "KnowledgeArticles"  # collection for knowledge articles (default)
+      auto_create_schema: true                   # auto-create MCPActions & KnowledgeArticles on startup (default true)
+
+      # HTTP ingestion server (optional)
+      http_addr: ":8081"           # address for the HTTP ingestion API
+      token: "my-secret-token"     # Bearer token — required when http_addr is set
 ```
 
 The `collection` field is required. All others have defaults (`host: localhost:8080`, `scheme: http`, `limit: 5`).
+
+### Auto-schema creation
+
+When `auto_create_schema` is `true` (the default), the plugin creates two Weaviate collections on startup if they don't already exist:
+
+| Collection | Properties | Purpose |
+|---|---|---|
+| `MCPActions` | `pluginName`, `actionName`, `description`, `parameters` | Indexed plugin capabilities for retrieval-based tool filtering |
+| `KnowledgeArticles` | `title`, `content`, `source`, `tags` | Domain knowledge and how-to guides |
+
+Set `auto_create_schema: false` to manage schemas manually.
+
+## HTTP Ingestion API
+
+When `http_addr` is configured, the plugin starts a token-protected HTTP server for external article and action ingestion. A `token` must be set — the plugin refuses to start without one.
+
+All endpoints require the header `Authorization: Bearer <token>`.
+
+### POST /api/v1/articles
+
+Ingest a single knowledge article.
+
+```bash
+curl -X POST http://localhost:8081/api/v1/articles \
+  -H "Authorization: Bearer my-secret-token" \
+  -H "Content-Type: application/json" \
+  -d '{"title":"Deployment guide","content":"Steps to deploy...","source":"wiki","tags":["ops","deploy"]}'
+```
+
+Response: `{"ingested":1}`
+
+### POST /api/v1/articles/batch
+
+Batch ingest multiple articles.
+
+```bash
+curl -X POST http://localhost:8081/api/v1/articles/batch \
+  -H "Authorization: Bearer my-secret-token" \
+  -H "Content-Type: application/json" \
+  -d '[
+    {"title":"Article 1","content":"Content 1.","tags":["guide"]},
+    {"title":"Article 2","content":"Content 2.","source":"docs"}
+  ]'
+```
+
+Response: `{"ingested":2}`
+
+### POST /api/v1/actions/sync
+
+Sync plugin action definitions into the MCPActions collection. Uses deterministic UUIDs so repeated syncs upsert rather than duplicate.
+
+```bash
+curl -X POST http://localhost:8081/api/v1/actions/sync \
+  -H "Authorization: Bearer my-secret-token" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "plugin_name": "jira",
+    "actions": [
+      {"name": "create_issue", "description": "Create a Jira issue", "parameters": [{"name":"project","type":"string"}]},
+      {"name": "list_issues", "description": "List open issues"}
+    ]
+  }'
+```
+
+Response: `{"synced":2}`
 
 ## Install
 
@@ -139,10 +216,14 @@ The integration job uses Docker service containers declared in the workflow — 
 
 | Test | Needs vectorizer | What it checks |
 |---|---|---|
-| `TestCapabilities` | no | Plugin declares correct name and actions |
-| `TestConfigure_defaults` | no | Default limit=5 applied, client constructed |
+| `TestCapabilities` | no | Plugin declares correct name and all 6 actions |
+| `TestConfigure_defaults` | no | Default limit=5, default collection names applied |
 | `TestConfigure_missingCollection` | no | Error returned when collection omitted |
 | `TestConfigure_badJSON` | no | Error returned for malformed config |
+| `TestConfigure_httpRequiresToken` | no | Error when http_addr set without token |
+| `TestConfigure_customCollectionNames` | no | Custom actions/knowledge collection names are applied |
+| `TestConfigure_autoCreateSchema` | no | MCPActions and KnowledgeArticles created on startup |
+| `TestConfigure_autoCreateSchemaIdempotent` | no | Repeated Configure with auto_create_schema does not fail |
 | `TestExecute_unknownAction` | no | Error returned for unrecognised action |
 | `TestHybridSearch_keywordOnly` | no | BM25 (alpha=0) returns the Python article for "python" |
 | `TestHybridSearch_limitOverride` | no | `limit=1` returns exactly one result |
@@ -150,6 +231,25 @@ The integration job uses Docker service containers declared in the workflow — 
 | `TestSearch_semantic` | **yes** | nearText "vector database" returns the Weaviate article |
 | `TestSearch_missingQuery` | no | Error returned when query arg is absent |
 | `TestHybridSearch_missingQuery` | no | Error returned when query arg is absent |
+| `TestSyncActions` | no | Sync 2 actions, verify synced count |
+| `TestSyncActions_upsert` | no | Re-sync with updated description succeeds |
+| `TestSyncActions_missingPayload` | no | Error when payload arg is absent |
+| `TestSyncActions_missingPluginName` | no | Error when plugin_name is missing from payload |
+| `TestSyncActions_emptyActions` | no | Empty actions array returns synced:0 |
+| `TestIngest` | no | Ingest single article with all fields |
+| `TestIngest_missingFields` | no | Error when title or content is missing |
+| `TestIngest_noOptionalFields` | no | Ingest with only title and content succeeds |
+| `TestIngestBatch` | no | Batch ingest 3 articles |
+| `TestIngestBatch_missingPayload` | no | Error when payload arg is absent |
+| `TestIngestBatch_skipsInvalid` | no | Invalid articles (missing title/content) are skipped |
+| `TestIngestBatch_badJSON` | no | Error for malformed JSON payload |
+| `TestHTTP_ingestArticle` | no | HTTP POST article with valid token succeeds |
+| `TestHTTP_ingestArticleUnauthorized` | no | HTTP POST without token returns 401 |
+| `TestHTTP_ingestArticleWrongToken` | no | HTTP POST with wrong token returns 401 |
+| `TestHTTP_syncActions` | no | HTTP POST sync_actions with valid token succeeds |
+| `TestHTTP_ingestBatch` | no | HTTP POST batch with valid token succeeds |
+| `TestHTTP_badJSON` | no | HTTP POST with invalid JSON returns 400 |
+| `TestHTTP_noTokenConfigured` | no | Requests pass through when no token is configured |
 
 ## Wiring into OpenTalon
 
@@ -195,9 +295,32 @@ content_preparers:
 
 With `fail_open: true` and the plugin's own fail-open logic, a Weaviate outage never blocks the LLM call.
 
+### Knowledge-augmented RAG mode
+
+Enable the HTTP ingestion API and auto-schema creation to build a knowledge base alongside MCP action indexing:
+
+```yaml
+plugins:
+  - name: weaviate
+    plugin: /usr/local/bin/weaviate-plugin
+    enabled: true
+    config:
+      host: "localhost:8080"
+      scheme: "http"
+      collection: "Article"
+      fields: [title, body]
+      limit: 5
+      auto_create_schema: true
+      http_addr: ":8081"
+      token: "my-secret-token"
+```
+
+The orchestrator can call `sync_actions` at startup to index all plugin capabilities into the `MCPActions` collection. External systems can push knowledge articles via the HTTP API.
+
 ## References
 
 - Weaviate Go client: https://github.com/weaviate/weaviate-go-client
 - Weaviate server: https://github.com/weaviate/weaviate
 - Contextionary: https://github.com/weaviate/contextionary
 - OpenTalon plugin SDK: https://github.com/opentalon/opentalon (see `pkg/plugin`)
+- Knowledge-augmented RAG issue: https://github.com/opentalon/opentalon/issues/97
