@@ -1124,3 +1124,180 @@ func TestPrepare_knowledgeAndActionsBlocks(t *testing.T) {
 		t.Error("expected [actions] block in message")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Integration tests — ask_knowledge (Phase 3)
+// ---------------------------------------------------------------------------
+
+func TestAskKnowledge(t *testing.T) {
+	h := newHandler(t)
+
+	resp := h.Execute(plugin.Request{
+		ID:     "ask-1",
+		Action: "ask_knowledge",
+		Args:   map[string]string{"query": "Kubernetes deployment ArgoCD Helm"},
+	})
+
+	if resp.Error != "" {
+		t.Fatalf("Execute error: %s", resp.Error)
+	}
+	if resp.Content == "" {
+		t.Fatal("expected non-empty response")
+	}
+	// Should contain knowledge articles section.
+	if !strings.Contains(resp.Content, "Knowledge Articles") {
+		t.Logf("response: %s", resp.Content)
+		t.Error("expected Knowledge Articles section in response")
+	}
+}
+
+func TestAskKnowledge_returnsTools(t *testing.T) {
+	h := newHandler(t)
+
+	resp := h.Execute(plugin.Request{
+		ID:     "ask-tools",
+		Action: "ask_knowledge",
+		Args:   map[string]string{"query": "Create a new issue in the Jira project tracker"},
+	})
+
+	if resp.Error != "" {
+		t.Fatalf("Execute error: %s", resp.Error)
+	}
+	if !strings.Contains(resp.Content, "Available Tools") {
+		t.Logf("response: %s", resp.Content)
+		t.Error("expected Available Tools section in response")
+	}
+}
+
+func TestAskKnowledge_missingQuery(t *testing.T) {
+	h := newHandler(t)
+
+	resp := h.Execute(plugin.Request{
+		ID:     "ask-err",
+		Action: "ask_knowledge",
+		Args:   map[string]string{},
+	})
+	if resp.Error == "" {
+		t.Error("expected error for missing query, got none")
+	}
+}
+
+func TestAskKnowledge_pluginFilter(t *testing.T) {
+	h := newHandler(t)
+
+	resp := h.Execute(plugin.Request{
+		ID:     "ask-plugin",
+		Action: "ask_knowledge",
+		Args: map[string]string{
+			"query":  "create issue merge request",
+			"plugin": "jira",
+		},
+	})
+
+	if resp.Error != "" {
+		t.Fatalf("Execute error: %s", resp.Error)
+	}
+
+	// Should not contain gitlab tools when filtered to jira.
+	if strings.Contains(resp.Content, "gitlab.") {
+		t.Error("expected no gitlab tools when plugin=jira")
+	}
+}
+
+func TestAskKnowledge_sourceFilter(t *testing.T) {
+	h := newHandler(t)
+
+	resp := h.Execute(plugin.Request{
+		ID:     "ask-source",
+		Action: "ask_knowledge",
+		Args: map[string]string{
+			"query":  "Kubernetes deployment",
+			"source": "wiki",
+		},
+	})
+
+	if resp.Error != "" {
+		t.Fatalf("Execute error: %s", resp.Error)
+	}
+	// Should succeed; source filter narrows to wiki articles.
+	if resp.Content == "" {
+		t.Fatal("expected non-empty response")
+	}
+}
+
+func TestAskKnowledge_allowedPlugins(t *testing.T) {
+	h := newHandler(t)
+
+	allowed, _ := json.Marshal([]string{"gitlab"})
+	resp := h.Execute(plugin.Request{
+		ID:     "ask-allowed",
+		Action: "ask_knowledge",
+		Args: map[string]string{
+			"query":            "create issue merge request pipelines",
+			"allowed_plugins":  string(allowed),
+		},
+	})
+
+	if resp.Error != "" {
+		t.Fatalf("Execute error: %s", resp.Error)
+	}
+
+	// Should not contain jira tools when allowed_plugins=["gitlab"].
+	if strings.Contains(resp.Content, "jira.") {
+		t.Error("expected no jira tools when allowed_plugins=[gitlab]")
+	}
+}
+
+func TestAskKnowledge_limitOverride(t *testing.T) {
+	h := newHandler(t)
+
+	resp := h.Execute(plugin.Request{
+		ID:     "ask-limit",
+		Action: "ask_knowledge",
+		Args: map[string]string{
+			"query": "issue",
+			"limit": "1",
+		},
+	})
+
+	if resp.Error != "" {
+		t.Fatalf("Execute error: %s", resp.Error)
+	}
+	if resp.Content == "" {
+		t.Fatal("expected non-empty response")
+	}
+}
+
+func TestAskKnowledge_noResults(t *testing.T) {
+	h := newHandler(t)
+
+	resp := h.Execute(plugin.Request{
+		ID:     "ask-noresults",
+		Action: "ask_knowledge",
+		Args: map[string]string{
+			"query":  "completely irrelevant xyzzy foobar",
+			"source": "nonexistent-source-that-has-no-articles",
+		},
+	})
+
+	if resp.Error != "" {
+		t.Fatalf("Execute error: %s", resp.Error)
+	}
+	// With a very restrictive filter, we may get no results.
+	// The response should still be valid (either empty message or "No relevant results").
+	if resp.Content == "" {
+		t.Fatal("expected non-empty response even with no results")
+	}
+}
+
+func TestCapabilities_includesAskKnowledge(t *testing.T) {
+	caps := (&WeaviateHandler{}).Capabilities()
+
+	actions := make(map[string]bool, len(caps.Actions))
+	for _, a := range caps.Actions {
+		actions[a.Name] = true
+	}
+	if !actions["ask_knowledge"] {
+		t.Error("missing ask_knowledge action in capabilities")
+	}
+}

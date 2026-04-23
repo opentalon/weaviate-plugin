@@ -207,6 +207,17 @@ func (h *WeaviateHandler) Capabilities() plugin.CapabilitiesMsg {
 					{Name: "payload", Description: `JSON array: [{"title":"...","content":"...","source":"...","tags":["..."]}]`, Type: "string", Required: true},
 				},
 			},
+			{
+				Name:        "ask_knowledge",
+				Description: "Search the knowledge base for product docs, how-to guides, and tool descriptions. Use BEFORE asking the user when you need more context.",
+				Parameters: []plugin.ParameterMsg{
+					{Name: "query", Description: "Natural language question for knowledge base search", Type: "string", Required: true},
+					{Name: "plugin", Description: "Narrow results to a specific plugin (e.g. 'jira')", Type: "string", Required: false},
+					{Name: "source", Description: "Filter knowledge articles by source identifier (e.g. 'help-center')", Type: "string", Required: false},
+					{Name: "limit", Description: "Maximum results per collection (default 3)", Type: "integer", Required: false},
+					{Name: "allowed_plugins", Description: "JSON array of allowed plugin names (injected by orchestrator)", Type: "string", Required: false},
+				},
+			},
 		},
 	}
 }
@@ -229,6 +240,8 @@ func (h *WeaviateHandler) Execute(req plugin.Request) plugin.Response {
 		return h.ingest(req)
 	case "ingest_batch":
 		return h.ingestBatch(req)
+	case "ask_knowledge":
+		return h.askKnowledge(req)
 	default:
 		return plugin.Response{CallID: req.ID, Error: fmt.Sprintf("unknown action %q", req.Action)}
 	}
@@ -392,41 +405,12 @@ func (h *WeaviateHandler) searchCollection(
 // extractToolNames extracts "pluginName.actionName" strings from an MCPActions
 // GraphQL response.
 func extractToolNames(result interface{}, className string) []string {
-	if result == nil {
-		return []string{}
-	}
-	b, err := json.Marshal(result)
-	if err != nil {
-		return []string{}
-	}
-	var raw map[string]interface{}
-	if err := json.Unmarshal(b, &raw); err != nil {
-		return []string{}
-	}
-
-	// The GraphQL response may be {"Get": {...}} or {"data": {"Get": {...}}}.
-	get, ok := raw["Get"].(map[string]interface{})
-	if !ok {
-		if data, ok := raw["data"].(map[string]interface{}); ok {
-			get, ok = data["Get"].(map[string]interface{})
-			if !ok {
-				return []string{}
-			}
-		} else {
-			return []string{}
-		}
-	}
-
-	items, ok := get[className].([]interface{})
-	if !ok {
+	items := extractItems(result, className)
+	if len(items) == 0 {
 		return []string{}
 	}
 	tools := make([]string, 0, len(items))
-	for _, item := range items {
-		obj, ok := item.(map[string]interface{})
-		if !ok {
-			continue
-		}
+	for _, obj := range items {
 		pluginName, _ := obj["pluginName"].(string)
 		actionName, _ := obj["actionName"].(string)
 		if pluginName != "" && actionName != "" {
@@ -442,7 +426,175 @@ func marshalPrepareResponse(callID string, resp prepareResponse) plugin.Response
 }
 
 // ---------------------------------------------------------------------------
-// RAG ingestion actions (new)
+// ask_knowledge — LLM-callable knowledge base query (Phase 3)
+// ---------------------------------------------------------------------------
+
+func (h *WeaviateHandler) askKnowledge(req plugin.Request) plugin.Response {
+	query, ok := req.Args["query"]
+	if !ok || query == "" {
+		return plugin.Response{CallID: req.ID, Error: "query is required"}
+	}
+
+	ctx := context.Background()
+
+	limit := 3
+	if v, ok := req.Args["limit"]; ok && v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			limit = n
+		}
+	}
+
+	// Build plugin filter for MCPActions.
+	var actionsWhere *filters.WhereBuilder
+	if p := req.Args["plugin"]; p != "" {
+		// Specific plugin filter takes precedence.
+		actionsWhere = filters.Where().
+			WithPath([]string{"pluginName"}).
+			WithOperator(filters.Equal).
+			WithValueText(p)
+	} else if v, ok := req.Args["allowed_plugins"]; ok && v != "" {
+		var allowedPlugins []string
+		if err := json.Unmarshal([]byte(v), &allowedPlugins); err == nil && len(allowedPlugins) > 0 {
+			actionsWhere = filters.Where().
+				WithPath([]string{"pluginName"}).
+				WithOperator(filters.ContainsAny).
+				WithValueText(allowedPlugins...)
+		}
+	}
+
+	// Build source filter for KnowledgeArticles.
+	var knowledgeWhere *filters.WhereBuilder
+	if s := req.Args["source"]; s != "" {
+		knowledgeWhere = filters.Where().
+			WithPath([]string{"source"}).
+			WithOperator(filters.Equal).
+			WithValueText(s)
+	}
+
+	// Search both collections.
+	knowledgeFields := []graphql.Field{
+		{Name: "title"}, {Name: "content"}, {Name: "source"},
+		{Name: "_additional", Fields: []graphql.Field{{Name: "score"}}},
+	}
+	knowledgeResult, knowledgeErr := h.searchCollection(ctx, h.knowledgeCollection, knowledgeFields, query, limit, knowledgeWhere)
+
+	actionFields := []graphql.Field{
+		{Name: "pluginName"}, {Name: "actionName"}, {Name: "description"}, {Name: "parameters"},
+		{Name: "_additional", Fields: []graphql.Field{{Name: "score"}}},
+	}
+	actionsResult, actionsErr := h.searchCollection(ctx, h.actionsCollection, actionFields, query, limit, actionsWhere)
+
+	if knowledgeErr != nil && actionsErr != nil {
+		return plugin.Response{CallID: req.ID, Error: fmt.Sprintf("knowledge search failed: %v; actions search failed: %v", knowledgeErr, actionsErr)}
+	}
+
+	// Format results as human-readable text.
+	var sections []string
+
+	if knowledgeErr == nil {
+		if text := formatKnowledgeResults(knowledgeResult, h.knowledgeCollection); text != "" {
+			sections = append(sections, text)
+		}
+	}
+	if actionsErr == nil {
+		if text := formatActionResults(actionsResult, h.actionsCollection); text != "" {
+			sections = append(sections, text)
+		}
+	}
+
+	if len(sections) == 0 {
+		return plugin.Response{CallID: req.ID, Content: "No relevant results found."}
+	}
+
+	return plugin.Response{CallID: req.ID, Content: strings.Join(sections, "\n\n")}
+}
+
+// formatKnowledgeResults formats KnowledgeArticles results as readable text.
+func formatKnowledgeResults(result interface{}, className string) string {
+	items := extractItems(result, className)
+	if len(items) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	sb.WriteString("## Knowledge Articles\n")
+	for i, item := range items {
+		title, _ := item["title"].(string)
+		content, _ := item["content"].(string)
+		source, _ := item["source"].(string)
+		if title == "" && content == "" {
+			continue
+		}
+		fmt.Fprintf(&sb, "\n### %d. %s\n", i+1, title)
+		if source != "" {
+			fmt.Fprintf(&sb, "Source: %s\n", source)
+		}
+		fmt.Fprintf(&sb, "%s\n", content)
+	}
+	return sb.String()
+}
+
+// formatActionResults formats MCPActions results as readable text.
+func formatActionResults(result interface{}, className string) string {
+	items := extractItems(result, className)
+	if len(items) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	sb.WriteString("## Available Tools\n")
+	for i, item := range items {
+		pluginName, _ := item["pluginName"].(string)
+		actionName, _ := item["actionName"].(string)
+		description, _ := item["description"].(string)
+		if pluginName == "" || actionName == "" {
+			continue
+		}
+		fmt.Fprintf(&sb, "\n### %d. %s.%s\n", i+1, pluginName, actionName)
+		if description != "" {
+			fmt.Fprintf(&sb, "%s\n", description)
+		}
+	}
+	return sb.String()
+}
+
+// extractItems drills into a GraphQL response and returns the result objects.
+func extractItems(result interface{}, className string) []map[string]interface{} {
+	if result == nil {
+		return nil
+	}
+	b, err := json.Marshal(result)
+	if err != nil {
+		return nil
+	}
+	var raw map[string]interface{}
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return nil
+	}
+
+	get, ok := raw["Get"].(map[string]interface{})
+	if !ok {
+		if data, ok := raw["data"].(map[string]interface{}); ok {
+			get, _ = data["Get"].(map[string]interface{})
+		}
+	}
+	if get == nil {
+		return nil
+	}
+
+	arr, ok := get[className].([]interface{})
+	if !ok {
+		return nil
+	}
+	items := make([]map[string]interface{}, 0, len(arr))
+	for _, v := range arr {
+		if obj, ok := v.(map[string]interface{}); ok {
+			items = append(items, obj)
+		}
+	}
+	return items
+}
+
+// ---------------------------------------------------------------------------
+// RAG ingestion actions
 // ---------------------------------------------------------------------------
 
 type syncActionsPayload struct {
