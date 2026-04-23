@@ -964,7 +964,7 @@ func TestPrepare_returnsRelevantTools(t *testing.T) {
 	resp := h.Execute(plugin.Request{
 		ID:     "prepare-tools",
 		Action: "prepare",
-		Args:   map[string]string{"text": "create issue in jira project tracker"},
+		Args:   map[string]string{"text": "Create a new issue in the Jira project tracker list open issues"},
 	})
 
 	if resp.Error != "" {
@@ -977,7 +977,8 @@ func TestPrepare_returnsRelevantTools(t *testing.T) {
 	}
 
 	if len(result.RelevantTools) == 0 {
-		t.Error("expected relevant_tools to be populated")
+		t.Logf("prepare response: %s", resp.Content)
+		t.Fatal("expected relevant_tools to be populated")
 	}
 
 	// Verify tool names are in "plugin.action" format.

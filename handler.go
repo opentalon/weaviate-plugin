@@ -399,14 +399,24 @@ func extractToolNames(result interface{}, className string) []string {
 	if err != nil {
 		return []string{}
 	}
-	var data map[string]interface{}
-	if err := json.Unmarshal(b, &data); err != nil {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(b, &raw); err != nil {
 		return []string{}
 	}
-	get, ok := data["Get"].(map[string]interface{})
+
+	// The GraphQL response may be {"Get": {...}} or {"data": {"Get": {...}}}.
+	get, ok := raw["Get"].(map[string]interface{})
 	if !ok {
-		return []string{}
+		if data, ok := raw["data"].(map[string]interface{}); ok {
+			get, ok = data["Get"].(map[string]interface{})
+			if !ok {
+				return []string{}
+			}
+		} else {
+			return []string{}
+		}
 	}
+
 	items, ok := get[className].([]interface{})
 	if !ok {
 		return []string{}
