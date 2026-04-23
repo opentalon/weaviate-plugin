@@ -238,7 +238,7 @@ func newHandler(t *testing.T) *WeaviateHandler {
 func requiresVectorizer(t *testing.T) {
 	t.Helper()
 	if vectorizerModule() == "none" {
-		t.Skip("nearText requires a vectorizer; set WEAVIATE_MODULE=text2vec-contextionary and run docker compose up -d")
+		t.Skip("nearText requires a vectorizer; set WEAVIATE_MODULE=text2vec-transformers and run docker compose up -d")
 	}
 }
 

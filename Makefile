@@ -29,11 +29,11 @@ test-brew:
 	go test -v -tags integration -timeout 60s ./... ; \
 	pkill -f "weaviate --host" || true
 
-## test-docker: integration tests with full contextionary (nearText enabled)
+## test-docker: integration tests with multilingual transformers (nearText enabled)
 test-docker:
 	docker compose up -d
 	until curl -sf http://localhost:8080/v1/.well-known/ready; do sleep 1; done
-	WEAVIATE_MODULE=text2vec-contextionary \
+	WEAVIATE_MODULE=text2vec-transformers \
 	go test -v -tags integration -timeout 120s ./...
 	docker compose down
 

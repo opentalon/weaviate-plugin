@@ -19,10 +19,20 @@ spec:
         authentication:
           anonymous_access:
             enabled: true
-        default_vectorizer_module: text2vec-contextionary
+        default_vectorizer_module: text2vec-transformers
         modules:
-          text2vec-contextionary:
+          text2vec-transformers:
             enabled: true
+            tag: sentence-transformers-paraphrase-multilingual-MiniLM-L12-v2
+            envconfig:
+              enable_cuda: "0"
+            resources:
+              requests:
+                cpu: "1"
+                memory: "2Gi"
+              limits:
+                cpu: "2"
+                memory: "3Gi"
         grpcService:
           enabled: true
         resources:
