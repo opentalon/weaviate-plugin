@@ -50,6 +50,10 @@ plugins:
         - url
       limit: 5                     # default result count
 
+      # Vectorizer (default: "text2vec-transformers")
+      vectorizer: "text2vec-transformers"
+      # module_config: {}          # optional per-module config (see Vectorizer Options below)
+
       # Knowledge-augmented RAG (Phase 1)
       actions_collection: "MCPActions"           # collection for indexed plugin capabilities (default)
       knowledge_collection: "KnowledgeArticles"  # collection for knowledge articles (default)
@@ -60,7 +64,55 @@ plugins:
       token: "my-secret-token"     # Bearer token — required when http_addr is set
 ```
 
-The `collection` field is required. All others have defaults (`host: localhost:8080`, `scheme: http`, `limit: 5`).
+The `collection` field is required. All others have defaults (`host: localhost:8080`, `scheme: http`, `limit: 5`, `vectorizer: text2vec-transformers`).
+
+### Vectorizer options
+
+The `vectorizer` field tells Weaviate which module to use for generating embeddings. The plugin sets this per-collection when `auto_create_schema` creates them. Three options are supported:
+
+#### 1. In-cluster transformers (default) — multilingual, strong German
+
+```yaml
+config:
+  vectorizer: "text2vec-transformers"
+```
+
+Weaviate calls a transformer inference service running in-cluster to generate embeddings. The language support depends on which model image is deployed (see [Kubernetes Deployment](#kubernetes-deployment-argocd) below).
+
+Recommended models (all support 50+ languages including German):
+
+| Helm `tag` / Docker image tag | Dims | Memory | Notes |
+|---|---|---|---|
+| `sentence-transformers-paraphrase-multilingual-MiniLM-L12-v2` | 384 | ~1.5Gi | **Default.** Fast, CPU-friendly, good German |
+| `sentence-transformers-distiluse-base-multilingual-cased-v2` | 512 | ~2Gi | Slightly better quality |
+| `sentence-transformers-paraphrase-multilingual-mpnet-base-v2` | 768 | ~3Gi | Best quality, heaviest |
+
+All images available at `cr.weaviate.io/semitechnologies/transformers-inference:<tag>`.
+
+#### 2. OVH AI Endpoints — best German quality, hosted EU
+
+```yaml
+config:
+  vectorizer: "text2vec-openai"
+  module_config:
+    baseURL: "https://bge-m3-xxx.endpoints.kepler.ai.cloud.ovh.net"
+    model: "bge-m3"
+```
+
+Uses OVH AI Endpoints (OpenAI-API-compatible) to generate embeddings externally. Requires:
+- `text2vec-openai` enabled in Weaviate modules
+- `OPENAI_APIKEY` environment variable set on the Weaviate pod with the OVH API token (see [Using OVH AI Endpoints](#using-ovh-ai-endpoints-instead) for k8s Secret setup)
+
+OVH datacenters are in France/Germany (EU data residency).
+
+#### 3. Legacy contextionary — English only
+
+```yaml
+config:
+  vectorizer: "text2vec-contextionary"
+```
+
+Weaviate's legacy English-only word-embedding vectorizer. Not recommended for German or multilingual content.
 
 ### Auto-schema creation
 
@@ -71,7 +123,7 @@ When `auto_create_schema` is `true` (the default), the plugin creates two Weavia
 | `MCPActions` | `pluginName`, `actionName`, `description`, `parameters` | Indexed plugin capabilities for retrieval-based tool filtering |
 | `KnowledgeArticles` | `title`, `content`, `source`, `tags` | Domain knowledge and how-to guides |
 
-Set `auto_create_schema: false` to manage schemas manually.
+Collections are created with the configured `vectorizer` and `module_config`. Set `auto_create_schema: false` to manage schemas manually.
 
 ## HTTP Ingestion API
 
@@ -166,18 +218,20 @@ make test-brew
 
 ### Option B — Docker Compose (full suite, includes semantic search)
 
-Starts Weaviate + the [contextionary](https://github.com/weaviate/contextionary) English word-embedding service so nearText works:
+Starts Weaviate + the multilingual transformer inference service so nearText works:
 
 ```bash
 make test-docker
 ```
+
+This uses `sentence-transformers-paraphrase-multilingual-MiniLM-L12-v2` (384 dims, 50+ languages including German).
 
 ### Environment variables for tests
 
 | Variable | Default | Description |
 |---|---|---|
 | `WEAVIATE_HOST` | `localhost:8080` | Address of the running Weaviate instance |
-| `WEAVIATE_MODULE` | `none` | Set to `text2vec-contextionary` to enable nearText tests |
+| `WEAVIATE_MODULE` | `none` | Set to `text2vec-transformers` to enable nearText tests |
 
 ## Build
 
@@ -208,7 +262,7 @@ GitHub Actions runs three jobs on every push/PR:
 |---|---|
 | **lint** | `golangci-lint` |
 | **unit** | `go test ./...` (no Weaviate required) |
-| **integration** | Real Weaviate 1.30 + contextionary via Docker service; runs full test suite including nearText |
+| **integration** | Real Weaviate 1.30 + multilingual transformers via Docker service; runs full test suite including nearText |
 
 The integration job uses Docker service containers declared in the workflow — no manual setup needed.
 
@@ -319,7 +373,20 @@ The orchestrator can call `sync_actions` at startup to index all plugin capabili
 
 ## Kubernetes Deployment (ArgoCD)
 
-Deploy Weaviate to Kubernetes using the included ArgoCD Application manifest.
+Deploy Weaviate to Kubernetes using the included ArgoCD Application manifest. The Weaviate Helm chart automatically deploys the transformer inference model as a sidecar — no separate manifest is needed.
+
+### Architecture
+
+```
+Plugin ──► Weaviate pod ──► Transformer inference container (sidecar)
+           (ArgoCD/Helm)    (auto-deployed by Helm chart)
+```
+
+The Helm chart:
+1. Deploys Weaviate
+2. Deploys the transformer model container alongside it
+3. Wires `TRANSFORMERS_INFERENCE_API` internally
+4. You just set `enabled: true` and a `tag` (model image) in the Helm values
 
 ### Prerequisites
 
@@ -336,7 +403,7 @@ kubectl apply -f deploy/weaviate/application.yaml
 ArgoCD will automatically:
 - Create the `weaviate` namespace
 - Install Weaviate 1.30.0 via the official Helm chart (v17.8.0)
-- Enable `text2vec-contextionary` for semantic search
+- Deploy the `paraphrase-multilingual-MiniLM-L12-v2` transformer model as a sidecar (multilingual, supports German)
 - Provision a 32Gi persistent volume
 - Auto-sync and self-heal
 
@@ -346,11 +413,14 @@ ArgoCD will automatically:
 # Check ArgoCD status
 argocd app get weaviate
 
-# Check pod is running
+# Check pods — you should see both weaviate and transformers containers
 kubectl -n weaviate get pods
 
 # Check readiness
 kubectl -n weaviate exec svc/weaviate -- wget -qO- http://localhost:8080/v1/.well-known/ready
+
+# Verify the vectorizer is set correctly on a collection
+kubectl -n weaviate exec svc/weaviate -- wget -qO- http://localhost:8080/v1/schema/MCPActions | python3 -m json.tool
 ```
 
 ### Connect the plugin
@@ -368,8 +438,69 @@ plugins:
       collection: "Article"
       fields: [title, body]
       limit: 5
+      vectorizer: "text2vec-transformers"
       auto_create_schema: true
 ```
+
+### Choosing a different model
+
+To change the transformer model, edit the `tag` field in `deploy/weaviate/application.yaml`:
+
+```yaml
+modules:
+  text2vec-transformers:
+    enabled: true
+    tag: sentence-transformers-paraphrase-multilingual-mpnet-base-v2  # change this
+```
+
+Available multilingual models:
+
+| Helm `tag` value | Dims | German | Memory |
+|---|---|---|---|
+| `sentence-transformers-paraphrase-multilingual-MiniLM-L12-v2` | 384 | Good | ~1.5Gi |
+| `sentence-transformers-distiluse-base-multilingual-cased-v2` | 512 | Good | ~2Gi |
+| `sentence-transformers-paraphrase-multilingual-mpnet-base-v2` | 768 | Best | ~3Gi |
+
+After changing the model, delete existing collections (vector dimensions will differ) and let `auto_create_schema` recreate them. Re-ingest data via `sync_actions` and the HTTP API.
+
+### Using OVH AI Endpoints instead
+
+To use OVH-hosted embeddings (bge-m3, best German quality) instead of in-cluster transformers:
+
+1. Create a Kubernetes Secret with your OVH API token:
+
+```bash
+kubectl -n weaviate create secret generic ovh-api-key \
+  --from-literal=OPENAI_APIKEY='your-ovh-api-token'
+```
+
+2. Update the Helm values in `application.yaml`:
+
+```yaml
+default_vectorizer_module: text2vec-openai
+modules:
+  text2vec-openai:
+    enabled: true
+  # Remove or disable text2vec-transformers
+env:
+  OPENAI_APIKEY:
+    valueFrom:
+      secretKeyRef:
+        name: ovh-api-key
+        key: OPENAI_APIKEY
+```
+
+3. Configure the plugin:
+
+```yaml
+config:
+  vectorizer: "text2vec-openai"
+  module_config:
+    baseURL: "https://bge-m3-xxx.endpoints.kepler.ai.cloud.ovh.net"
+    model: "bge-m3"
+```
+
+The `text2vec-openai` module reads the API key from the `OPENAI_APIKEY` environment variable on the Weaviate pod. OVH AI Endpoints are OpenAI-API-compatible, so no other changes are needed.
 
 ### Customization
 
@@ -382,12 +513,15 @@ Edit the inline `helm.values` block in `deploy/weaviate/application.yaml` to adj
 | `storage.size` | `32Gi` | Persistent volume size |
 | `resources.requests.cpu` | `1` | CPU request |
 | `resources.requests.memory` | `2Gi` | Memory request |
+| `modules.text2vec-transformers.tag` | `sentence-transformers-paraphrase-multilingual-MiniLM-L12-v2` | Transformer model |
 | `authentication.anonymous_access.enabled` | `true` | Set `false` and configure API keys for production |
 
 ## References
 
 - Weaviate Go client: https://github.com/weaviate/weaviate-go-client
 - Weaviate server: https://github.com/weaviate/weaviate
-- Contextionary: https://github.com/weaviate/contextionary
+- Weaviate Helm chart: https://github.com/weaviate/weaviate-helm
+- Transformer models: https://github.com/weaviate/t2v-transformers-models
+- Weaviate transformers docs: https://weaviate.io/developers/weaviate/model-providers/transformers/embeddings
 - OpenTalon plugin SDK: https://github.com/opentalon/opentalon (see `pkg/plugin`)
 - Knowledge-augmented RAG issue: https://github.com/opentalon/opentalon/issues/97

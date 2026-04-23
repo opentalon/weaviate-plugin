@@ -28,16 +28,18 @@ var actionNS = uuid.MustParse("d4e8f1a2-5b3c-4d6e-9f0a-1b2c3d4e5f6a")
 
 // Config is the JSON config block passed via the Init RPC.
 type Config struct {
-	Host                string   `json:"host"`
-	Scheme              string   `json:"scheme"`
-	Collection          string   `json:"collection"`
-	ActionsCollection   string   `json:"actions_collection"`
-	KnowledgeCollection string   `json:"knowledge_collection"`
-	Fields              []string `json:"fields"`
-	Limit               int      `json:"limit"`
-	AutoCreateSchema    *bool    `json:"auto_create_schema"`
-	HTTPAddr            string   `json:"http_addr"`
-	Token               string   `json:"token"`
+	Host                string         `json:"host"`
+	Scheme              string         `json:"scheme"`
+	Collection          string         `json:"collection"`
+	ActionsCollection   string         `json:"actions_collection"`
+	KnowledgeCollection string         `json:"knowledge_collection"`
+	Fields              []string       `json:"fields"`
+	Limit               int            `json:"limit"`
+	AutoCreateSchema    *bool          `json:"auto_create_schema"`
+	HTTPAddr            string         `json:"http_addr"`
+	Token               string         `json:"token"`
+	Vectorizer          string         `json:"vectorizer"`
+	ModuleConfig        map[string]any `json:"module_config"`
 }
 
 // WeaviateHandler implements plugin.Handler.
@@ -50,6 +52,8 @@ type WeaviateHandler struct {
 	limit               int
 	httpAddr            string
 	token               string
+	vectorizer          string
+	moduleConfig        map[string]any
 }
 
 // Configure is called by the SDK during the Init RPC with the JSON config block.
@@ -95,6 +99,12 @@ func (h *WeaviateHandler) Configure(configJSON string) error {
 
 	h.httpAddr = cfg.HTTPAddr
 	h.token = cfg.Token
+
+	h.vectorizer = cfg.Vectorizer
+	if h.vectorizer == "" {
+		h.vectorizer = "text2vec-transformers"
+	}
+	h.moduleConfig = cfg.ModuleConfig
 
 	if h.httpAddr != "" && h.token == "" {
 		return fmt.Errorf("config.token is required when http_addr is set")
@@ -144,10 +154,17 @@ func (h *WeaviateHandler) ensureClass(ctx context.Context, name string, props []
 	if exists {
 		return nil
 	}
-	return h.client.Schema().ClassCreator().WithClass(&wmodels.Class{
+	class := &wmodels.Class{
 		Class:      name,
+		Vectorizer: h.vectorizer,
 		Properties: props,
-	}).Do(ctx)
+	}
+	if h.moduleConfig != nil {
+		class.ModuleConfig = map[string]interface{}{
+			h.vectorizer: h.moduleConfig,
+		}
+	}
+	return h.client.Schema().ClassCreator().WithClass(class).Do(ctx)
 }
 
 // Capabilities declares this plugin's name, description, and actions to the host.
