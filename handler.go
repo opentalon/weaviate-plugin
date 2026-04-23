@@ -58,6 +58,8 @@ type WeaviateHandler struct {
 
 // Configure is called by the SDK during the Init RPC with the JSON config block.
 func (h *WeaviateHandler) Configure(configJSON string) error {
+	log.Println("weaviate-plugin: Configure begin")
+
 	cfg := Config{
 		Host:   "localhost:8080",
 		Scheme: "http",
@@ -71,6 +73,8 @@ func (h *WeaviateHandler) Configure(configJSON string) error {
 	if cfg.Collection == "" {
 		return fmt.Errorf("config.collection is required")
 	}
+
+	log.Printf("weaviate-plugin: connecting to %s://%s", cfg.Scheme, cfg.Host)
 
 	client, err := weaviate.NewClient(weaviate.Config{
 		Host:   cfg.Host,
@@ -110,20 +114,31 @@ func (h *WeaviateHandler) Configure(configJSON string) error {
 		return fmt.Errorf("config.token is required when http_addr is set")
 	}
 
+	log.Printf("weaviate-plugin: collection=%s vectorizer=%s limit=%d fields=%v",
+		h.collection, h.vectorizer, h.limit, h.fields)
+	log.Printf("weaviate-plugin: actions_collection=%s knowledge_collection=%s",
+		h.actionsCollection, h.knowledgeCollection)
+
 	autoCreate := cfg.AutoCreateSchema == nil || *cfg.AutoCreateSchema
 	if autoCreate {
+		log.Println("weaviate-plugin: auto-creating schemas")
 		if err := h.ensureSchemas(context.Background()); err != nil {
 			return fmt.Errorf("auto-create schemas: %w", err)
 		}
+		log.Println("weaviate-plugin: schemas ready")
 	}
 
 	if h.httpAddr != "" {
+		log.Printf("weaviate-plugin: starting HTTP server on %s (token protected)", h.httpAddr)
 		go func() {
 			if err := h.listenHTTP(); err != nil {
-				log.Printf("http server: %v", err)
+				log.Printf("weaviate-plugin: http server error: %v", err)
 			}
 		}()
 	}
+
+	log.Printf("weaviate-plugin: init done (Configure) host=%s://%s collection=%s http=%s",
+		cfg.Scheme, cfg.Host, h.collection, h.httpAddr)
 
 	return nil
 }
@@ -338,16 +353,20 @@ func (h *WeaviateHandler) prepare(req plugin.Request) plugin.Response {
 		_ = json.Unmarshal([]byte(v), &allowedPlugins)
 	}
 
-	// Search KnowledgeArticles (limit 5).
+	// Search KnowledgeArticles (limit 10) with plugin-boosted query.
 	knowledgeFields := []graphql.Field{
-		{Name: "title"}, {Name: "content"}, {Name: "source"},
+		{Name: "title"}, {Name: "content"}, {Name: "source"}, {Name: "tags"},
 		{Name: "_additional", Fields: []graphql.Field{{Name: "score"}}},
 	}
-	knowledgeResult, knowledgeErr := h.searchCollection(ctx, h.knowledgeCollection, knowledgeFields, text, 5, nil)
+	knowledgeQuery := text
+	if len(allowedPlugins) > 0 {
+		knowledgeQuery = text + " " + strings.Join(allowedPlugins, " ")
+	}
+	knowledgeResult, knowledgeErr := h.searchCollection(ctx, h.knowledgeCollection, knowledgeFields, knowledgeQuery, 10, nil)
 
 	// Search MCPActions (limit 10) with optional plugin filter.
 	actionFields := []graphql.Field{
-		{Name: "pluginName"}, {Name: "actionName"}, {Name: "description"},
+		{Name: "pluginName"}, {Name: "actionName"}, {Name: "description"}, {Name: "parameters"},
 		{Name: "_additional", Fields: []graphql.Field{{Name: "score"}}},
 	}
 	var actionsWhere *filters.WhereBuilder
