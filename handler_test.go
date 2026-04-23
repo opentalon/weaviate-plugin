@@ -68,6 +68,7 @@ func TestMain(m *testing.M) {
 	setupSchema()
 	setupRAGSchemas()
 	seedData()
+	seedRAGData()
 
 	code := m.Run()
 
@@ -173,6 +174,47 @@ func seedData() {
 			panic(fmt.Sprintf("seed %q: %v", a.Title, err))
 		}
 	}
+	time.Sleep(300 * time.Millisecond)
+}
+
+func seedRAGData() {
+	ctx := context.Background()
+
+	// Seed knowledge articles.
+	knowledgeArticles := []map[string]interface{}{
+		{"title": "Kubernetes Deployment Guide", "content": "How to deploy applications to Kubernetes using ArgoCD and Helm charts.", "source": "wiki"},
+		{"title": "API Authentication", "content": "All API requests require a Bearer token in the Authorization header.", "source": "docs"},
+		{"title": "Jira Workflow", "content": "Issues in Jira follow the workflow: Open, In Progress, Review, Done.", "source": "wiki"},
+	}
+	for _, a := range knowledgeArticles {
+		_, err := rawClient.Data().Creator().
+			WithClassName(DefaultKnowledgeCollection).
+			WithProperties(a).
+			Do(ctx)
+		if err != nil {
+			panic(fmt.Sprintf("seed knowledge %q: %v", a["title"], err))
+		}
+	}
+
+	// Seed MCP actions with deterministic IDs.
+	mcpActions := []map[string]interface{}{
+		{"pluginName": "jira", "actionName": "create_issue", "description": "Create a new issue in the Jira project tracker"},
+		{"pluginName": "jira", "actionName": "list_issues", "description": "List all open issues in a Jira project"},
+		{"pluginName": "gitlab", "actionName": "create_mr", "description": "Create a merge request in GitLab"},
+		{"pluginName": "gitlab", "actionName": "list_pipelines", "description": "List CI pipelines in a GitLab project"},
+	}
+	for _, a := range mcpActions {
+		id := actionUUID(a["pluginName"].(string), a["actionName"].(string))
+		_, err := rawClient.Data().Creator().
+			WithClassName(DefaultActionsCollection).
+			WithID(id).
+			WithProperties(a).
+			Do(ctx)
+		if err != nil {
+			panic(fmt.Sprintf("seed action %s.%s: %v", a["pluginName"], a["actionName"], err))
+		}
+	}
+
 	time.Sleep(300 * time.Millisecond)
 }
 
@@ -878,5 +920,206 @@ func TestHTTP_noTokenConfigured(t *testing.T) {
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("status: got %d want %d; body: %s", w.Code, http.StatusOK, w.Body.String())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Integration tests — prepare (Phase 2: dual-collection RAG)
+// ---------------------------------------------------------------------------
+
+func TestPrepare_dualCollection(t *testing.T) {
+	h := newHandler(t)
+
+	resp := h.Execute(plugin.Request{
+		ID:     "prepare-1",
+		Action: "prepare",
+		Args:   map[string]string{"text": "create jira issue"},
+	})
+
+	if resp.Error != "" {
+		t.Fatalf("Execute error: %s", resp.Error)
+	}
+
+	var result prepareResponse
+	if err := json.Unmarshal([]byte(resp.Content), &result); err != nil {
+		t.Fatalf("unmarshal prepare response: %v\nraw: %s", err, resp.Content)
+	}
+	if !result.SendToLLM {
+		t.Error("expected send_to_llm=true")
+	}
+	if result.Message == "" {
+		t.Error("expected non-empty message")
+	}
+	if !strings.Contains(result.Message, "[retrieved_context") {
+		t.Error("expected [retrieved_context] block in message")
+	}
+	if !strings.Contains(result.Message, "create jira issue") {
+		t.Error("expected original text in message")
+	}
+}
+
+func TestPrepare_returnsRelevantTools(t *testing.T) {
+	h := newHandler(t)
+
+	resp := h.Execute(plugin.Request{
+		ID:     "prepare-tools",
+		Action: "prepare",
+		Args:   map[string]string{"text": "create issue in jira project tracker"},
+	})
+
+	if resp.Error != "" {
+		t.Fatalf("Execute error: %s", resp.Error)
+	}
+
+	var result prepareResponse
+	if err := json.Unmarshal([]byte(resp.Content), &result); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	if len(result.RelevantTools) == 0 {
+		t.Error("expected relevant_tools to be populated")
+	}
+
+	// Verify tool names are in "plugin.action" format.
+	for _, tool := range result.RelevantTools {
+		if !strings.Contains(tool, ".") {
+			t.Errorf("tool %q should be in 'plugin.action' format", tool)
+		}
+	}
+}
+
+func TestPrepare_allowedPlugins(t *testing.T) {
+	h := newHandler(t)
+
+	allowed, _ := json.Marshal([]string{"jira"})
+	resp := h.Execute(plugin.Request{
+		ID:     "prepare-filter",
+		Action: "prepare",
+		Args: map[string]string{
+			"text":            "create issue or merge request",
+			"allowed_plugins": string(allowed),
+		},
+	})
+
+	if resp.Error != "" {
+		t.Fatalf("Execute error: %s", resp.Error)
+	}
+
+	var result prepareResponse
+	if err := json.Unmarshal([]byte(resp.Content), &result); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	// All returned tools should be from jira only, not gitlab.
+	for _, tool := range result.RelevantTools {
+		if !strings.HasPrefix(tool, "jira.") {
+			t.Errorf("expected only jira tools with allowed_plugins=[jira], got %q", tool)
+		}
+	}
+}
+
+func TestPrepare_emptyText(t *testing.T) {
+	h := newHandler(t)
+
+	resp := h.Execute(plugin.Request{
+		ID:     "prepare-empty",
+		Action: "prepare",
+		Args:   map[string]string{"text": ""},
+	})
+
+	if resp.Error != "" {
+		t.Fatalf("Execute error: %s", resp.Error)
+	}
+
+	var result prepareResponse
+	if err := json.Unmarshal([]byte(resp.Content), &result); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !result.SendToLLM {
+		t.Error("expected send_to_llm=true")
+	}
+	if result.Message != "" {
+		t.Errorf("expected empty message for empty text, got %q", result.Message)
+	}
+	if len(result.RelevantTools) != 0 {
+		t.Errorf("expected empty relevant_tools, got %v", result.RelevantTools)
+	}
+}
+
+func TestPrepare_noTextArg(t *testing.T) {
+	h := newHandler(t)
+
+	resp := h.Execute(plugin.Request{
+		ID:     "prepare-notext",
+		Action: "prepare",
+		Args:   map[string]string{},
+	})
+
+	if resp.Error != "" {
+		t.Fatalf("Execute error: %s", resp.Error)
+	}
+
+	var result prepareResponse
+	if err := json.Unmarshal([]byte(resp.Content), &result); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !result.SendToLLM {
+		t.Error("expected send_to_llm=true")
+	}
+}
+
+func TestPrepare_structuredJSONFormat(t *testing.T) {
+	h := newHandler(t)
+
+	resp := h.Execute(plugin.Request{
+		ID:     "prepare-json",
+		Action: "prepare",
+		Args:   map[string]string{"text": "deploy kubernetes"},
+	})
+
+	if resp.Error != "" {
+		t.Fatalf("Execute error: %s", resp.Error)
+	}
+
+	// Verify the response is valid JSON with expected fields.
+	var raw map[string]interface{}
+	if err := json.Unmarshal([]byte(resp.Content), &raw); err != nil {
+		t.Fatalf("response is not valid JSON: %v", err)
+	}
+
+	if _, ok := raw["send_to_llm"]; !ok {
+		t.Error("missing send_to_llm field")
+	}
+	if _, ok := raw["message"]; !ok {
+		t.Error("missing message field")
+	}
+	if _, ok := raw["relevant_tools"]; !ok {
+		t.Error("missing relevant_tools field")
+	}
+}
+
+func TestPrepare_knowledgeAndActionsBlocks(t *testing.T) {
+	h := newHandler(t)
+
+	resp := h.Execute(plugin.Request{
+		ID:     "prepare-blocks",
+		Action: "prepare",
+		Args:   map[string]string{"text": "jira issue workflow"},
+	})
+
+	if resp.Error != "" {
+		t.Fatalf("Execute error: %s", resp.Error)
+	}
+
+	var result prepareResponse
+	if err := json.Unmarshal([]byte(resp.Content), &result); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	if !strings.Contains(result.Message, "[knowledge]") {
+		t.Error("expected [knowledge] block in message")
+	}
+	if !strings.Contains(result.Message, "[actions]") {
+		t.Error("expected [actions] block in message")
 	}
 }

@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/opentalon/opentalon/pkg/plugin"
 	"github.com/weaviate/weaviate-go-client/v5/weaviate"
+	"github.com/weaviate/weaviate-go-client/v5/weaviate/filters"
 	"github.com/weaviate/weaviate-go-client/v5/weaviate/graphql"
 	wmodels "github.com/weaviate/weaviate/entities/models"
 )
@@ -176,9 +177,10 @@ func (h *WeaviateHandler) Capabilities() plugin.CapabilitiesMsg {
 			},
 			{
 				Name:        "prepare",
-				Description: "RAG preparer: searches Weaviate with the user message and returns the message prepended with relevant context.",
+				Description: "RAG preparer: searches KnowledgeArticles and MCPActions with the user message and returns structured context with relevant tools.",
 				Parameters: []plugin.ParameterMsg{
 					{Name: "text", Description: "Raw user message (injected by the orchestrator)", Type: "string", Required: true},
+					{Name: "allowed_plugins", Description: "JSON array of allowed plugin names for filtering (injected by orchestrator)", Type: "string", Required: false},
 				},
 			},
 			{
@@ -281,33 +283,152 @@ func (h *WeaviateHandler) hybridSearch(req plugin.Request) plugin.Response {
 	return marshalResponse(req.ID, result)
 }
 
+// prepareResponse is the structured JSON returned by the prepare action.
+type prepareResponse struct {
+	SendToLLM     bool     `json:"send_to_llm"`
+	Message       string   `json:"message"`
+	RelevantTools []string `json:"relevant_tools"`
+}
+
 func (h *WeaviateHandler) prepare(req plugin.Request) plugin.Response {
-	text, ok := req.Args["text"]
-	if !ok || text == "" {
-		return plugin.Response{CallID: req.ID, Content: text}
+	text := req.Args["text"]
+	if text == "" {
+		return marshalPrepareResponse(req.ID, prepareResponse{
+			SendToLLM:     true,
+			Message:       "",
+			RelevantTools: []string{},
+		})
 	}
 
-	hybrid := h.client.GraphQL().HybridArgumentBuilder().WithQuery(text)
+	ctx := context.Background()
 
-	result, err := h.client.GraphQL().Get().
-		WithClassName(h.collection).
-		WithFields(h.resolveFields(map[string]string{})...).
-		WithHybrid(hybrid).
-		WithLimit(h.limit).
-		Do(context.Background())
+	// Parse allowed_plugins filter if provided by the orchestrator.
+	var allowedPlugins []string
+	if v, ok := req.Args["allowed_plugins"]; ok && v != "" {
+		_ = json.Unmarshal([]byte(v), &allowedPlugins)
+	}
 
+	// Search KnowledgeArticles (limit 5).
+	knowledgeFields := []graphql.Field{
+		{Name: "title"}, {Name: "content"}, {Name: "source"},
+		{Name: "_additional", Fields: []graphql.Field{{Name: "score"}}},
+	}
+	knowledgeResult, knowledgeErr := h.searchCollection(ctx, h.knowledgeCollection, knowledgeFields, text, 5, nil)
+
+	// Search MCPActions (limit 10) with optional plugin filter.
+	actionFields := []graphql.Field{
+		{Name: "pluginName"}, {Name: "actionName"}, {Name: "description"},
+		{Name: "_additional", Fields: []graphql.Field{{Name: "score"}}},
+	}
+	var actionsWhere *filters.WhereBuilder
+	if len(allowedPlugins) > 0 {
+		actionsWhere = filters.Where().
+			WithPath([]string{"pluginName"}).
+			WithOperator(filters.ContainsAny).
+			WithValueText(allowedPlugins...)
+	}
+	actionsResult, actionsErr := h.searchCollection(ctx, h.actionsCollection, actionFields, text, 10, actionsWhere)
+
+	// Fail-open: if both searches fail, pass through unchanged.
+	if knowledgeErr != nil && actionsErr != nil {
+		return marshalPrepareResponse(req.ID, prepareResponse{
+			SendToLLM:     true,
+			Message:       text,
+			RelevantTools: []string{},
+		})
+	}
+
+	// Build context blocks from whichever collections succeeded.
+	var contextBlocks []string
+	if knowledgeErr == nil {
+		kb, _ := json.MarshalIndent(knowledgeResult, "", "  ")
+		contextBlocks = append(contextBlocks, fmt.Sprintf("[knowledge]\n%s\n[/knowledge]", string(kb)))
+	}
+	if actionsErr == nil {
+		ab, _ := json.MarshalIndent(actionsResult, "", "  ")
+		contextBlocks = append(contextBlocks, fmt.Sprintf("[actions]\n%s\n[/actions]", string(ab)))
+	}
+
+	message := text
+	if len(contextBlocks) > 0 {
+		message = fmt.Sprintf(
+			"[retrieved_context source=\"weaviate\"]\n%s\n[/retrieved_context]\n\n%s",
+			strings.Join(contextBlocks, "\n"), text,
+		)
+	}
+
+	tools := extractToolNames(actionsResult, h.actionsCollection)
+
+	return marshalPrepareResponse(req.ID, prepareResponse{
+		SendToLLM:     true,
+		Message:       message,
+		RelevantTools: tools,
+	})
+}
+
+// searchCollection performs a hybrid search (alpha=0.5) on the given collection
+// with an optional where filter.
+func (h *WeaviateHandler) searchCollection(
+	ctx context.Context,
+	className string,
+	fields []graphql.Field,
+	query string,
+	limit int,
+	where *filters.WhereBuilder,
+) (interface{}, error) {
+	builder := h.client.GraphQL().Get().
+		WithClassName(className).
+		WithFields(fields...).
+		WithHybrid(h.client.GraphQL().HybridArgumentBuilder().WithQuery(query)).
+		WithLimit(limit)
+
+	if where != nil {
+		builder = builder.WithWhere(where)
+	}
+
+	return builder.Do(ctx)
+}
+
+// extractToolNames extracts "pluginName.actionName" strings from an MCPActions
+// GraphQL response.
+func extractToolNames(result interface{}, className string) []string {
+	if result == nil {
+		return []string{}
+	}
+	b, err := json.Marshal(result)
 	if err != nil {
-		// Fail-open: forward the original message so the LLM call is not blocked.
-		return plugin.Response{CallID: req.ID, Content: text}
+		return []string{}
 	}
+	var data map[string]interface{}
+	if err := json.Unmarshal(b, &data); err != nil {
+		return []string{}
+	}
+	get, ok := data["Get"].(map[string]interface{})
+	if !ok {
+		return []string{}
+	}
+	items, ok := get[className].([]interface{})
+	if !ok {
+		return []string{}
+	}
+	tools := make([]string, 0, len(items))
+	for _, item := range items {
+		obj, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		pluginName, _ := obj["pluginName"].(string)
+		actionName, _ := obj["actionName"].(string)
+		if pluginName != "" && actionName != "" {
+			tools = append(tools, pluginName+"."+actionName)
+		}
+	}
+	return tools
+}
 
-	b, _ := json.MarshalIndent(result, "", "  ")
-
-	enriched := fmt.Sprintf(
-		"[retrieved_context source=\"weaviate\"]\n%s\n[/retrieved_context]\n\n%s",
-		string(b), text,
-	)
-	return plugin.Response{CallID: req.ID, Content: enriched}
+func marshalPrepareResponse(callID string, resp prepareResponse) plugin.Response {
+	b, _ := json.Marshal(resp)
+	return plugin.Response{CallID: callID, Content: string(b)}
 }
 
 // ---------------------------------------------------------------------------
