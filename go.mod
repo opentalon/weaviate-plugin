@@ -5,7 +5,7 @@ go 1.25.0
 require (
 	github.com/go-openapi/strfmt v0.23.0
 	github.com/google/uuid v1.6.0
-	github.com/opentalon/opentalon v0.0.1
+	github.com/opentalon/opentalon v0.0.5
 	github.com/weaviate/weaviate v1.30.0
 	github.com/weaviate/weaviate-go-client/v5 v5.1.0
 )
@@ -28,13 +28,13 @@ require (
 	github.com/opentracing/opentracing-go v1.2.0 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	go.mongodb.org/mongo-driver v1.14.0 // indirect
-	golang.org/x/net v0.35.0 // indirect
+	golang.org/x/net v0.43.0 // indirect
 	golang.org/x/oauth2 v0.25.0 // indirect
 	golang.org/x/sys v0.39.0 // indirect
 	golang.org/x/text v0.32.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20250102185135-69823020774d // indirect
 	google.golang.org/grpc v1.69.4 // indirect
-	google.golang.org/protobuf v1.36.3 // indirect
+	google.golang.org/protobuf v1.36.8 // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
