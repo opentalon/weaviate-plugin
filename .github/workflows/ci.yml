@@ -44,29 +44,6 @@ jobs:
     name: Integration
     runs-on: ubuntu-latest
 
-    services:
-      weaviate:
-        image: cr.weaviate.io/semitechnologies/weaviate:1.30.0
-        ports:
-          - "8080:8080"
-        env:
-          AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: "true"
-          DEFAULT_VECTORIZER_MODULE: text2vec-transformers
-          ENABLE_MODULES: text2vec-transformers
-          TRANSFORMERS_INFERENCE_API: http://t2v-transformers:8080
-          CLUSTER_HOSTNAME: node1
-          PERSISTENCE_DATA_PATH: /var/lib/weaviate
-        options: >-
-          --health-cmd "wget -qO- http://localhost:8080/v1/.well-known/ready || exit 1"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 24
-
-      t2v-transformers:
-        image: cr.weaviate.io/semitechnologies/transformers-inference:sentence-transformers-paraphrase-multilingual-MiniLM-L12-v2
-        env:
-          ENABLE_CUDA: "0"
-
     steps:
       - uses: actions/checkout@v4
 
@@ -74,10 +51,13 @@ jobs:
         with:
           go-version: "1.25"
 
+      - name: Start Weaviate + transformers via docker compose
+        run: docker compose up -d
+
       - name: Wait for Weaviate to be ready
         run: |
           echo "Waiting for Weaviate..."
-          for i in $(seq 1 45); do
+          for i in $(seq 1 60); do
             if curl -sf http://localhost:8080/v1/.well-known/ready; then
               echo "Weaviate is ready"
               exit 0
@@ -85,6 +65,7 @@ jobs:
             sleep 2
           done
           echo "Weaviate did not become ready in time"
+          docker compose logs
           exit 1
 
       - name: go test (integration)
@@ -92,6 +73,10 @@ jobs:
           WEAVIATE_HOST: localhost:8080
           WEAVIATE_MODULE: text2vec-transformers
         run: go test -v -tags integration -timeout 120s ./...
+
+      - name: Stop containers
+        if: always()
+        run: docker compose down
 
   # ── Build ────────────────────────────────────────────────────────────────────
   build:
