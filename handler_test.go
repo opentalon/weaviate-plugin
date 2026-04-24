@@ -950,11 +950,12 @@ func TestPrepare_dualCollection(t *testing.T) {
 	if result.Message == "" {
 		t.Error("expected non-empty message")
 	}
-	if !strings.Contains(result.Message, "[retrieved_context") {
-		t.Error("expected [retrieved_context] block in message")
-	}
 	if !strings.Contains(result.Message, "create jira issue") {
 		t.Error("expected original text in message")
+	}
+	// Actions should NOT be in message — relevant_tools handles filtering.
+	if strings.Contains(result.Message, "[actions]") {
+		t.Error("message should NOT contain [actions] block")
 	}
 }
 
@@ -1099,7 +1100,7 @@ func TestPrepare_structuredJSONFormat(t *testing.T) {
 	}
 }
 
-func TestPrepare_knowledgeAndActionsBlocks(t *testing.T) {
+func TestPrepare_knowledgeContextAndRelevantTools(t *testing.T) {
 	h := newHandler(t)
 
 	resp := h.Execute(plugin.Request{
@@ -1117,11 +1118,14 @@ func TestPrepare_knowledgeAndActionsBlocks(t *testing.T) {
 		t.Fatalf("unmarshal: %v", err)
 	}
 
-	if !strings.Contains(result.Message, "[knowledge]") {
-		t.Error("expected [knowledge] block in message")
+	// Action context must NOT be in the message — relevant_tools handles tool filtering.
+	if strings.Contains(result.Message, "[actions]") {
+		t.Error("message should NOT contain [actions] block — tool filtering uses relevant_tools")
 	}
-	if !strings.Contains(result.Message, "[actions]") {
-		t.Error("expected [actions] block in message")
+
+	// relevant_tools should be populated with matched actions above score threshold.
+	if result.RelevantTools == nil {
+		t.Error("relevant_tools should not be nil")
 	}
 }
 
