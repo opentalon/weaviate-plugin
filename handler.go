@@ -397,6 +397,10 @@ func (h *WeaviateHandler) prepare(req plugin.Request) plugin.Response {
 	// The orchestrator uses this list to decide which tools to show the LLM.
 	tools := extractToolNamesAboveScore(actionsResult, h.actionsCollection, minPrepareScore)
 
+	// Always include ask_knowledge so the LLM can discover more tools on demand,
+	// even when the initial search found nothing relevant.
+	tools = append(tools, "weaviate.ask_knowledge")
+
 	log.Printf("weaviate-plugin: prepare: query=%q matched_tools=%d tools=%v", text, len(tools), tools)
 
 	// Build message: only include knowledge context (if non-empty).
