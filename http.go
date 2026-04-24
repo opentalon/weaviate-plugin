@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -12,6 +13,7 @@ import (
 // listenHTTP starts the token-protected HTTP ingestion server.
 func (h *WeaviateHandler) listenHTTP() error {
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/health", h.handleHealth)
 	mux.HandleFunc("POST /api/v1/articles", h.requireToken(h.handleIngestArticle))
 	mux.HandleFunc("POST /api/v1/articles/batch", h.requireToken(h.handleIngestBatch))
 	mux.HandleFunc("POST /api/v1/actions/sync", h.requireToken(h.handleSyncActions))
@@ -100,6 +102,22 @@ func writePluginResponse(w http.ResponseWriter, resp plugin.Response) {
 		return
 	}
 	_, _ = w.Write([]byte(resp.Content))
+}
+
+func (h *WeaviateHandler) handleHealth(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if h.client == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = fmt.Fprint(w, `{"status":"not_ready","error":"weaviate client not initialised"}`)
+		return
+	}
+	live, err := h.client.Misc().LiveChecker().Do(context.Background())
+	if err != nil || !live {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = fmt.Fprintf(w, `{"status":"not_ready","error":"weaviate not reachable: %v"}`, err)
+		return
+	}
+	_, _ = fmt.Fprint(w, `{"status":"ok"}`)
 }
 
 func writeJSONError(w http.ResponseWriter, code int, msg string) {
