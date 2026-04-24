@@ -40,6 +40,7 @@ type Config struct {
 	Token               string         `json:"token"`
 	Vectorizer          string         `json:"vectorizer"`
 	ModuleConfig        map[string]any `json:"module_config"`
+	MinPrepareScore     *float64       `json:"min_prepare_score"`
 }
 
 // WeaviateHandler implements plugin.Handler.
@@ -54,6 +55,7 @@ type WeaviateHandler struct {
 	token               string
 	vectorizer          string
 	moduleConfig        map[string]any
+	minPrepareScore     float64
 }
 
 // Configure is called by the SDK during the Init RPC with the JSON config block.
@@ -110,12 +112,18 @@ func (h *WeaviateHandler) Configure(configJSON string) error {
 	}
 	h.moduleConfig = cfg.ModuleConfig
 
+	if cfg.MinPrepareScore != nil && *cfg.MinPrepareScore > 0 {
+		h.minPrepareScore = *cfg.MinPrepareScore
+	} else {
+		h.minPrepareScore = defaultMinPrepareScore
+	}
+
 	if h.httpAddr != "" && h.token == "" {
 		return fmt.Errorf("config.token is required when http_addr is set")
 	}
 
-	log.Printf("weaviate-plugin: collection=%s vectorizer=%s limit=%d fields=%v",
-		h.collection, h.vectorizer, h.limit, h.fields)
+	log.Printf("weaviate-plugin: collection=%s vectorizer=%s limit=%d min_prepare_score=%.4f fields=%v",
+		h.collection, h.vectorizer, h.limit, h.minPrepareScore, h.fields)
 	log.Printf("weaviate-plugin: actions_collection=%s knowledge_collection=%s",
 		h.actionsCollection, h.knowledgeCollection)
 
@@ -335,9 +343,10 @@ type prepareResponse struct {
 	RelevantTools []string `json:"relevant_tools"`
 }
 
-// minPrepareScore is the minimum hybrid-search score for a result to be
-// included in the prepare response. Results below this threshold are noise.
-const minPrepareScore = 0.85
+// defaultMinPrepareScore is the default minimum hybrid-search score for a
+// result to be included in the prepare response. Configurable via
+// config.min_prepare_score.
+const defaultMinPrepareScore = 0.012
 
 func (h *WeaviateHandler) prepare(req plugin.Request) plugin.Response {
 	text := req.Args["text"]
@@ -395,13 +404,20 @@ func (h *WeaviateHandler) prepare(req plugin.Request) plugin.Response {
 
 	// Extract relevant tool names (above score threshold) for system prompt filtering.
 	// The orchestrator uses this list to decide which tools to show the LLM.
-	tools := extractToolNamesAboveScore(actionsResult, h.actionsCollection, minPrepareScore)
+	tools := extractToolNamesAboveScore(actionsResult, h.actionsCollection, h.minPrepareScore)
 
-	// Always include ask_knowledge so the LLM can discover more tools on demand,
-	// even when the initial search found nothing relevant.
-	tools = append(tools, "weaviate.ask_knowledge")
+	// When no real tools matched, return nil so the orchestrator shows ALL
+	// tools (relevantToolsActive=false). Only activate filtering when we
+	// actually found relevant actions — otherwise the LLM loses access to
+	// every plugin except ask_knowledge.
+	if len(tools) > 0 {
+		// Add ask_knowledge so the LLM can discover additional tools on demand.
+		tools = append(tools, "weaviate.ask_knowledge")
+	} else {
+		tools = nil
+	}
 
-	log.Printf("weaviate-plugin: prepare: query=%q matched_tools=%d tools=%v", text, len(tools), tools)
+	log.Printf("weaviate-plugin: prepare: query=%q min_score=%.4f matched_tools=%d tools=%v", text, h.minPrepareScore, len(tools), tools)
 
 	// Build message: only include knowledge context (if non-empty).
 	// Action/tool context is NOT injected into the message — the orchestrator
@@ -409,7 +425,7 @@ func (h *WeaviateHandler) prepare(req plugin.Request) plugin.Response {
 	// relevant_tools. Duplicating them here wastes tokens.
 	message := text
 	if knowledgeErr == nil {
-		if knowledgeText := formatKnowledgeResultsCompact(knowledgeResult, h.knowledgeCollection, minPrepareScore); knowledgeText != "" {
+		if knowledgeText := formatKnowledgeResultsCompact(knowledgeResult, h.knowledgeCollection, h.minPrepareScore); knowledgeText != "" {
 			message = fmt.Sprintf("[knowledge_context]\n%s\n[/knowledge_context]\n\n%s", knowledgeText, text)
 		}
 	}
