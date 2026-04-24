@@ -440,23 +440,6 @@ func (h *WeaviateHandler) searchCollection(
 	return builder.Do(ctx)
 }
 
-// extractToolNames extracts "pluginName.actionName" strings from an MCPActions
-// GraphQL response.
-func extractToolNames(result interface{}, className string) []string {
-	items := extractItems(result, className)
-	if len(items) == 0 {
-		return []string{}
-	}
-	tools := make([]string, 0, len(items))
-	for _, obj := range items {
-		pluginName, _ := obj["pluginName"].(string)
-		actionName, _ := obj["actionName"].(string)
-		if pluginName != "" && actionName != "" {
-			tools = append(tools, pluginName+"."+actionName)
-		}
-	}
-	return tools
-}
 
 // extractToolNamesAboveScore extracts "pluginName.actionName" strings from an
 // MCPActions GraphQL response, filtering out results below the given score threshold.
