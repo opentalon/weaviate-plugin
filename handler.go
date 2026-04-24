@@ -335,6 +335,10 @@ type prepareResponse struct {
 	RelevantTools []string `json:"relevant_tools"`
 }
 
+// minPrepareScore is the minimum hybrid-search score for a result to be
+// included in the prepare response. Results below this threshold are noise.
+const minPrepareScore = 0.85
+
 func (h *WeaviateHandler) prepare(req plugin.Request) plugin.Response {
 	text := req.Args["text"]
 	if text == "" {
@@ -353,20 +357,22 @@ func (h *WeaviateHandler) prepare(req plugin.Request) plugin.Response {
 		_ = json.Unmarshal([]byte(v), &allowedPlugins)
 	}
 
-	// Search KnowledgeArticles (limit 10) with plugin-boosted query.
+	// Search KnowledgeArticles (limit 5) with plugin-boosted query.
 	knowledgeFields := []graphql.Field{
-		{Name: "title"}, {Name: "content"}, {Name: "source"}, {Name: "tags"},
+		{Name: "title"}, {Name: "content"}, {Name: "source"},
 		{Name: "_additional", Fields: []graphql.Field{{Name: "score"}}},
 	}
 	knowledgeQuery := text
 	if len(allowedPlugins) > 0 {
 		knowledgeQuery = text + " " + strings.Join(allowedPlugins, " ")
 	}
-	knowledgeResult, knowledgeErr := h.searchCollection(ctx, h.knowledgeCollection, knowledgeFields, knowledgeQuery, 10, nil)
+	knowledgeResult, knowledgeErr := h.searchCollection(ctx, h.knowledgeCollection, knowledgeFields, knowledgeQuery, 5, nil)
 
-	// Search MCPActions (limit 10) with optional plugin filter.
+	// Search MCPActions (limit 5) with optional plugin filter.
+	// Only pluginName + actionName + score needed — the orchestrator already
+	// has full tool definitions in the system prompt via relevant_tools filtering.
 	actionFields := []graphql.Field{
-		{Name: "pluginName"}, {Name: "actionName"}, {Name: "description"}, {Name: "parameters"},
+		{Name: "pluginName"}, {Name: "actionName"},
 		{Name: "_additional", Fields: []graphql.Field{{Name: "score"}}},
 	}
 	var actionsWhere *filters.WhereBuilder
@@ -376,7 +382,7 @@ func (h *WeaviateHandler) prepare(req plugin.Request) plugin.Response {
 			WithOperator(filters.ContainsAny).
 			WithValueText(allowedPlugins...)
 	}
-	actionsResult, actionsErr := h.searchCollection(ctx, h.actionsCollection, actionFields, text, 10, actionsWhere)
+	actionsResult, actionsErr := h.searchCollection(ctx, h.actionsCollection, actionFields, text, 5, actionsWhere)
 
 	// Fail-open: if both searches fail, pass through unchanged.
 	if knowledgeErr != nil && actionsErr != nil {
@@ -387,26 +393,22 @@ func (h *WeaviateHandler) prepare(req plugin.Request) plugin.Response {
 		})
 	}
 
-	// Build context blocks from whichever collections succeeded.
-	var contextBlocks []string
-	if knowledgeErr == nil {
-		kb, _ := json.MarshalIndent(knowledgeResult, "", "  ")
-		contextBlocks = append(contextBlocks, fmt.Sprintf("[knowledge]\n%s\n[/knowledge]", string(kb)))
-	}
-	if actionsErr == nil {
-		ab, _ := json.MarshalIndent(actionsResult, "", "  ")
-		contextBlocks = append(contextBlocks, fmt.Sprintf("[actions]\n%s\n[/actions]", string(ab)))
-	}
+	// Extract relevant tool names (above score threshold) for system prompt filtering.
+	// The orchestrator uses this list to decide which tools to show the LLM.
+	tools := extractToolNamesAboveScore(actionsResult, h.actionsCollection, minPrepareScore)
 
+	log.Printf("weaviate-plugin: prepare: query=%q matched_tools=%d tools=%v", text, len(tools), tools)
+
+	// Build message: only include knowledge context (if non-empty).
+	// Action/tool context is NOT injected into the message — the orchestrator
+	// already provides full tool definitions in the system prompt filtered by
+	// relevant_tools. Duplicating them here wastes tokens.
 	message := text
-	if len(contextBlocks) > 0 {
-		message = fmt.Sprintf(
-			"[retrieved_context source=\"weaviate\"]\n%s\n[/retrieved_context]\n\n%s",
-			strings.Join(contextBlocks, "\n"), text,
-		)
+	if knowledgeErr == nil {
+		if knowledgeText := formatKnowledgeResultsCompact(knowledgeResult, h.knowledgeCollection, minPrepareScore); knowledgeText != "" {
+			message = fmt.Sprintf("[knowledge_context]\n%s\n[/knowledge_context]\n\n%s", knowledgeText, text)
+		}
 	}
-
-	tools := extractToolNames(actionsResult, h.actionsCollection)
 
 	return marshalPrepareResponse(req.ID, prepareResponse{
 		SendToLLM:     true,
@@ -454,6 +456,71 @@ func extractToolNames(result interface{}, className string) []string {
 		}
 	}
 	return tools
+}
+
+// extractToolNamesAboveScore extracts "pluginName.actionName" strings from an
+// MCPActions GraphQL response, filtering out results below the given score threshold.
+func extractToolNamesAboveScore(result interface{}, className string, minScore float64) []string {
+	items := extractItems(result, className)
+	if len(items) == 0 {
+		return []string{}
+	}
+	tools := make([]string, 0, len(items))
+	for _, obj := range items {
+		if !aboveScore(obj, minScore) {
+			continue
+		}
+		pluginName, _ := obj["pluginName"].(string)
+		actionName, _ := obj["actionName"].(string)
+		if pluginName != "" && actionName != "" {
+			tools = append(tools, pluginName+"."+actionName)
+		}
+	}
+	return tools
+}
+
+// formatKnowledgeResultsCompact formats knowledge articles above the score
+// threshold as compact text (title + content only). Returns "" when no
+// articles pass the threshold.
+func formatKnowledgeResultsCompact(result interface{}, className string, minScore float64) string {
+	items := extractItems(result, className)
+	if len(items) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	for _, item := range items {
+		if !aboveScore(item, minScore) {
+			continue
+		}
+		title, _ := item["title"].(string)
+		content, _ := item["content"].(string)
+		if title == "" && content == "" {
+			continue
+		}
+		if sb.Len() > 0 {
+			sb.WriteString("\n---\n")
+		}
+		fmt.Fprintf(&sb, "%s\n%s", title, content)
+	}
+	return sb.String()
+}
+
+// aboveScore checks whether a GraphQL result object's _additional.score
+// meets the minimum threshold.
+func aboveScore(obj map[string]interface{}, minScore float64) bool {
+	additional, _ := obj["_additional"].(map[string]interface{})
+	if additional == nil {
+		return true // no score info → include by default
+	}
+	scoreStr, _ := additional["score"].(string)
+	if scoreStr == "" {
+		return true
+	}
+	score, err := strconv.ParseFloat(scoreStr, 64)
+	if err != nil {
+		return true
+	}
+	return score >= minScore
 }
 
 func marshalPrepareResponse(callID string, resp prepareResponse) plugin.Response {
