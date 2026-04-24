@@ -950,11 +950,12 @@ func TestPrepare_dualCollection(t *testing.T) {
 	if result.Message == "" {
 		t.Error("expected non-empty message")
 	}
-	if !strings.Contains(result.Message, "[retrieved_context") {
-		t.Error("expected [retrieved_context] block in message")
-	}
 	if !strings.Contains(result.Message, "create jira issue") {
 		t.Error("expected original text in message")
+	}
+	// Actions should NOT be in message — relevant_tools handles filtering.
+	if strings.Contains(result.Message, "[actions]") {
+		t.Error("message should NOT contain [actions] block")
 	}
 }
 
