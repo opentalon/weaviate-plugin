@@ -59,12 +59,34 @@ plugins:
       knowledge_collection: "KnowledgeArticles"  # collection for knowledge articles (default)
       auto_create_schema: true                   # auto-create MCPActions & KnowledgeArticles on startup (default true)
 
+      # Prepare-phase filtering
+      min_prepare_score: 0.012     # minimum hybrid-search score for prepare results (default 0.012)
+
       # HTTP ingestion server (optional)
       http_addr: ":8081"           # address for the HTTP ingestion API
       token: "my-secret-token"     # Bearer token — required when http_addr is set
 ```
 
 The `collection` field is required. All others have defaults (`host: localhost:8080`, `scheme: http`, `limit: 5`, `vectorizer: text2vec-transformers`).
+
+### `min_prepare_score`
+
+During the `prepare` phase the plugin runs a hybrid search against the actions and knowledge collections. Each result comes back with a relevance score. Results scoring below `min_prepare_score` are discarded.
+
+| Setting | Value |
+|---|---|
+| Config key | `min_prepare_score` |
+| Type | float |
+| Default | `0.012` |
+
+- **Higher values** (e.g. `0.30`) return only high-confidence matches, reducing noise but potentially dropping relevant results.
+- **Lower values** surface more results at the cost of relevance.
+- **`0` or omitted** falls back to the default (`0.012`).
+
+Tuning tips:
+- Start with the default and check plugin logs (`min_score=... matched_tools=...`) to see what scores your data produces.
+- If the plugin returns too many irrelevant tools, raise the threshold incrementally.
+- If relevant tools are being filtered out, lower it.
 
 ### Vectorizer options
 
