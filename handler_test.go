@@ -1012,10 +1012,10 @@ func TestPrepare_allowedPlugins(t *testing.T) {
 		t.Fatalf("unmarshal: %v", err)
 	}
 
-	// All returned tools should be from jira only, not gitlab.
+	// All returned tools should be from jira (or the always-included ask_knowledge), not gitlab.
 	for _, tool := range result.RelevantTools {
-		if !strings.HasPrefix(tool, "jira.") {
-			t.Errorf("expected only jira tools with allowed_plugins=[jira], got %q", tool)
+		if !strings.HasPrefix(tool, "jira.") && tool != "weaviate.ask_knowledge" {
+			t.Errorf("expected only jira tools (+ ask_knowledge) with allowed_plugins=[jira], got %q", tool)
 		}
 	}
 }
