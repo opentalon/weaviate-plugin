@@ -258,6 +258,11 @@ func (h *WeaviateHandler) Capabilities() plugin.CapabilitiesMsg {
 					{Name: "allowed_plugins", Description: "JSON array of allowed plugin names (injected by orchestrator)", Type: "string", Required: false},
 				},
 			},
+			{
+				Name:        "refresh",
+				Description: "Re-create Weaviate collections if they were deleted externally. Called automatically on session clear.",
+				Parameters:  []plugin.ParameterMsg{},
+			},
 		},
 	}
 }
@@ -282,6 +287,8 @@ func (h *WeaviateHandler) Execute(req plugin.Request) plugin.Response {
 		return h.ingestBatch(req)
 	case "ask_knowledge":
 		return h.askKnowledge(req)
+	case "refresh":
+		return h.refresh(req)
 	default:
 		return plugin.Response{CallID: req.ID, Error: fmt.Sprintf("unknown action %q", req.Action)}
 	}
@@ -616,6 +623,14 @@ func (h *WeaviateHandler) askKnowledge(req plugin.Request) plugin.Response {
 	}
 
 	return plugin.Response{CallID: req.ID, Content: strings.Join(sections, "\n\n")}
+}
+
+func (h *WeaviateHandler) refresh(req plugin.Request) plugin.Response {
+	if err := h.ensureSchemas(context.Background()); err != nil {
+		return plugin.Response{CallID: req.ID, Error: fmt.Sprintf("refresh: %v", err)}
+	}
+	log.Println("weaviate-plugin: refresh: schemas verified")
+	return plugin.Response{CallID: req.ID, Content: `{"refreshed":true}`}
 }
 
 // formatKnowledgeResults formats KnowledgeArticles results as readable text.

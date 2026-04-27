@@ -257,7 +257,7 @@ func TestCapabilities(t *testing.T) {
 	for _, a := range caps.Actions {
 		actions[a.Name] = true
 	}
-	for _, want := range []string{"search", "hybrid_search", "prepare", "sync_actions", "ingest", "ingest_batch"} {
+	for _, want := range []string{"search", "hybrid_search", "prepare", "sync_actions", "ingest", "ingest_batch", "refresh"} {
 		if !actions[want] {
 			t.Errorf("missing action %q", want)
 		}
@@ -1367,5 +1367,20 @@ func TestCapabilities_includesAskKnowledge(t *testing.T) {
 	}
 	if !actions["ask_knowledge"] {
 		t.Error("missing ask_knowledge action in capabilities")
+	}
+}
+
+func TestRefresh(t *testing.T) {
+	h := newHandler(t)
+	resp := h.Execute(plugin.Request{
+		ID:     "refresh-1",
+		Action: "refresh",
+		Args:   map[string]string{},
+	})
+	if resp.Error != "" {
+		t.Fatalf("Execute error: %s", resp.Error)
+	}
+	if !strings.Contains(resp.Content, `"refreshed":true`) {
+		t.Errorf("expected refreshed:true, got: %s", resp.Content)
 	}
 }
