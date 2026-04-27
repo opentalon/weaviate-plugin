@@ -258,6 +258,11 @@ func (h *WeaviateHandler) Capabilities() plugin.CapabilitiesMsg {
 					{Name: "allowed_plugins", Description: "JSON array of allowed plugin names (injected by orchestrator)", Type: "string", Required: false},
 				},
 			},
+			{
+				Name:        "refresh",
+				Description: "Re-create Weaviate collections if they were deleted externally. Called automatically on session clear.",
+				Parameters:  []plugin.ParameterMsg{},
+			},
 		},
 	}
 }
@@ -282,6 +287,8 @@ func (h *WeaviateHandler) Execute(req plugin.Request) plugin.Response {
 		return h.ingestBatch(req)
 	case "ask_knowledge":
 		return h.askKnowledge(req)
+	case "refresh":
+		return h.refresh(req)
 	default:
 		return plugin.Response{CallID: req.ID, Error: fmt.Sprintf("unknown action %q", req.Action)}
 	}
@@ -425,7 +432,10 @@ func (h *WeaviateHandler) prepare(req plugin.Request) plugin.Response {
 	// relevant_tools. Duplicating them here wastes tokens.
 	message := text
 	if knowledgeErr == nil {
+		knowledgeItems := extractItems(knowledgeResult, h.knowledgeCollection)
+		log.Printf("weaviate-plugin: prepare: knowledge_items=%d knowledge_err=%v", len(knowledgeItems), knowledgeErr)
 		if knowledgeText := formatKnowledgeResultsCompact(knowledgeResult, h.knowledgeCollection, h.minPrepareScore); knowledgeText != "" {
+			log.Printf("weaviate-plugin: prepare: injecting knowledge_context len=%d", len(knowledgeText))
 			message = fmt.Sprintf("[knowledge_context]\n%s\n[/knowledge_context]\n\n%s", knowledgeText, text)
 		}
 	}
@@ -615,6 +625,14 @@ func (h *WeaviateHandler) askKnowledge(req plugin.Request) plugin.Response {
 	return plugin.Response{CallID: req.ID, Content: strings.Join(sections, "\n\n")}
 }
 
+func (h *WeaviateHandler) refresh(req plugin.Request) plugin.Response {
+	if err := h.ensureSchemas(context.Background()); err != nil {
+		return plugin.Response{CallID: req.ID, Error: fmt.Sprintf("refresh: %v", err)}
+	}
+	log.Println("weaviate-plugin: refresh: schemas verified")
+	return plugin.Response{CallID: req.ID, Content: `{"refreshed":true}`}
+}
+
 // formatKnowledgeResults formats KnowledgeArticles results as readable text.
 func formatKnowledgeResults(result interface{}, className string) string {
 	items := extractItems(result, className)
@@ -728,6 +746,21 @@ func (h *WeaviateHandler) syncActions(req plugin.Request) plugin.Response {
 		return plugin.Response{CallID: req.ID, Error: "plugin_name is required"}
 	}
 
+	ctx := context.Background()
+
+	// Delete all existing actions for this plugin before re-syncing so that
+	// removed/renamed actions don't linger as stale entries.
+	_, delErr := h.client.Batch().ObjectsBatchDeleter().
+		WithClassName(h.actionsCollection).
+		WithWhere(filters.Where().
+			WithPath([]string{"pluginName"}).
+			WithOperator(filters.Equal).
+			WithValueText(payload.PluginName)).
+		Do(ctx)
+	if delErr != nil {
+		log.Printf("weaviate-plugin: sync_actions: failed to delete old actions for %s: %v", payload.PluginName, delErr)
+	}
+
 	objects := make([]*wmodels.Object, 0, len(payload.Actions))
 	for _, a := range payload.Actions {
 		params := ""
@@ -750,7 +783,7 @@ func (h *WeaviateHandler) syncActions(req plugin.Request) plugin.Response {
 		return plugin.Response{CallID: req.ID, Content: `{"synced":0}`}
 	}
 
-	results, err := h.client.Batch().ObjectsBatcher().WithObjects(objects...).Do(context.Background())
+	results, err := h.client.Batch().ObjectsBatcher().WithObjects(objects...).Do(ctx)
 	if err != nil {
 		return plugin.Response{CallID: req.ID, Error: fmt.Sprintf("batch sync: %v", err)}
 	}
