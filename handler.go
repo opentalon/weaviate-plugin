@@ -857,65 +857,106 @@ func (h *WeaviateHandler) syncActions(req plugin.Request) plugin.Response {
 
 // pruneOrphans deletes any MCPActions and any auto-generated KnowledgeArticles
 // (those with source matching MCPSourcePrefix) whose plugin is NOT in keep.
-// Returns the total deletion count across both collections (best-effort: counts
-// are summed across class deletes; per-class errors are returned but do not
-// abort the second class delete).
+//
+// Implementation note: instead of a single batch-delete with a NotEqual filter
+// (Weaviate's NotEqual on tokenized text fields produces unreliable results
+// for our purposes), we discover the set of distinct pluginName / source
+// values currently indexed and issue one Equal-based batch-delete per orphan.
+// Equal on tokenized text matches the full property value reliably — same
+// pattern PR #16's intra-plugin pre-delete depends on.
+//
+// Returns the total deletion count across both collections (best-effort:
+// per-class errors are recorded but do not abort the second class delete).
 func (h *WeaviateHandler) pruneOrphans(ctx context.Context, keep []string) (int, error) {
 	if len(keep) == 0 {
 		return 0, nil
 	}
+	keepSet := make(map[string]bool, len(keep))
+	for _, k := range keep {
+		keepSet[k] = true
+	}
+
 	total := 0
 	var firstErr error
 
-	// MCPActions: delete where pluginName != every kept plugin.
-	actionsWhere := buildNotInFilter("pluginName", keep, "")
-	n, err := h.batchDelete(ctx, h.actionsCollection, actionsWhere)
-	total += n
+	// MCPActions: discover distinct pluginNames, delete each orphan by Equal.
+	plugins, err := h.distinctValues(ctx, h.actionsCollection, "pluginName", nil)
 	if err != nil {
-		firstErr = fmt.Errorf("MCPActions: %w", err)
+		firstErr = fmt.Errorf("MCPActions distinct: %w", err)
+	}
+	for _, p := range plugins {
+		if keepSet[p] {
+			continue
+		}
+		n, err := h.batchDeleteEqual(ctx, h.actionsCollection, "pluginName", p)
+		total += n
+		if err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("MCPActions delete %s: %w", p, err)
+		}
 	}
 
 	// KnowledgeArticles: scope to MCP-managed records (source LIKE "mcp:*"),
-	// then delete those whose source ("mcp:<plugin>") doesn't match any kept
-	// plugin. We And the source-prefix Like with the NotIn over source values.
+	// discover distinct sources, delete each orphan by Equal on source.
 	mcpScope := filters.Where().
 		WithPath([]string{"source"}).
 		WithOperator(filters.Like).
 		WithValueText(MCPSourcePrefix + "*")
-	notKept := buildNotInFilter("source", keep, MCPSourcePrefix)
-	knowledgeWhere := filters.Where().
-		WithOperator(filters.And).
-		WithOperands([]*filters.WhereBuilder{mcpScope, notKept})
-	n, err = h.batchDelete(ctx, h.knowledgeCollection, knowledgeWhere)
-	total += n
+	sources, err := h.distinctValues(ctx, h.knowledgeCollection, "source", mcpScope)
 	if err != nil && firstErr == nil {
-		firstErr = fmt.Errorf("KnowledgeArticles: %w", err)
+		firstErr = fmt.Errorf("KnowledgeArticles distinct: %w", err)
+	}
+	for _, src := range sources {
+		plugin := strings.TrimPrefix(src, MCPSourcePrefix)
+		if keepSet[plugin] {
+			continue
+		}
+		n, err := h.batchDeleteEqual(ctx, h.knowledgeCollection, "source", src)
+		total += n
+		if err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("KnowledgeArticles delete %s: %w", src, err)
+		}
 	}
 	return total, firstErr
 }
 
-// buildNotInFilter returns a where clause matching values of `path` that are
-// NOT equal to any element of keep. valuePrefix is concatenated with each
-// keep entry — empty for plain pluginName matches, "mcp:" when keying off
-// the source field. With a single kept plugin we return a flat NotEqual; with
-// multiple, an And of NotEqual operands.
-func buildNotInFilter(path string, keep []string, valuePrefix string) *filters.WhereBuilder {
-	operands := make([]*filters.WhereBuilder, 0, len(keep))
-	for _, k := range keep {
-		operands = append(operands, filters.Where().
-			WithPath([]string{path}).
-			WithOperator(filters.NotEqual).
-			WithValueText(valuePrefix+k))
+// distinctValues scans `class` (optionally filtered by `where`) and returns
+// the distinct non-empty values of property `path`. The 10000-record limit
+// is well above any realistic plugin count and the typical sync-managed
+// article count; trip it and we'd need to switch to GraphQL Aggregate.
+func (h *WeaviateHandler) distinctValues(ctx context.Context, class, path string, where *filters.WhereBuilder) ([]string, error) {
+	builder := h.client.GraphQL().Get().
+		WithClassName(class).
+		WithFields(graphql.Field{Name: path}).
+		WithLimit(10000)
+	if where != nil {
+		builder = builder.WithWhere(where)
 	}
-	if len(operands) == 1 {
-		return operands[0]
+	result, err := builder.Do(ctx)
+	if err != nil {
+		return nil, err
 	}
-	return filters.Where().WithOperator(filters.And).WithOperands(operands)
+	if len(result.Errors) > 0 {
+		return nil, fmt.Errorf("%s", result.Errors[0].Message)
+	}
+	seen := map[string]bool{}
+	for _, item := range extractItems(result, class) {
+		if v, ok := item[path].(string); ok && v != "" {
+			seen[v] = true
+		}
+	}
+	out := make([]string, 0, len(seen))
+	for v := range seen {
+		out = append(out, v)
+	}
+	return out, nil
 }
 
-// batchDelete deletes objects from class matching where, returning the number
-// of objects deleted as reported by Weaviate.
-func (h *WeaviateHandler) batchDelete(ctx context.Context, class string, where *filters.WhereBuilder) (int, error) {
+// batchDeleteEqual deletes objects in class where path Equal value.
+func (h *WeaviateHandler) batchDeleteEqual(ctx context.Context, class, path, value string) (int, error) {
+	where := filters.Where().
+		WithPath([]string{path}).
+		WithOperator(filters.Equal).
+		WithValueText(value)
 	resp, err := h.client.Batch().ObjectsBatchDeleter().
 		WithClassName(class).
 		WithWhere(where).

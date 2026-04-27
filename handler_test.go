@@ -728,6 +728,7 @@ func TestSyncActions_serverInstructions(t *testing.T) {
 	if !strings.Contains(resp.Content, `"server_instructions_synced":1`) {
 		t.Errorf("expected server_instructions_synced:1, got: %s", resp.Content)
 	}
+	time.Sleep(300 * time.Millisecond)
 
 	// Verify the article exists with the deterministic UUID and expected fields.
 	id := serverInstructionsUUID("si-test")
@@ -759,6 +760,7 @@ func TestSyncActions_serverInstructions(t *testing.T) {
 	if resp.Error != "" {
 		t.Fatalf("re-sync error: %s", resp.Error)
 	}
+	time.Sleep(300 * time.Millisecond)
 	got, err = rawClient.Data().ObjectsGetter().
 		WithClassName(DefaultKnowledgeCollection).
 		WithID(id).
@@ -787,6 +789,7 @@ func TestSyncActions_pruneOrphans(t *testing.T) {
 			t.Fatalf("seed %s: %s", name, resp.Error)
 		}
 	}
+	time.Sleep(300 * time.Millisecond)
 
 	// Re-sync with keep_plugins listing only the kept plugin — orphan must vanish.
 	payload, _ := json.Marshal(syncActionsPayload{
@@ -801,6 +804,7 @@ func TestSyncActions_pruneOrphans(t *testing.T) {
 	if !strings.Contains(resp.Content, `"orphans_pruned":`) {
 		t.Errorf("expected orphans_pruned in response: %s", resp.Content)
 	}
+	time.Sleep(300 * time.Millisecond)
 
 	// MCPActions: kept plugin's action survives, orphan's action is gone.
 	keepActionID := actionUUID("prune-keep", "act")
@@ -853,6 +857,7 @@ func TestSyncActions_emptyKeepPluginsSkipsPrune(t *testing.T) {
 	if strings.Contains(resp.Content, `"orphans_pruned"`) {
 		t.Errorf("empty keep_plugins must not trigger prune: %s", resp.Content)
 	}
+	time.Sleep(300 * time.Millisecond)
 
 	// Verify the seeded record still exists.
 	id := actionUUID("skip-prune", "act")
@@ -877,6 +882,7 @@ func TestSyncActions_pruneAlsoWithoutInstructions(t *testing.T) {
 	if resp.Error != "" {
 		t.Fatalf("seed: %s", resp.Error)
 	}
+	time.Sleep(300 * time.Millisecond)
 
 	// Now sync a different plugin and prune.
 	payload, _ = json.Marshal(syncActionsPayload{
@@ -888,6 +894,7 @@ func TestSyncActions_pruneAlsoWithoutInstructions(t *testing.T) {
 	if resp.Error != "" {
 		t.Fatalf("prune call: %s", resp.Error)
 	}
+	time.Sleep(300 * time.Millisecond)
 
 	orphanID := actionUUID("no-instr-orphan", "act")
 	got, err := rawClient.Data().ObjectsGetter().WithClassName(DefaultActionsCollection).WithID(orphanID).Do(context.Background())
