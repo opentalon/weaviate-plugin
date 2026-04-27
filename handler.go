@@ -7,6 +7,7 @@ import (
 	"log"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/go-openapi/strfmt"
 	"github.com/google/uuid"
@@ -51,6 +52,7 @@ type Config struct {
 	Vectorizer          string         `json:"vectorizer"`
 	ModuleConfig        map[string]any `json:"module_config"`
 	MinPrepareScore     *float64       `json:"min_prepare_score"`
+	Timeout             time.Duration  `json:"timeout"` // Weaviate HTTP client timeout; default 2m
 }
 
 // WeaviateHandler implements plugin.Handler.
@@ -88,9 +90,14 @@ func (h *WeaviateHandler) Configure(configJSON string) error {
 
 	log.Printf("weaviate-plugin: connecting to %s://%s", cfg.Scheme, cfg.Host)
 
+	clientTimeout := 2 * time.Minute
+	if cfg.Timeout > 0 {
+		clientTimeout = cfg.Timeout
+	}
 	client, err := weaviate.NewClient(weaviate.Config{
-		Host:   cfg.Host,
-		Scheme: cfg.Scheme,
+		Host:    cfg.Host,
+		Scheme:  cfg.Scheme,
+		Timeout: clientTimeout,
 	})
 	if err != nil {
 		return fmt.Errorf("weaviate client: %w", err)
