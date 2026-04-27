@@ -425,7 +425,10 @@ func (h *WeaviateHandler) prepare(req plugin.Request) plugin.Response {
 	// relevant_tools. Duplicating them here wastes tokens.
 	message := text
 	if knowledgeErr == nil {
+		knowledgeItems := extractItems(knowledgeResult, h.knowledgeCollection)
+		log.Printf("weaviate-plugin: prepare: knowledge_items=%d knowledge_err=%v", len(knowledgeItems), knowledgeErr)
 		if knowledgeText := formatKnowledgeResultsCompact(knowledgeResult, h.knowledgeCollection, h.minPrepareScore); knowledgeText != "" {
+			log.Printf("weaviate-plugin: prepare: injecting knowledge_context len=%d", len(knowledgeText))
 			message = fmt.Sprintf("[knowledge_context]\n%s\n[/knowledge_context]\n\n%s", knowledgeText, text)
 		}
 	}
