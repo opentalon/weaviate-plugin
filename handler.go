@@ -269,6 +269,15 @@ func (h *WeaviateHandler) Capabilities() plugin.CapabilitiesMsg {
 				},
 			},
 			{
+				Name:        "search_instructions",
+				Description: "Search MCP server instructions stored during plugin sync. Returns guidance and context from MCP servers that match the query.",
+				Parameters: []plugin.ParameterMsg{
+					{Name: "query", Description: "Natural language query to search instructions", Type: "string", Required: true},
+					{Name: "plugin", Description: "Narrow results to a specific plugin (e.g. 'timly')", Type: "string", Required: false},
+					{Name: "limit", Description: "Maximum results (default 5)", Type: "integer", Required: false},
+				},
+			},
+			{
 				Name:        "refresh",
 				Description: "Re-create Weaviate collections if they were deleted externally. Called automatically on session clear.",
 				Parameters:  []plugin.ParameterMsg{},
@@ -297,6 +306,8 @@ func (h *WeaviateHandler) Execute(req plugin.Request) plugin.Response {
 		return h.ingestBatch(req)
 	case "ask_knowledge":
 		return h.askKnowledge(req)
+	case "search_instructions":
+		return h.searchInstructions(req)
 	case "refresh":
 		return h.refresh(req)
 	default:
@@ -635,6 +646,55 @@ func (h *WeaviateHandler) askKnowledge(req plugin.Request) plugin.Response {
 	return plugin.Response{CallID: req.ID, Content: strings.Join(sections, "\n\n")}
 }
 
+// searchInstructions searches the KnowledgeArticles collection for MCP server
+// instructions (source starts with "mcp:"). This surfaces guidance that MCP
+// servers declared at init time.
+func (h *WeaviateHandler) searchInstructions(req plugin.Request) plugin.Response {
+	query, ok := req.Args["query"]
+	if !ok || query == "" {
+		return plugin.Response{CallID: req.ID, Error: "query is required"}
+	}
+
+	ctx := context.Background()
+
+	limit := 5
+	if v, ok := req.Args["limit"]; ok && v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			limit = n
+		}
+	}
+
+	// Filter to MCP-sourced instructions only (source starts with "mcp:").
+	where := filters.Where().
+		WithPath([]string{"source"}).
+		WithOperator(filters.Like).
+		WithValueText("mcp:*")
+
+	// Optionally narrow to a specific plugin.
+	if p := req.Args["plugin"]; p != "" {
+		where = filters.Where().
+			WithPath([]string{"source"}).
+			WithOperator(filters.Equal).
+			WithValueText(MCPSourcePrefix + p)
+	}
+
+	fields := []graphql.Field{
+		{Name: "title"}, {Name: "content"}, {Name: "source"}, {Name: "tags"},
+		{Name: "_additional", Fields: []graphql.Field{{Name: "score"}}},
+	}
+
+	result, err := h.searchCollection(ctx, h.knowledgeCollection, fields, query, limit, where)
+	if err != nil {
+		return plugin.Response{CallID: req.ID, Error: fmt.Sprintf("search instructions: %v", err)}
+	}
+
+	text := formatKnowledgeResults(result, h.knowledgeCollection)
+	if text == "" {
+		return plugin.Response{CallID: req.ID, Content: "No MCP server instructions found."}
+	}
+	return plugin.Response{CallID: req.ID, Content: text}
+}
+
 func (h *WeaviateHandler) refresh(req plugin.Request) plugin.Response {
 	if err := h.ensureSchemas(context.Background()); err != nil {
 		return plugin.Response{CallID: req.ID, Error: fmt.Sprintf("refresh: %v", err)}
@@ -803,6 +863,7 @@ func (h *WeaviateHandler) syncActions(req plugin.Request) plugin.Response {
 	// next sync (or pruned via keep_plugins below).
 	var instructionsObj *wmodels.Object
 	if payload.ServerInstructions != "" {
+		log.Printf("weaviate-plugin: sync_actions: storing server instructions for %s (%d bytes)", payload.PluginName, len(payload.ServerInstructions))
 		instructionsObj = &wmodels.Object{
 			Class: h.knowledgeCollection,
 			ID:    strfmt.UUID(serverInstructionsUUID(payload.PluginName)),
@@ -810,7 +871,7 @@ func (h *WeaviateHandler) syncActions(req plugin.Request) plugin.Response {
 				"title":   payload.PluginName + " MCP server instructions",
 				"content": payload.ServerInstructions,
 				"source":  MCPSourcePrefix + payload.PluginName,
-				"tags":    []string{"mcp", "server-instructions", payload.PluginName},
+				"tags":    []string{"opentalon", "mcp", "server-instructions", payload.PluginName},
 			},
 		}
 		objects = append(objects, instructionsObj)
