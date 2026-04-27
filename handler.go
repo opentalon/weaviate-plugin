@@ -728,6 +728,21 @@ func (h *WeaviateHandler) syncActions(req plugin.Request) plugin.Response {
 		return plugin.Response{CallID: req.ID, Error: "plugin_name is required"}
 	}
 
+	ctx := context.Background()
+
+	// Delete all existing actions for this plugin before re-syncing so that
+	// removed/renamed actions don't linger as stale entries.
+	_, delErr := h.client.Batch().ObjectsBatchDeleter().
+		WithClassName(h.actionsCollection).
+		WithWhere(filters.Where().
+			WithPath([]string{"pluginName"}).
+			WithOperator(filters.Equal).
+			WithValueText(payload.PluginName)).
+		Do(ctx)
+	if delErr != nil {
+		log.Printf("weaviate-plugin: sync_actions: failed to delete old actions for %s: %v", payload.PluginName, delErr)
+	}
+
 	objects := make([]*wmodels.Object, 0, len(payload.Actions))
 	for _, a := range payload.Actions {
 		params := ""
@@ -750,7 +765,7 @@ func (h *WeaviateHandler) syncActions(req plugin.Request) plugin.Response {
 		return plugin.Response{CallID: req.ID, Content: `{"synced":0}`}
 	}
 
-	results, err := h.client.Batch().ObjectsBatcher().WithObjects(objects...).Do(context.Background())
+	results, err := h.client.Batch().ObjectsBatcher().WithObjects(objects...).Do(ctx)
 	if err != nil {
 		return plugin.Response{CallID: req.ID, Error: fmt.Sprintf("batch sync: %v", err)}
 	}

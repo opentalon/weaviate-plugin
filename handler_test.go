@@ -629,6 +629,70 @@ func TestSyncActions_missingPluginName(t *testing.T) {
 	}
 }
 
+func TestSyncActions_deletesStaleActions(t *testing.T) {
+	h := newHandler(t)
+
+	// First sync: two actions.
+	payload, _ := json.Marshal(syncActionsPayload{
+		PluginName: "stale-plugin",
+		Actions: []syncActionEntry{
+			{Name: "old_action", Description: "Will be removed"},
+			{Name: "keep_action", Description: "Will be kept"},
+		},
+	})
+	resp := h.Execute(plugin.Request{
+		ID:     "sync-stale1",
+		Action: "sync_actions",
+		Args:   map[string]string{"payload": string(payload)},
+	})
+	if resp.Error != "" {
+		t.Fatalf("first sync error: %s", resp.Error)
+	}
+
+	time.Sleep(300 * time.Millisecond)
+
+	// Second sync: only keep_action — old_action should be deleted.
+	payload, _ = json.Marshal(syncActionsPayload{
+		PluginName: "stale-plugin",
+		Actions: []syncActionEntry{
+			{Name: "keep_action", Description: "Updated description"},
+		},
+	})
+	resp = h.Execute(plugin.Request{
+		ID:     "sync-stale2",
+		Action: "sync_actions",
+		Args:   map[string]string{"payload": string(payload)},
+	})
+	if resp.Error != "" {
+		t.Fatalf("second sync error: %s", resp.Error)
+	}
+
+	time.Sleep(300 * time.Millisecond)
+
+	// Verify old_action no longer exists by searching for it.
+	oldID := actionUUID("stale-plugin", "old_action")
+	objs, err := rawClient.Data().ObjectsGetter().
+		WithClassName(DefaultActionsCollection).
+		WithID(oldID).
+		Do(context.Background())
+	if err == nil && len(objs) > 0 {
+		t.Error("old_action should have been deleted by the second sync, but it still exists")
+	}
+
+	// Verify keep_action still exists.
+	keepID := actionUUID("stale-plugin", "keep_action")
+	objs, err = rawClient.Data().ObjectsGetter().
+		WithClassName(DefaultActionsCollection).
+		WithID(keepID).
+		Do(context.Background())
+	if err != nil {
+		t.Fatalf("check keep_action: %v", err)
+	}
+	if len(objs) == 0 {
+		t.Error("keep_action should still exist after second sync")
+	}
+}
+
 func TestSyncActions_emptyActions(t *testing.T) {
 	h := newHandler(t)
 	payload, _ := json.Marshal(syncActionsPayload{
