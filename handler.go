@@ -26,6 +26,16 @@ const (
 // actionNS is a UUID v5 namespace for deterministic MCP action object IDs.
 var actionNS = uuid.MustParse("d4e8f1a2-5b3c-4d6e-9f0a-1b2c3d4e5f6a")
 
+// articleNS is a UUID v5 namespace for deterministic KnowledgeArticles IDs
+// generated from sync_actions (e.g. one article per plugin's MCP server
+// instructions). Distinct from actionNS so the two ID spaces never collide.
+var articleNS = uuid.MustParse("e5f9a2b3-6c4d-5e7f-a0b1-2c3d4e5f6a7b")
+
+// MCPSourcePrefix tags KnowledgeArticles records that were generated from a
+// plugin's MCP server-instructions text rather than authored manually. Used
+// for filtered prune queries — only auto-managed records are deleted.
+const MCPSourcePrefix = "mcp:"
+
 // Config is the JSON config block passed via the Init RPC.
 type Config struct {
 	Host                string         `json:"host"`
@@ -721,9 +731,14 @@ func extractItems(result interface{}, className string) []map[string]interface{}
 // RAG ingestion actions
 // ---------------------------------------------------------------------------
 
+// syncActionsPayload mirrors the JSON shape sent by opentalon's orchestrator.
+// ServerInstructions and KeepPlugins are added by opentalon/opentalon#107 — both
+// are optional, so older orchestrators (which omit them) keep working.
 type syncActionsPayload struct {
-	PluginName string            `json:"plugin_name"`
-	Actions    []syncActionEntry `json:"actions"`
+	PluginName         string            `json:"plugin_name"`
+	Actions            []syncActionEntry `json:"actions"`
+	ServerInstructions string            `json:"server_instructions,omitempty"`
+	KeepPlugins        []string          `json:"keep_plugins,omitempty"`
 }
 
 type syncActionEntry struct {
@@ -749,7 +764,9 @@ func (h *WeaviateHandler) syncActions(req plugin.Request) plugin.Response {
 	ctx := context.Background()
 
 	// Delete all existing actions for this plugin before re-syncing so that
-	// removed/renamed actions don't linger as stale entries.
+	// removed/renamed actions don't linger as stale entries (intra-plugin
+	// orphan prune from #16). KnowledgeArticles records keyed by deterministic
+	// UUID are overwritten by upsert below, so they don't need a pre-delete.
 	_, delErr := h.client.Batch().ObjectsBatchDeleter().
 		WithClassName(h.actionsCollection).
 		WithWhere(filters.Where().
@@ -779,19 +796,184 @@ func (h *WeaviateHandler) syncActions(req plugin.Request) plugin.Response {
 		})
 	}
 
-	if len(objects) == 0 {
-		return plugin.Response{CallID: req.ID, Content: `{"synced":0}`}
+	// Upsert one KnowledgeArticles record carrying the plugin's server-level
+	// instructions text (e.g. an MCP server's `initialize.instructions`) when
+	// the orchestrator forwarded it. Keyed by deterministic UUID so re-runs are
+	// idempotent and a removed plugin's record is overwritten cleanly on the
+	// next sync (or pruned via keep_plugins below).
+	var instructionsObj *wmodels.Object
+	if payload.ServerInstructions != "" {
+		instructionsObj = &wmodels.Object{
+			Class: h.knowledgeCollection,
+			ID:    strfmt.UUID(serverInstructionsUUID(payload.PluginName)),
+			Properties: map[string]interface{}{
+				"title":   payload.PluginName + " MCP server instructions",
+				"content": payload.ServerInstructions,
+				"source":  MCPSourcePrefix + payload.PluginName,
+				"tags":    []string{"mcp", "server-instructions", payload.PluginName},
+			},
+		}
+		objects = append(objects, instructionsObj)
 	}
 
-	results, err := h.client.Batch().ObjectsBatcher().WithObjects(objects...).Do(ctx)
+	syncedActions := len(payload.Actions)
+	if len(objects) > 0 {
+		results, err := h.client.Batch().ObjectsBatcher().WithObjects(objects...).Do(ctx)
+		if err != nil {
+			return plugin.Response{CallID: req.ID, Error: fmt.Sprintf("batch sync: %v", err)}
+		}
+		if err := checkBatchErrors(results); err != nil {
+			return plugin.Response{CallID: req.ID, Error: fmt.Sprintf("batch sync: %v", err)}
+		}
+	}
+
+	// Inter-plugin orphan prune: when the orchestrator ships the authoritative
+	// live-plugin list, delete records for plugins no longer present. Idempotent
+	// across the per-plugin calls of one full startup sync, so it's safe to
+	// apply on every call. Skip when keep_plugins is empty — that could
+	// legitimately mean "no plugins" but it's also the legacy / corrupted-payload
+	// case, and nuking the whole index on a bad input is too costly.
+	pruned := 0
+	if len(payload.KeepPlugins) > 0 {
+		n, err := h.pruneOrphans(ctx, payload.KeepPlugins)
+		if err != nil {
+			log.Printf("weaviate-plugin: prune_orphans failed: %v", err)
+			// Don't fail the sync_actions call on prune error — upserts already
+			// succeeded, and a transient delete failure is recoverable on next sync.
+		}
+		pruned = n
+	}
+
+	respBody := fmt.Sprintf(`{"synced":%d`, syncedActions)
+	if instructionsObj != nil {
+		respBody += `,"server_instructions_synced":1`
+	}
+	if len(payload.KeepPlugins) > 0 {
+		respBody += fmt.Sprintf(`,"orphans_pruned":%d`, pruned)
+	}
+	respBody += `}`
+	return plugin.Response{CallID: req.ID, Content: respBody}
+}
+
+// pruneOrphans deletes any MCPActions and any auto-generated KnowledgeArticles
+// (those with source matching MCPSourcePrefix) whose plugin is NOT in keep.
+//
+// Implementation note: instead of a single batch-delete with a NotEqual filter
+// (Weaviate's NotEqual on tokenized text fields produces unreliable results
+// for our purposes), we discover the set of distinct pluginName / source
+// values currently indexed and issue one Equal-based batch-delete per orphan.
+// Equal on tokenized text matches the full property value reliably — same
+// pattern PR #16's intra-plugin pre-delete depends on.
+//
+// Returns the total deletion count across both collections (best-effort:
+// per-class errors are recorded but do not abort the second class delete).
+func (h *WeaviateHandler) pruneOrphans(ctx context.Context, keep []string) (int, error) {
+	if len(keep) == 0 {
+		return 0, nil
+	}
+	keepSet := make(map[string]bool, len(keep))
+	for _, k := range keep {
+		keepSet[k] = true
+	}
+
+	total := 0
+	var firstErr error
+
+	// MCPActions: discover distinct pluginNames, delete each orphan by Equal.
+	plugins, err := h.distinctValues(ctx, h.actionsCollection, "pluginName", nil)
 	if err != nil {
-		return plugin.Response{CallID: req.ID, Error: fmt.Sprintf("batch sync: %v", err)}
+		firstErr = fmt.Errorf("MCPActions distinct: %w", err)
 	}
-	if err := checkBatchErrors(results); err != nil {
-		return plugin.Response{CallID: req.ID, Error: fmt.Sprintf("batch sync: %v", err)}
+	for _, p := range plugins {
+		if keepSet[p] {
+			continue
+		}
+		n, err := h.batchDeleteEqual(ctx, h.actionsCollection, "pluginName", p)
+		total += n
+		if err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("MCPActions delete %s: %w", p, err)
+		}
 	}
 
-	return plugin.Response{CallID: req.ID, Content: fmt.Sprintf(`{"synced":%d}`, len(objects))}
+	// KnowledgeArticles: scope to MCP-managed records (source LIKE "mcp:*"),
+	// discover distinct sources, delete each orphan by Equal on source.
+	mcpScope := filters.Where().
+		WithPath([]string{"source"}).
+		WithOperator(filters.Like).
+		WithValueText(MCPSourcePrefix + "*")
+	sources, err := h.distinctValues(ctx, h.knowledgeCollection, "source", mcpScope)
+	if err != nil && firstErr == nil {
+		firstErr = fmt.Errorf("KnowledgeArticles distinct: %w", err)
+	}
+	for _, src := range sources {
+		plugin := strings.TrimPrefix(src, MCPSourcePrefix)
+		if keepSet[plugin] {
+			continue
+		}
+		n, err := h.batchDeleteEqual(ctx, h.knowledgeCollection, "source", src)
+		total += n
+		if err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("KnowledgeArticles delete %s: %w", src, err)
+		}
+	}
+	return total, firstErr
+}
+
+// distinctValues scans `class` (optionally filtered by `where`) and returns
+// the distinct non-empty values of property `path`. The 10000-record limit
+// is well above any realistic plugin count and the typical sync-managed
+// article count; trip it and we'd need to switch to GraphQL Aggregate.
+func (h *WeaviateHandler) distinctValues(ctx context.Context, class, path string, where *filters.WhereBuilder) ([]string, error) {
+	builder := h.client.GraphQL().Get().
+		WithClassName(class).
+		WithFields(graphql.Field{Name: path}).
+		WithLimit(10000)
+	if where != nil {
+		builder = builder.WithWhere(where)
+	}
+	result, err := builder.Do(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if len(result.Errors) > 0 {
+		return nil, fmt.Errorf("%s", result.Errors[0].Message)
+	}
+	seen := map[string]bool{}
+	for _, item := range extractItems(result, class) {
+		if v, ok := item[path].(string); ok && v != "" {
+			seen[v] = true
+		}
+	}
+	out := make([]string, 0, len(seen))
+	for v := range seen {
+		out = append(out, v)
+	}
+	return out, nil
+}
+
+// batchDeleteEqual deletes objects in class where path Equal value.
+func (h *WeaviateHandler) batchDeleteEqual(ctx context.Context, class, path, value string) (int, error) {
+	where := filters.Where().
+		WithPath([]string{path}).
+		WithOperator(filters.Equal).
+		WithValueText(value)
+	resp, err := h.client.Batch().ObjectsBatchDeleter().
+		WithClassName(class).
+		WithWhere(where).
+		Do(ctx)
+	if err != nil {
+		return 0, err
+	}
+	if resp != nil && resp.Results != nil {
+		return int(resp.Results.Successful), nil
+	}
+	return 0, nil
+}
+
+// serverInstructionsUUID returns a deterministic UUID v5 for the
+// per-plugin server-instructions article. Re-runs upsert in place.
+func serverInstructionsUUID(pluginName string) string {
+	return uuid.NewSHA1(articleNS, []byte("mcp-server-instructions:"+pluginName)).String()
 }
 
 type knowledgeArticle struct {

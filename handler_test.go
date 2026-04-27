@@ -712,6 +712,197 @@ func TestSyncActions_emptyActions(t *testing.T) {
 	}
 }
 
+func TestSyncActions_serverInstructions(t *testing.T) {
+	h := newHandler(t)
+
+	const prose = "Timly MCP server.\n\n## Org-units vs Containers\nA Place is a storage unit; an Org-unit is a structural unit."
+	payload, _ := json.Marshal(syncActionsPayload{
+		PluginName:         "si-test",
+		Actions:            []syncActionEntry{{Name: "list-items", Description: "List items"}},
+		ServerInstructions: prose,
+	})
+	resp := h.Execute(plugin.Request{ID: "sync-si", Action: "sync_actions", Args: map[string]string{"payload": string(payload)}})
+	if resp.Error != "" {
+		t.Fatalf("Execute error: %s", resp.Error)
+	}
+	if !strings.Contains(resp.Content, `"server_instructions_synced":1`) {
+		t.Errorf("expected server_instructions_synced:1, got: %s", resp.Content)
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	// Verify the article exists with the deterministic UUID and expected fields.
+	id := serverInstructionsUUID("si-test")
+	got, err := rawClient.Data().ObjectsGetter().
+		WithClassName(DefaultKnowledgeCollection).
+		WithID(id).
+		Do(context.Background())
+	if err != nil {
+		t.Fatalf("get article by ID %s: %v", id, err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected 1 article, got %d", len(got))
+	}
+	props := got[0].Properties.(map[string]interface{})
+	if src, _ := props["source"].(string); src != "mcp:si-test" {
+		t.Errorf("source = %q, want %q", src, "mcp:si-test")
+	}
+	if content, _ := props["content"].(string); content != prose {
+		t.Errorf("content mismatch:\ngot:  %q\nwant: %q", content, prose)
+	}
+
+	// Idempotency: re-syncing with updated prose must overwrite, not duplicate.
+	const newProse = "Timly MCP server.\nUpdated."
+	payload, _ = json.Marshal(syncActionsPayload{
+		PluginName:         "si-test",
+		ServerInstructions: newProse,
+	})
+	resp = h.Execute(plugin.Request{ID: "sync-si-2", Action: "sync_actions", Args: map[string]string{"payload": string(payload)}})
+	if resp.Error != "" {
+		t.Fatalf("re-sync error: %s", resp.Error)
+	}
+	time.Sleep(300 * time.Millisecond)
+	got, err = rawClient.Data().ObjectsGetter().
+		WithClassName(DefaultKnowledgeCollection).
+		WithID(id).
+		Do(context.Background())
+	if err != nil || len(got) != 1 {
+		t.Fatalf("re-fetch: err=%v len=%d", err, len(got))
+	}
+	props = got[0].Properties.(map[string]interface{})
+	if content, _ := props["content"].(string); content != newProse {
+		t.Errorf("content not updated: %q", content)
+	}
+}
+
+func TestSyncActions_pruneOrphans(t *testing.T) {
+	h := newHandler(t)
+
+	// Seed two plugins (each with one action and instructions).
+	for _, name := range []string{"prune-keep", "prune-orphan"} {
+		payload, _ := json.Marshal(syncActionsPayload{
+			PluginName:         name,
+			Actions:            []syncActionEntry{{Name: "act", Description: "x"}},
+			ServerInstructions: "instructions for " + name,
+		})
+		resp := h.Execute(plugin.Request{ID: "seed-" + name, Action: "sync_actions", Args: map[string]string{"payload": string(payload)}})
+		if resp.Error != "" {
+			t.Fatalf("seed %s: %s", name, resp.Error)
+		}
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	// Re-sync with keep_plugins listing only the kept plugin — orphan must vanish.
+	payload, _ := json.Marshal(syncActionsPayload{
+		PluginName:  "prune-keep",
+		Actions:     []syncActionEntry{{Name: "act", Description: "x"}},
+		KeepPlugins: []string{"prune-keep"},
+	})
+	resp := h.Execute(plugin.Request{ID: "prune-call", Action: "sync_actions", Args: map[string]string{"payload": string(payload)}})
+	if resp.Error != "" {
+		t.Fatalf("prune call: %s", resp.Error)
+	}
+	if !strings.Contains(resp.Content, `"orphans_pruned":`) {
+		t.Errorf("expected orphans_pruned in response: %s", resp.Content)
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	// MCPActions: kept plugin's action survives, orphan's action is gone.
+	keepActionID := actionUUID("prune-keep", "act")
+	got, err := rawClient.Data().ObjectsGetter().WithClassName(DefaultActionsCollection).WithID(keepActionID).Do(context.Background())
+	if err != nil || len(got) != 1 {
+		t.Errorf("kept action missing: err=%v len=%d", err, len(got))
+	}
+	orphanActionID := actionUUID("prune-orphan", "act")
+	got, err = rawClient.Data().ObjectsGetter().WithClassName(DefaultActionsCollection).WithID(orphanActionID).Do(context.Background())
+	if err == nil && len(got) != 0 {
+		t.Errorf("orphan action still present after prune: %d records", len(got))
+	}
+
+	// KnowledgeArticles: kept plugin's article survives, orphan's article is gone.
+	keepArticleID := serverInstructionsUUID("prune-keep")
+	got, err = rawClient.Data().ObjectsGetter().WithClassName(DefaultKnowledgeCollection).WithID(keepArticleID).Do(context.Background())
+	if err != nil || len(got) != 1 {
+		t.Errorf("kept article missing: err=%v len=%d", err, len(got))
+	}
+	orphanArticleID := serverInstructionsUUID("prune-orphan")
+	got, err = rawClient.Data().ObjectsGetter().WithClassName(DefaultKnowledgeCollection).WithID(orphanArticleID).Do(context.Background())
+	if err == nil && len(got) != 0 {
+		t.Errorf("orphan article still present after prune: %d records", len(got))
+	}
+}
+
+func TestSyncActions_emptyKeepPluginsSkipsPrune(t *testing.T) {
+	h := newHandler(t)
+
+	// Seed one record.
+	payload, _ := json.Marshal(syncActionsPayload{
+		PluginName: "skip-prune",
+		Actions:    []syncActionEntry{{Name: "act", Description: "x"}},
+	})
+	resp := h.Execute(plugin.Request{ID: "seed-skip", Action: "sync_actions", Args: map[string]string{"payload": string(payload)}})
+	if resp.Error != "" {
+		t.Fatalf("seed: %s", resp.Error)
+	}
+
+	// Send an empty keep_plugins — must NOT trigger a delete-everything-in-class.
+	payload, _ = json.Marshal(syncActionsPayload{
+		PluginName:  "skip-prune",
+		Actions:     []syncActionEntry{{Name: "act", Description: "x"}},
+		KeepPlugins: []string{},
+	})
+	resp = h.Execute(plugin.Request{ID: "skip-prune-call", Action: "sync_actions", Args: map[string]string{"payload": string(payload)}})
+	if resp.Error != "" {
+		t.Fatalf("skip-prune call: %s", resp.Error)
+	}
+	if strings.Contains(resp.Content, `"orphans_pruned"`) {
+		t.Errorf("empty keep_plugins must not trigger prune: %s", resp.Content)
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	// Verify the seeded record still exists.
+	id := actionUUID("skip-prune", "act")
+	got, err := rawClient.Data().ObjectsGetter().WithClassName(DefaultActionsCollection).WithID(id).Do(context.Background())
+	if err != nil || len(got) != 1 {
+		t.Errorf("record was pruned despite empty keep_plugins: err=%v len=%d", err, len(got))
+	}
+}
+
+func TestSyncActions_pruneAlsoWithoutInstructions(t *testing.T) {
+	// Verify a sync_actions call with keep_plugins works even when the new
+	// optional fields aren't present together — only KeepPlugins set, no
+	// ServerInstructions on this call.
+	h := newHandler(t)
+
+	// Seed an orphan.
+	payload, _ := json.Marshal(syncActionsPayload{
+		PluginName: "no-instr-orphan",
+		Actions:    []syncActionEntry{{Name: "act", Description: "x"}},
+	})
+	resp := h.Execute(plugin.Request{ID: "seed-noinstr", Action: "sync_actions", Args: map[string]string{"payload": string(payload)}})
+	if resp.Error != "" {
+		t.Fatalf("seed: %s", resp.Error)
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	// Now sync a different plugin and prune.
+	payload, _ = json.Marshal(syncActionsPayload{
+		PluginName:  "no-instr-keep",
+		Actions:     []syncActionEntry{{Name: "act", Description: "x"}},
+		KeepPlugins: []string{"no-instr-keep"},
+	})
+	resp = h.Execute(plugin.Request{ID: "prune-noinstr", Action: "sync_actions", Args: map[string]string{"payload": string(payload)}})
+	if resp.Error != "" {
+		t.Fatalf("prune call: %s", resp.Error)
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	orphanID := actionUUID("no-instr-orphan", "act")
+	got, err := rawClient.Data().ObjectsGetter().WithClassName(DefaultActionsCollection).WithID(orphanID).Do(context.Background())
+	if err == nil && len(got) != 0 {
+		t.Errorf("orphan still present without ServerInstructions path: %d records", len(got))
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Integration tests — ingest
 // ---------------------------------------------------------------------------
