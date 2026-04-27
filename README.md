@@ -59,6 +59,9 @@ plugins:
       knowledge_collection: "KnowledgeArticles"  # collection for knowledge articles (default)
       auto_create_schema: true                   # auto-create MCPActions & KnowledgeArticles on startup (default true)
 
+      # Client timeout
+      timeout: "2m"                # Weaviate HTTP client timeout (default 2m); increase for large batch syncs
+
       # Prepare-phase filtering
       min_prepare_score: 0.012     # minimum hybrid-search score for prepare results (default 0.012)
 
