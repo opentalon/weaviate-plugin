@@ -813,6 +813,12 @@ type syncActionsPayload struct {
 	Actions            []syncActionEntry `json:"actions"`
 	ServerInstructions string            `json:"server_instructions,omitempty"`
 	KeepPlugins        []string          `json:"keep_plugins,omitempty"`
+	// IsContinuationBatch is set by the orchestrator on batches 1..N of a
+	// chunked plugin sync so the plugin skips the per-plugin pre-delete that
+	// would otherwise wipe the previous batches' inserts. Batch 0 (default
+	// false) keeps the orphan-prune semantic. Older orchestrators omit the
+	// field entirely — default false matches the legacy single-batch behaviour.
+	IsContinuationBatch bool `json:"is_continuation_batch,omitempty"`
 }
 
 type syncActionEntry struct {
@@ -841,15 +847,22 @@ func (h *WeaviateHandler) syncActions(req plugin.Request) plugin.Response {
 	// removed/renamed actions don't linger as stale entries (intra-plugin
 	// orphan prune from #16). KnowledgeArticles records keyed by deterministic
 	// UUID are overwritten by upsert below, so they don't need a pre-delete.
-	_, delErr := h.client.Batch().ObjectsBatchDeleter().
-		WithClassName(h.actionsCollection).
-		WithWhere(filters.Where().
-			WithPath([]string{"pluginName"}).
-			WithOperator(filters.Equal).
-			WithValueText(payload.PluginName)).
-		Do(ctx)
-	if delErr != nil {
-		log.Printf("weaviate-plugin: sync_actions: failed to delete old actions for %s: %v", payload.PluginName, delErr)
+	//
+	// Skip on continuation batches (1..N of a chunked sync) — otherwise each
+	// batch would wipe the previous batches' inserts, leaving only the last
+	// batch's contents persisted. Batch 0 (IsContinuationBatch=false) carries
+	// the orphan-prune semantic for the entire plugin.
+	if !payload.IsContinuationBatch {
+		_, delErr := h.client.Batch().ObjectsBatchDeleter().
+			WithClassName(h.actionsCollection).
+			WithWhere(filters.Where().
+				WithPath([]string{"pluginName"}).
+				WithOperator(filters.Equal).
+				WithValueText(payload.PluginName)).
+			Do(ctx)
+		if delErr != nil {
+			log.Printf("weaviate-plugin: sync_actions: failed to delete old actions for %s: %v", payload.PluginName, delErr)
+		}
 	}
 
 	objects := make([]*wmodels.Object, 0, len(payload.Actions))
