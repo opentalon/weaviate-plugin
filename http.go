@@ -16,6 +16,8 @@ func (h *WeaviateHandler) listenHTTP() error {
 	mux.HandleFunc("GET /api/v1/health", h.handleHealth)
 	mux.HandleFunc("POST /api/v1/articles", h.requireToken(h.handleIngestArticle))
 	mux.HandleFunc("POST /api/v1/articles/batch", h.requireToken(h.handleIngestBatch))
+	mux.HandleFunc("DELETE /api/v1/articles/{id}", h.requireToken(h.handleDeleteArticle))
+	mux.HandleFunc("DELETE /api/v1/articles", h.requireToken(h.handleDeleteArticlesBySource))
 	mux.HandleFunc("POST /api/v1/actions/sync", h.requireToken(h.handleSyncActions))
 	return http.ListenAndServe(h.httpAddr, mux)
 }
@@ -74,6 +76,39 @@ func (h *WeaviateHandler) handleIngestBatch(w http.ResponseWriter, r *http.Reque
 	})
 
 	writePluginResponse(w, resp)
+}
+
+func (h *WeaviateHandler) handleDeleteArticle(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		writeJSONError(w, http.StatusBadRequest, "missing article id")
+		return
+	}
+	err := h.client.Data().Deleter().
+		WithClassName(h.knowledgeCollection).
+		WithID(id).
+		Do(r.Context())
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("delete: %v", err))
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = fmt.Fprintf(w, `{"deleted":true,"id":%q}`, id)
+}
+
+func (h *WeaviateHandler) handleDeleteArticlesBySource(w http.ResponseWriter, r *http.Request) {
+	source := r.URL.Query().Get("source")
+	if source == "" {
+		writeJSONError(w, http.StatusBadRequest, "missing ?source= query parameter")
+		return
+	}
+	n, err := h.batchDeleteEqual(r.Context(), h.knowledgeCollection, "source", source)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("batch delete: %v", err))
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = fmt.Fprintf(w, `{"deleted":%d,"source":%q}`, n, source)
 }
 
 func (h *WeaviateHandler) handleSyncActions(w http.ResponseWriter, r *http.Request) {
