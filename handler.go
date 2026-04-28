@@ -68,6 +68,7 @@ type WeaviateHandler struct {
 	vectorizer          string
 	moduleConfig        map[string]any
 	minPrepareScore     float64
+	clientTimeout       time.Duration
 }
 
 // Configure is called by the SDK during the Init RPC with the JSON config block.
@@ -98,6 +99,7 @@ func (h *WeaviateHandler) Configure(configJSON string) error {
 			log.Printf("weaviate-plugin: invalid timeout %q, using default %s: %v", cfg.Timeout, clientTimeout, err)
 		}
 	}
+	log.Printf("weaviate-plugin: client timeout = %s (config %q)", clientTimeout, cfg.Timeout)
 	client, err := weaviate.NewClient(weaviate.Config{
 		Host:    cfg.Host,
 		Scheme:  cfg.Scheme,
@@ -108,6 +110,7 @@ func (h *WeaviateHandler) Configure(configJSON string) error {
 	}
 
 	h.client = client
+	h.clientTimeout = clientTimeout
 	h.collection = cfg.Collection
 	h.fields = cfg.Fields
 	h.limit = cfg.Limit
