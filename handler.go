@@ -468,8 +468,12 @@ func (h *WeaviateHandler) prepare(req plugin.Request) plugin.Response {
 	message := text
 	if knowledgeErr == nil {
 		knowledgeItems := extractItems(knowledgeResult, h.knowledgeCollection)
+		// Exclude MCP server-instructions articles — they are already in the
+		// system prompt via SystemPromptAddition. Including them in
+		// [knowledge_context] would duplicate them on every LLM call.
+		knowledgeItems = filterOutMCPItems(knowledgeItems)
 		log.Printf("weaviate-plugin: prepare: knowledge_items=%d knowledge_err=%v", len(knowledgeItems), knowledgeErr)
-		if knowledgeText := formatKnowledgeResultsCompact(knowledgeResult, h.knowledgeCollection, h.minPrepareScore); knowledgeText != "" {
+		if knowledgeText := formatItemsCompact(knowledgeItems, h.minPrepareScore); knowledgeText != "" {
 			log.Printf("weaviate-plugin: prepare: injecting knowledge_context len=%d", len(knowledgeText))
 			message = fmt.Sprintf("[knowledge_context]\n%s\n[/knowledge_context]\n\n%s", knowledgeText, text)
 		}
@@ -531,7 +535,12 @@ func extractToolNamesAboveScore(result interface{}, className string, minScore f
 // threshold as compact text (title + content only). Returns "" when no
 // articles pass the threshold.
 func formatKnowledgeResultsCompact(result interface{}, className string, minScore float64) string {
-	items := extractItems(result, className)
+	return formatItemsCompact(extractItems(result, className), minScore)
+}
+
+// formatItemsCompact formats pre-extracted items above the score threshold as
+// compact text (title + content only). Returns "" when no items pass.
+func formatItemsCompact(items []map[string]interface{}, minScore float64) string {
 	if len(items) == 0 {
 		return ""
 	}
@@ -551,6 +560,22 @@ func formatKnowledgeResultsCompact(result interface{}, className string, minScor
 		fmt.Fprintf(&sb, "%s\n%s", title, content)
 	}
 	return sb.String()
+}
+
+// filterOutMCPItems removes KnowledgeArticles items whose source starts with
+// "mcp:" (server-instructions synced via sync_actions). These are already in
+// the system prompt via SystemPromptAddition and must not be duplicated as
+// [knowledge_context].
+func filterOutMCPItems(items []map[string]interface{}) []map[string]interface{} {
+	filtered := make([]map[string]interface{}, 0, len(items))
+	for _, item := range items {
+		source, _ := item["source"].(string)
+		if strings.HasPrefix(source, MCPSourcePrefix) {
+			continue
+		}
+		filtered = append(filtered, item)
+	}
+	return filtered
 }
 
 // aboveScore checks whether a GraphQL result object's _additional.score
