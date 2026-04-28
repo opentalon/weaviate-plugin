@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"testing"
+	"time"
 )
 
 // ---------------------------------------------------------------------------
@@ -201,6 +202,76 @@ func TestMinPrepareScore_zeroUsesDefault(t *testing.T) {
 	}
 	if h.minPrepareScore != defaultMinPrepareScore {
 		t.Errorf("expected default %.4f for zero value, got %.4f", defaultMinPrepareScore, h.minPrepareScore)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests for timeout config parsing
+// ---------------------------------------------------------------------------
+
+func TestConfigureTimeout_default(t *testing.T) {
+	h := &WeaviateHandler{}
+	cfg := `{"host":"localhost:8080","collection":"Test","auto_create_schema":false}`
+	if err := h.Configure(cfg); err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+	if h.clientTimeout != 2*time.Minute {
+		t.Errorf("expected default 2m, got %s", h.clientTimeout)
+	}
+}
+
+func TestConfigureTimeout_customDuration(t *testing.T) {
+	h := &WeaviateHandler{}
+	cfg := `{"host":"localhost:8080","collection":"Test","auto_create_schema":false,"timeout":"5m"}`
+	if err := h.Configure(cfg); err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+	if h.clientTimeout != 5*time.Minute {
+		t.Errorf("expected 5m, got %s", h.clientTimeout)
+	}
+}
+
+func TestConfigureTimeout_seconds(t *testing.T) {
+	h := &WeaviateHandler{}
+	cfg := `{"host":"localhost:8080","collection":"Test","auto_create_schema":false,"timeout":"90s"}`
+	if err := h.Configure(cfg); err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+	if h.clientTimeout != 90*time.Second {
+		t.Errorf("expected 90s, got %s", h.clientTimeout)
+	}
+}
+
+func TestConfigureTimeout_invalidFallsBackToDefault(t *testing.T) {
+	h := &WeaviateHandler{}
+	cfg := `{"host":"localhost:8080","collection":"Test","auto_create_schema":false,"timeout":"notaduration"}`
+	if err := h.Configure(cfg); err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+	if h.clientTimeout != 2*time.Minute {
+		t.Errorf("expected default 2m for invalid timeout, got %s", h.clientTimeout)
+	}
+}
+
+func TestConfigureTimeout_zeroFallsBackToDefault(t *testing.T) {
+	h := &WeaviateHandler{}
+	cfg := `{"host":"localhost:8080","collection":"Test","auto_create_schema":false,"timeout":"0s"}`
+	if err := h.Configure(cfg); err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+	if h.clientTimeout != 2*time.Minute {
+		t.Errorf("expected default 2m for zero timeout, got %s", h.clientTimeout)
+	}
+}
+
+func TestConfigureTimeout_negativeFallsBackToDefault(t *testing.T) {
+	h := &WeaviateHandler{}
+	cfg := `{"host":"localhost:8080","collection":"Test","auto_create_schema":false,"timeout":"-5m"}`
+	if err := h.Configure(cfg); err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+	if h.clientTimeout != 2*time.Minute {
+		t.Errorf("expected default 2m for negative timeout, got %s", h.clientTimeout)
 	}
 }
 
