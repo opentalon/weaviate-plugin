@@ -693,6 +693,64 @@ func TestSyncActions_deletesStaleActions(t *testing.T) {
 	}
 }
 
+// TestSyncActions_continuationBatchSkipsPreDelete verifies the fix for the
+// multi-batch sync truncation bug: when the orchestrator chunks a plugin's
+// actions across multiple sync_actions calls, batches 1..N must NOT pre-delete
+// the plugin's actions (which would wipe what batch 0 inserted). Only batch 0
+// performs the orphan-prune; subsequent batches are pure inserts.
+func TestSyncActions_continuationBatchSkipsPreDelete(t *testing.T) {
+	h := newHandler(t)
+
+	// Batch 0: insert 3 actions, IsContinuationBatch=false (pre-delete + insert).
+	batch0, _ := json.Marshal(syncActionsPayload{
+		PluginName: "multi-batch-plugin",
+		Actions: []syncActionEntry{
+			{Name: "alpha", Description: "Alpha action"},
+			{Name: "bravo", Description: "Bravo action"},
+			{Name: "charlie", Description: "Charlie action"},
+		},
+	})
+	if resp := h.Execute(plugin.Request{
+		ID: "sync-batch-0", Action: "sync_actions", Args: map[string]string{"payload": string(batch0)},
+	}); resp.Error != "" {
+		t.Fatalf("batch 0 error: %s", resp.Error)
+	}
+
+	// Batch 1: insert 3 more actions, IsContinuationBatch=true (insert only).
+	// Without the fix, batch 1's pre-delete would wipe alpha / bravo / charlie.
+	batch1, _ := json.Marshal(syncActionsPayload{
+		PluginName: "multi-batch-plugin",
+		Actions: []syncActionEntry{
+			{Name: "delta", Description: "Delta action"},
+			{Name: "echo", Description: "Echo action"},
+			{Name: "foxtrot", Description: "Foxtrot action"},
+		},
+		IsContinuationBatch: true,
+	})
+	if resp := h.Execute(plugin.Request{
+		ID: "sync-batch-1", Action: "sync_actions", Args: map[string]string{"payload": string(batch1)},
+	}); resp.Error != "" {
+		t.Fatalf("batch 1 error: %s", resp.Error)
+	}
+
+	time.Sleep(300 * time.Millisecond)
+
+	// All six actions from both batches must be present.
+	for _, name := range []string{"alpha", "bravo", "charlie", "delta", "echo", "foxtrot"} {
+		id := actionUUID("multi-batch-plugin", name)
+		objs, err := rawClient.Data().ObjectsGetter().
+			WithClassName(DefaultActionsCollection).
+			WithID(id).
+			Do(context.Background())
+		if err != nil {
+			t.Fatalf("get %s: %v", name, err)
+		}
+		if len(objs) == 0 {
+			t.Errorf("expected %s to be present after multi-batch sync, but it was deleted", name)
+		}
+	}
+}
+
 func TestSyncActions_emptyActions(t *testing.T) {
 	h := newHandler(t)
 	payload, _ := json.Marshal(syncActionsPayload{
