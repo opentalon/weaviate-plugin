@@ -531,13 +531,6 @@ func extractToolNamesAboveScore(result interface{}, className string, minScore f
 	return tools
 }
 
-// formatKnowledgeResultsCompact formats knowledge articles above the score
-// threshold as compact text (title + content only). Returns "" when no
-// articles pass the threshold.
-func formatKnowledgeResultsCompact(result interface{}, className string, minScore float64) string {
-	return formatItemsCompact(extractItems(result, className), minScore)
-}
-
 // formatItemsCompact formats pre-extracted items above the score threshold as
 // compact text (title + content only). Returns "" when no items pass.
 func formatItemsCompact(items []map[string]interface{}, minScore float64) string {
