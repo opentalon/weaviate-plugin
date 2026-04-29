@@ -53,6 +53,12 @@ type Config struct {
 	ModuleConfig        map[string]any `json:"module_config"`
 	MinPrepareScore     *float64       `json:"min_prepare_score"`
 	Timeout             string         `json:"timeout"` // Weaviate HTTP client timeout as duration string (e.g. "2m", "90s"); default "2m"
+	// Translator is the optional LibreTranslate-compatible query
+	// pre-processor. When enabled, non-target-language user queries are
+	// translated to TargetLang before they reach Weaviate, fixing
+	// cross-lingual BM25 collapse against an EN-indexed corpus. Off by
+	// default; see translator.go for the config shape.
+	Translator *TranslatorConfig `json:"translator,omitempty"`
 }
 
 // WeaviateHandler implements plugin.Handler.
@@ -69,6 +75,7 @@ type WeaviateHandler struct {
 	moduleConfig        map[string]any
 	minPrepareScore     float64
 	clientTimeout       time.Duration
+	translator          Translator
 }
 
 // Configure is called by the SDK during the Init RPC with the JSON config block.
@@ -141,6 +148,8 @@ func (h *WeaviateHandler) Configure(configJSON string) error {
 	} else {
 		h.minPrepareScore = defaultMinPrepareScore
 	}
+
+	h.translator = newTranslator(cfg.Translator)
 
 	if h.httpAddr != "" && h.token == "" {
 		return fmt.Errorf("config.token is required when http_addr is set")
@@ -339,12 +348,19 @@ func (h *WeaviateHandler) search(req plugin.Request) plugin.Response {
 		return plugin.Response{CallID: req.ID, Error: "query is required"}
 	}
 
+	ctx := context.Background()
+	original := query
+	query = h.translateQuery(ctx, query, "search")
+	if query != original {
+		log.Printf("weaviate-plugin: search: query=%q search_text=%q", original, query)
+	}
+
 	result, err := h.client.GraphQL().Get().
 		WithClassName(h.collection).
 		WithFields(h.resolveFields(req.Args)...).
 		WithNearText(h.client.GraphQL().NearTextArgBuilder().WithConcepts([]string{query})).
 		WithLimit(h.resolveLimit(req.Args)).
-		Do(context.Background())
+		Do(ctx)
 
 	if err != nil {
 		return plugin.Response{CallID: req.ID, Error: fmt.Sprintf("weaviate search: %v", err)}
@@ -356,6 +372,13 @@ func (h *WeaviateHandler) hybridSearch(req plugin.Request) plugin.Response {
 	query, ok := req.Args["query"]
 	if !ok || query == "" {
 		return plugin.Response{CallID: req.ID, Error: "query is required"}
+	}
+
+	ctx := context.Background()
+	original := query
+	query = h.translateQuery(ctx, query, "hybrid_search")
+	if query != original {
+		log.Printf("weaviate-plugin: hybrid_search: query=%q search_text=%q", original, query)
 	}
 
 	hybrid := h.client.GraphQL().HybridArgumentBuilder().WithQuery(query)
@@ -370,7 +393,7 @@ func (h *WeaviateHandler) hybridSearch(req plugin.Request) plugin.Response {
 		WithFields(h.resolveFields(req.Args)...).
 		WithHybrid(hybrid).
 		WithLimit(h.resolveLimit(req.Args)).
-		Do(context.Background())
+		Do(ctx)
 
 	if err != nil {
 		return plugin.Response{CallID: req.ID, Error: fmt.Sprintf("weaviate hybrid_search: %v", err)}
@@ -402,6 +425,13 @@ func (h *WeaviateHandler) prepare(req plugin.Request) plugin.Response {
 
 	ctx := context.Background()
 
+	// Translate the user query to the target language (default EN) before
+	// it reaches Weaviate, so non-EN queries can BM25-match an EN-indexed
+	// corpus. Only the SEARCH side is translated — the original `text`
+	// stays in the Message we return so the LLM still sees the user's
+	// query in their original language.
+	searchText := h.translateQuery(ctx, text, "prepare")
+
 	// Parse allowed_plugins filter if provided by the orchestrator.
 	var allowedPlugins []string
 	if v, ok := req.Args["allowed_plugins"]; ok && v != "" {
@@ -413,9 +443,9 @@ func (h *WeaviateHandler) prepare(req plugin.Request) plugin.Response {
 		{Name: "title"}, {Name: "content"}, {Name: "source"},
 		{Name: "_additional", Fields: []graphql.Field{{Name: "score"}}},
 	}
-	knowledgeQuery := text
+	knowledgeQuery := searchText
 	if len(allowedPlugins) > 0 {
-		knowledgeQuery = text + " " + strings.Join(allowedPlugins, " ")
+		knowledgeQuery = searchText + " " + strings.Join(allowedPlugins, " ")
 	}
 	knowledgeResult, knowledgeErr := h.searchCollection(ctx, h.knowledgeCollection, knowledgeFields, knowledgeQuery, 5, nil)
 
@@ -433,7 +463,7 @@ func (h *WeaviateHandler) prepare(req plugin.Request) plugin.Response {
 			WithOperator(filters.ContainsAny).
 			WithValueText(allowedPlugins...)
 	}
-	actionsResult, actionsErr := h.searchCollection(ctx, h.actionsCollection, actionFields, text, 5, actionsWhere)
+	actionsResult, actionsErr := h.searchCollection(ctx, h.actionsCollection, actionFields, searchText, 5, actionsWhere)
 
 	// Fail-open: if both searches fail, pass through unchanged.
 	if knowledgeErr != nil && actionsErr != nil {
@@ -459,7 +489,8 @@ func (h *WeaviateHandler) prepare(req plugin.Request) plugin.Response {
 		tools = nil
 	}
 
-	log.Printf("weaviate-plugin: prepare: query=%q min_score=%.4f matched_tools=%d tools=%v", text, h.minPrepareScore, len(tools), tools)
+	log.Printf("weaviate-plugin: prepare: query=%q search_text=%q min_score=%.4f matched_tools=%d tools=%v",
+		text, searchText, h.minPrepareScore, len(tools), tools)
 
 	// Build message: only include knowledge context (if non-empty).
 	// Action/tool context is NOT injected into the message — the orchestrator
@@ -605,6 +636,11 @@ func (h *WeaviateHandler) askKnowledge(req plugin.Request) plugin.Response {
 	}
 
 	ctx := context.Background()
+	original := query
+	query = h.translateQuery(ctx, query, "ask_knowledge")
+	if query != original {
+		log.Printf("weaviate-plugin: ask_knowledge: query=%q search_text=%q", original, query)
+	}
 
 	limit := 3
 	if v, ok := req.Args["limit"]; ok && v != "" {
@@ -688,6 +724,11 @@ func (h *WeaviateHandler) searchInstructions(req plugin.Request) plugin.Response
 	}
 
 	ctx := context.Background()
+	original := query
+	query = h.translateQuery(ctx, query, "search_instructions")
+	if query != original {
+		log.Printf("weaviate-plugin: search_instructions: query=%q search_text=%q", original, query)
+	}
 
 	limit := 5
 	if v, ok := req.Args["limit"]; ok && v != "" {
