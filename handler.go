@@ -22,6 +22,7 @@ import (
 const (
 	DefaultActionsCollection   = "MCPActions"
 	DefaultKnowledgeCollection = "KnowledgeArticles"
+	DefaultGlossaryCollection  = "Glossary"
 )
 
 // actionNS is a UUID v5 namespace for deterministic MCP action object IDs.
@@ -31,6 +32,10 @@ var actionNS = uuid.MustParse("d4e8f1a2-5b3c-4d6e-9f0a-1b2c3d4e5f6a")
 // generated from sync_actions (e.g. one article per plugin's MCP server
 // instructions). Distinct from actionNS so the two ID spaces never collide.
 var articleNS = uuid.MustParse("e5f9a2b3-6c4d-5e7f-a0b1-2c3d4e5f6a7b")
+
+// glossaryNS is a UUID v5 namespace for deterministic Glossary entry IDs,
+// keyed on the term text. Distinct from actionNS and articleNS.
+var glossaryNS = uuid.MustParse("f6a0b3c4-7d5e-6f8a-b1c2-3d4e5f6a7b8c")
 
 // MCPSourcePrefix tags KnowledgeArticles records that were generated from a
 // plugin's MCP server-instructions text rather than authored manually. Used
@@ -53,6 +58,7 @@ type Config struct {
 	ModuleConfig        map[string]any `json:"module_config"`
 	MinPrepareScore     *float64       `json:"min_prepare_score"`
 	Timeout             string         `json:"timeout"` // Weaviate HTTP client timeout as duration string (e.g. "2m", "90s"); default "2m"
+	GlossaryCollection string `json:"glossary_collection"`
 	// Translator is the optional LibreTranslate-compatible query
 	// pre-processor. When enabled, non-target-language user queries are
 	// translated to TargetLang before they reach Weaviate, fixing
@@ -67,6 +73,7 @@ type WeaviateHandler struct {
 	collection          string
 	actionsCollection   string
 	knowledgeCollection string
+	glossaryCollection  string
 	fields              []string
 	limit               int
 	httpAddr            string
@@ -76,6 +83,10 @@ type WeaviateHandler struct {
 	minPrepareScore     float64
 	clientTimeout       time.Duration
 	translator          Translator
+
+	// Hash-based sync skip: avoid re-writing unchanged data to Weaviate.
+	actionHashes map[string]string // pluginName → last-seen hash from sync_actions
+	glossaryHash string            // last-seen hash from sync_glossary
 }
 
 // Configure is called by the SDK during the Init RPC with the JSON config block.
@@ -133,6 +144,12 @@ func (h *WeaviateHandler) Configure(configJSON string) error {
 	if h.knowledgeCollection == "" {
 		h.knowledgeCollection = DefaultKnowledgeCollection
 	}
+	h.glossaryCollection = cfg.GlossaryCollection
+	if h.glossaryCollection == "" {
+		h.glossaryCollection = DefaultGlossaryCollection
+	}
+
+	h.actionHashes = make(map[string]string)
 
 	h.httpAddr = cfg.HTTPAddr
 	h.token = cfg.Token
@@ -157,8 +174,8 @@ func (h *WeaviateHandler) Configure(configJSON string) error {
 
 	log.Printf("weaviate-plugin: collection=%s vectorizer=%s limit=%d min_prepare_score=%.4f fields=%v",
 		h.collection, h.vectorizer, h.limit, h.minPrepareScore, h.fields)
-	log.Printf("weaviate-plugin: actions_collection=%s knowledge_collection=%s",
-		h.actionsCollection, h.knowledgeCollection)
+	log.Printf("weaviate-plugin: actions_collection=%s knowledge_collection=%s glossary_collection=%s",
+		h.actionsCollection, h.knowledgeCollection, h.glossaryCollection)
 
 	autoCreate := cfg.AutoCreateSchema == nil || *cfg.AutoCreateSchema
 	if autoCreate {
@@ -184,7 +201,7 @@ func (h *WeaviateHandler) Configure(configJSON string) error {
 	return nil
 }
 
-// ensureSchemas creates the MCPActions and KnowledgeArticles collections if they don't exist.
+// ensureSchemas creates the MCPActions, KnowledgeArticles, and Glossary collections if they don't exist.
 func (h *WeaviateHandler) ensureSchemas(ctx context.Context) error {
 	if err := h.ensureClass(ctx, h.actionsCollection, []*wmodels.Property{
 		{Name: "pluginName", DataType: []string{"text"}},
@@ -194,11 +211,20 @@ func (h *WeaviateHandler) ensureSchemas(ctx context.Context) error {
 	}); err != nil {
 		return err
 	}
-	return h.ensureClass(ctx, h.knowledgeCollection, []*wmodels.Property{
+	if err := h.ensureClass(ctx, h.knowledgeCollection, []*wmodels.Property{
 		{Name: "title", DataType: []string{"text"}},
 		{Name: "content", DataType: []string{"text"}},
 		{Name: "source", DataType: []string{"text"}},
 		{Name: "tags", DataType: []string{"text[]"}},
+	}); err != nil {
+		return err
+	}
+	return h.ensureClass(ctx, h.glossaryCollection, []*wmodels.Property{
+		{Name: "term", DataType: []string{"text"}},
+		{Name: "definition", DataType: []string{"text"}},
+		{Name: "category", DataType: []string{"text"}},
+		{Name: "tags", DataType: []string{"text[]"}},
+		{Name: "synonyms", DataType: []string{"text[]"}},
 	})
 }
 
@@ -301,6 +327,13 @@ func (h *WeaviateHandler) Capabilities() plugin.CapabilitiesMsg {
 				},
 			},
 			{
+				Name:        "sync_glossary",
+				Description: "Sync glossary term/definition pairs into the Glossary collection for contextual injection in prepare.",
+				Parameters: []plugin.ParameterMsg{
+					{Name: "payload", Description: `JSON: {"glossary_hash":"...","entries":[{"term":"...","definition":"...","category":"...","tags":[...],"synonyms":[...]}],"is_continuation_batch":false}`, Type: "string", Required: true},
+				},
+			},
+			{
 				Name:        "refresh",
 				Description: "Re-create Weaviate collections if they were deleted externally. Called automatically on session clear.",
 				Parameters:  []plugin.ParameterMsg{},
@@ -331,6 +364,8 @@ func (h *WeaviateHandler) Execute(req plugin.Request) plugin.Response {
 		return h.askKnowledge(req)
 	case "search_instructions":
 		return h.searchInstructions(req)
+	case "sync_glossary":
+		return h.syncGlossary(req)
 	case "refresh":
 		return h.refresh(req)
 	default:
@@ -465,8 +500,15 @@ func (h *WeaviateHandler) prepare(req plugin.Request) plugin.Response {
 	}
 	actionsResult, actionsErr := h.searchCollection(ctx, h.actionsCollection, actionFields, searchText, 5, actionsWhere)
 
-	// Fail-open: if both searches fail, pass through unchanged.
-	if knowledgeErr != nil && actionsErr != nil {
+	// Search Glossary (limit 5) for matching terms/definitions.
+	glossaryFields := []graphql.Field{
+		{Name: "term"}, {Name: "definition"},
+		{Name: "_additional", Fields: []graphql.Field{{Name: "score"}}},
+	}
+	glossaryResult, glossaryErr := h.searchCollection(ctx, h.glossaryCollection, glossaryFields, searchText, 5, nil)
+
+	// Fail-open: if all searches fail, pass through unchanged.
+	if knowledgeErr != nil && actionsErr != nil && glossaryErr != nil {
 		return marshalPrepareResponse(req.ID, prepareResponse{
 			SendToLLM:     true,
 			Message:       text,
@@ -492,7 +534,7 @@ func (h *WeaviateHandler) prepare(req plugin.Request) plugin.Response {
 	log.Printf("weaviate-plugin: prepare: query=%q search_text=%q min_score=%.4f matched_tools=%d tools=%v",
 		text, searchText, h.minPrepareScore, len(tools), tools)
 
-	// Build message: only include knowledge context (if non-empty).
+	// Build message: inject glossary and knowledge context blocks (if non-empty).
 	// Action/tool context is NOT injected into the message — the orchestrator
 	// already provides full tool definitions in the system prompt filtered by
 	// relevant_tools. Duplicating them here wastes tokens.
@@ -507,6 +549,13 @@ func (h *WeaviateHandler) prepare(req plugin.Request) plugin.Response {
 		if knowledgeText := formatItemsCompact(knowledgeItems, h.minPrepareScore); knowledgeText != "" {
 			log.Printf("weaviate-plugin: prepare: injecting knowledge_context len=%d", len(knowledgeText))
 			message = fmt.Sprintf("[knowledge_context]\n%s\n[/knowledge_context]\n\n%s", knowledgeText, text)
+		}
+	}
+	if glossaryErr == nil {
+		glossaryItems := extractItems(glossaryResult, h.glossaryCollection)
+		if glossaryText := formatGlossaryItems(glossaryItems, h.minPrepareScore); glossaryText != "" {
+			log.Printf("weaviate-plugin: prepare: injecting glossary_context len=%d", len(glossaryText))
+			message = fmt.Sprintf("[glossary_context]\n%s\n[/glossary_context]\n\n%s", glossaryText, message)
 		}
 	}
 
@@ -582,6 +631,30 @@ func formatItemsCompact(items []map[string]interface{}, minScore float64) string
 			sb.WriteString("\n---\n")
 		}
 		fmt.Fprintf(&sb, "%s\n%s", title, content)
+	}
+	return sb.String()
+}
+
+// formatGlossaryItems formats Glossary search results above the score threshold
+// as a compact list of term→definition pairs for injection into the LLM message.
+func formatGlossaryItems(items []map[string]interface{}, minScore float64) string {
+	if len(items) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	for _, item := range items {
+		if !aboveScore(item, minScore) {
+			continue
+		}
+		term, _ := item["term"].(string)
+		definition, _ := item["definition"].(string)
+		if term == "" || definition == "" {
+			continue
+		}
+		if sb.Len() > 0 {
+			sb.WriteString("\n")
+		}
+		fmt.Fprintf(&sb, "- **%s**: %s", term, definition)
 	}
 	return sb.String()
 }
@@ -872,6 +945,11 @@ type syncActionsPayload struct {
 	Actions            []syncActionEntry `json:"actions"`
 	ServerInstructions string            `json:"server_instructions,omitempty"`
 	KeepPlugins        []string          `json:"keep_plugins,omitempty"`
+	// Hash is an opaque string computed by the orchestrator over the combined
+	// actions + server_instructions for this plugin. When present and matching
+	// the last-seen hash, the plugin skips the upsert (but still runs orphan
+	// prune). Older orchestrators that omit it get the legacy always-sync.
+	Hash string `json:"hash,omitempty"`
 	// IsContinuationBatch is set by the orchestrator on batches 1..N of a
 	// chunked plugin sync so the plugin skips the per-plugin pre-delete that
 	// would otherwise wipe the previous batches' inserts. Batch 0 (default
@@ -901,6 +979,29 @@ func (h *WeaviateHandler) syncActions(req plugin.Request) plugin.Response {
 	}
 
 	ctx := context.Background()
+
+	// Hash-based skip: when the orchestrator sends a hash and it matches the
+	// last-seen value for this plugin, skip the expensive upsert cycle. Orphan
+	// prune via keep_plugins still runs — it's cheap and keeps the index clean
+	// across plugin additions/removals. Continuation batches skip the hash
+	// check (the decision was made on batch 0).
+	if !payload.IsContinuationBatch && payload.Hash != "" && payload.Hash == h.actionHashes[payload.PluginName] {
+		log.Printf("weaviate-plugin: sync_actions: hash match for %s (%s), skipping upsert", payload.PluginName, payload.Hash)
+		pruned := 0
+		if len(payload.KeepPlugins) > 0 {
+			n, err := h.pruneOrphans(ctx, payload.KeepPlugins)
+			if err != nil {
+				log.Printf("weaviate-plugin: prune_orphans failed: %v", err)
+			}
+			pruned = n
+		}
+		respBody := `{"skipped":true,"reason":"hash_match"`
+		if len(payload.KeepPlugins) > 0 {
+			respBody += fmt.Sprintf(`,"orphans_pruned":%d`, pruned)
+		}
+		respBody += `}`
+		return plugin.Response{CallID: req.ID, Content: respBody}
+	}
 
 	// Delete all existing actions for this plugin before re-syncing so that
 	// removed/renamed actions don't linger as stale entries (intra-plugin
@@ -989,6 +1090,11 @@ func (h *WeaviateHandler) syncActions(req plugin.Request) plugin.Response {
 			// succeeded, and a transient delete failure is recoverable on next sync.
 		}
 		pruned = n
+	}
+
+	// Store hash on successful sync so next call with the same hash can skip.
+	if payload.Hash != "" {
+		h.actionHashes[payload.PluginName] = payload.Hash
 	}
 
 	respBody := fmt.Sprintf(`{"synced":%d`, syncedActions)
@@ -1115,6 +1221,105 @@ func (h *WeaviateHandler) batchDeleteEqual(ctx context.Context, class, path, val
 		return int(resp.Results.Successful), nil
 	}
 	return 0, nil
+}
+
+// ---------------------------------------------------------------------------
+// Glossary sync
+// ---------------------------------------------------------------------------
+
+type syncGlossaryPayload struct {
+	GlossaryHash        string          `json:"glossary_hash"`
+	Entries             []glossaryEntry `json:"entries"`
+	IsContinuationBatch bool            `json:"is_continuation_batch,omitempty"`
+}
+
+type glossaryEntry struct {
+	Term       string   `json:"term"`
+	Definition string   `json:"definition"`
+	Category   string   `json:"category,omitempty"`
+	Tags       []string `json:"tags,omitempty"`
+	Synonyms   []string `json:"synonyms,omitempty"`
+}
+
+func (h *WeaviateHandler) syncGlossary(req plugin.Request) plugin.Response {
+	raw, ok := req.Args["payload"]
+	if !ok || raw == "" {
+		return plugin.Response{CallID: req.ID, Error: "payload is required"}
+	}
+
+	var payload syncGlossaryPayload
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+		return plugin.Response{CallID: req.ID, Error: fmt.Sprintf("parse payload: %v", err)}
+	}
+
+	ctx := context.Background()
+
+	// Hash-based skip on batch 0: if the hash matches the last-seen value,
+	// the glossary hasn't changed — skip the expensive delete+reinsert.
+	// Continuation batches bypass the hash check (decision was on batch 0).
+	if !payload.IsContinuationBatch && payload.GlossaryHash != "" && payload.GlossaryHash == h.glossaryHash {
+		log.Printf("weaviate-plugin: sync_glossary: hash match (%s), skipping", payload.GlossaryHash)
+		return plugin.Response{CallID: req.ID, Content: `{"skipped":true,"reason":"hash_match"}`}
+	}
+
+	// Batch 0: delete all existing glossary entries for a clean full replace.
+	// Glossary is global (not per-plugin) so we delete everything.
+	// Continuation batches skip the delete to preserve previous batches.
+	if !payload.IsContinuationBatch {
+		_, delErr := h.client.Batch().ObjectsBatchDeleter().
+			WithClassName(h.glossaryCollection).
+			WithWhere(filters.Where().
+				WithPath([]string{"term"}).
+				WithOperator(filters.Like).
+				WithValueText("*")).
+			Do(ctx)
+		if delErr != nil {
+			log.Printf("weaviate-plugin: sync_glossary: failed to delete old entries: %v", delErr)
+		}
+	}
+
+	objects := make([]*wmodels.Object, 0, len(payload.Entries))
+	for _, e := range payload.Entries {
+		if e.Term == "" || e.Definition == "" {
+			continue
+		}
+		props := map[string]interface{}{
+			"term":       e.Term,
+			"definition": e.Definition,
+		}
+		if e.Category != "" {
+			props["category"] = e.Category
+		}
+		if len(e.Tags) > 0 {
+			props["tags"] = e.Tags
+		}
+		if len(e.Synonyms) > 0 {
+			props["synonyms"] = e.Synonyms
+		}
+		objects = append(objects, &wmodels.Object{
+			Class:      h.glossaryCollection,
+			ID:         strfmt.UUID(glossaryUUID(e.Term)),
+			Properties: props,
+		})
+	}
+
+	if len(objects) > 0 {
+		results, err := h.client.Batch().ObjectsBatcher().WithObjects(objects...).Do(ctx)
+		if err != nil {
+			return plugin.Response{CallID: req.ID, Error: fmt.Sprintf("batch sync glossary: %v", err)}
+		}
+		if err := checkBatchErrors(results); err != nil {
+			return plugin.Response{CallID: req.ID, Error: fmt.Sprintf("batch sync glossary: %v", err)}
+		}
+	}
+
+	// Store hash after successful sync.
+	if payload.GlossaryHash != "" {
+		h.glossaryHash = payload.GlossaryHash
+	}
+
+	log.Printf("weaviate-plugin: sync_glossary: synced %d entries (hash=%s continuation=%v)", len(objects), payload.GlossaryHash, payload.IsContinuationBatch)
+	return plugin.Response{CallID: req.ID, Content: fmt.Sprintf(`{"synced":%d}`, len(objects))}
 }
 
 // serverInstructionsUUID returns a deterministic UUID v5 for the
@@ -1260,6 +1465,10 @@ func splitCSV(s string) []string {
 
 func actionUUID(pluginName, actionName string) string {
 	return uuid.NewSHA1(actionNS, []byte(pluginName+"/"+actionName)).String()
+}
+
+func glossaryUUID(term string) string {
+	return uuid.NewSHA1(glossaryNS, []byte(term)).String()
 }
 
 func checkBatchErrors(results []wmodels.ObjectsGetResponse) error {

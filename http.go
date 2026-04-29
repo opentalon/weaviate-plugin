@@ -30,6 +30,7 @@ func (h *WeaviateHandler) listenHTTP() error {
 	mux.HandleFunc("DELETE /api/v1/articles/{id}", h.requireToken(h.handleDeleteArticle))
 	mux.HandleFunc("DELETE /api/v1/articles", h.requireToken(h.handleDeleteArticlesBySource))
 	mux.HandleFunc("POST /api/v1/actions/sync", h.requireToken(h.handleSyncActions))
+	mux.HandleFunc("POST /api/v1/glossary/sync", h.requireToken(h.handleSyncGlossary))
 	mux.HandleFunc("POST /api/v1/debug/prepare", h.requireToken(h.handleDebugPrepare))
 	return http.ListenAndServe(h.httpAddr, mux)
 }
@@ -140,6 +141,23 @@ func (h *WeaviateHandler) handleSyncActions(w http.ResponseWriter, r *http.Reque
 	writePluginResponse(w, resp)
 }
 
+func (h *WeaviateHandler) handleSyncGlossary(w http.ResponseWriter, r *http.Request) {
+	var body syncGlossaryPayload
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid JSON: %v", err))
+		return
+	}
+
+	payload, _ := json.Marshal(body)
+	resp := h.Execute(plugin.Request{
+		ID:     "http",
+		Action: "sync_glossary",
+		Args:   map[string]string{"payload": string(payload)},
+	})
+
+	writePluginResponse(w, resp)
+}
+
 func writePluginResponse(w http.ResponseWriter, resp plugin.Response) {
 	w.Header().Set("Content-Type", "application/json")
 	if resp.Error != "" {
@@ -187,6 +205,7 @@ type debugPrepareResponse struct {
 	MatchedTools     []string           `json:"matched_tools"`
 	ActionsTop       []debugScoredEntry `json:"actions_top"`
 	KnowledgeTop     []debugScoredEntry `json:"knowledge_top"`
+	GlossaryTop      []debugScoredEntry `json:"glossary_top"`
 	WeaviateMs       float64            `json:"weaviate_ms"`
 	KnowledgeQuery   string             `json:"knowledge_query"`
 	ActionsCollWhere string             `json:"actions_where,omitempty"`
@@ -198,6 +217,7 @@ type debugScoredEntry struct {
 	ActionName string  `json:"action_name,omitempty"`
 	Title      string  `json:"title,omitempty"`
 	Source     string  `json:"source,omitempty"`
+	Term       string  `json:"term,omitempty"`
 }
 
 // handleDebugPrepare runs the SAME pipeline as Execute("prepare", ...) but
@@ -244,9 +264,15 @@ func (h *WeaviateHandler) handleDebugPrepare(w http.ResponseWriter, r *http.Requ
 		whereLabel = "pluginName ContainsAny " + strings.Join(body.AllowedPlugins, ",")
 	}
 
+	glossaryFields := []graphql.Field{
+		{Name: "term"}, {Name: "definition"},
+		{Name: "_additional", Fields: []graphql.Field{{Name: "score"}}},
+	}
+
 	wStart := time.Now()
 	knowledgeResult, _ := h.searchCollection(ctx, h.knowledgeCollection, knowledgeFields, knowledgeQuery, 5, nil)
 	actionsResult, _ := h.searchCollection(ctx, h.actionsCollection, actionFields, searchText, 5, actionsWhere)
+	glossaryResult, _ := h.searchCollection(ctx, h.glossaryCollection, glossaryFields, searchText, 5, nil)
 	weaviateMs := float64(time.Since(wStart).Microseconds()) / 1000.0
 
 	tools := extractToolNamesAboveScore(actionsResult, h.actionsCollection, h.minPrepareScore)
@@ -260,6 +286,7 @@ func (h *WeaviateHandler) handleDebugPrepare(w http.ResponseWriter, r *http.Requ
 		MatchedTools:     tools,
 		ActionsTop:       extractScoredActions(actionsResult, h.actionsCollection),
 		KnowledgeTop:     extractScoredKnowledge(knowledgeResult, h.knowledgeCollection),
+		GlossaryTop:      extractScoredGlossary(glossaryResult, h.glossaryCollection),
 		WeaviateMs:       weaviateMs,
 		KnowledgeQuery:   knowledgeQuery,
 		ActionsCollWhere: whereLabel,
@@ -290,6 +317,17 @@ func extractScoredKnowledge(result interface{}, className string) []debugScoredE
 		entry := debugScoredEntry{Score: extractScore(item)}
 		entry.Title, _ = item["title"].(string)
 		entry.Source, _ = item["source"].(string)
+		out = append(out, entry)
+	}
+	return out
+}
+
+func extractScoredGlossary(result interface{}, className string) []debugScoredEntry {
+	items := extractItems(result, className)
+	out := make([]debugScoredEntry, 0, len(items))
+	for _, item := range items {
+		entry := debugScoredEntry{Score: extractScore(item)}
+		entry.Term, _ = item["term"].(string)
 		out = append(out, entry)
 	}
 	return out
