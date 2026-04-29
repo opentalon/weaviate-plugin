@@ -68,7 +68,43 @@ plugins:
       # HTTP ingestion server (optional)
       http_addr: ":8081"           # address for the HTTP ingestion API
       token: "my-secret-token"     # Bearer token — required when http_addr is set
+
+      # Optional cross-lingual query pre-processor (off by default)
+      translator:
+        enabled: false                                              # opt-in
+        url: "http://libretranslate.libretranslate.svc:5000"        # LibreTranslate-compatible endpoint
+        target_lang: "en"                                           # default "en"
+        source_lang: "auto"                                         # default "auto" (let translator detect)
+        timeout: "3s"                                               # per-request timeout (default 3s)
+        skip_if_target_confidence: 0.7                              # /detect first; skip /translate when source==target with at least this confidence (default 0.7, 0 disables)
+        api_key: ""                                                 # only if the translator requires LT_API_KEYS
 ```
+
+### Translator (cross-lingual query pre-processor)
+
+When the corpus is indexed in one language (typically English) but users ask
+questions in another (DE / FR / ES / …), BM25 contributes ~0 to the hybrid
+score because the foreign-language tokens never appear in the corpus. With
+`alpha=0.5` the resulting score is roughly halved, often dropping good hits
+below `min_prepare_score`.
+
+The translator addresses this end-to-end without re-indexing: every query
+that reaches `prepare`, `search`, `hybrid_search`, `ask_knowledge`, or
+`search_instructions` is translated to `target_lang` (default `en`) before
+the lookup runs. The original-language `text` is still echoed back into the
+`prepare` response message so the LLM sees the user's query in their own
+language and replies in kind.
+
+Behaviour at a glance:
+
+* `enabled: false` (default) → no-op, zero overhead.
+* `enabled: true` with no `url` → silently downgrades to no-op (logged).
+* Detect-first short-circuit: if `/detect` says the input is already in
+  `target_lang` with ≥ `skip_if_target_confidence`, the `/translate` call is
+  skipped (~30 ms `/detect` only).
+* Any error (network, non-2xx, empty response) → fail-open: the original
+  text is returned and the search runs untranslated.
+
 
 The `collection` field is required. All others have defaults (`host: localhost:8080`, `scheme: http`, `limit: 5`, `vectorizer: text2vec-transformers`).
 
