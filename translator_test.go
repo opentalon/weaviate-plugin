@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 // fakeTranslator is a configurable in-memory Translator for handler tests.
@@ -343,5 +345,91 @@ func TestTranslateQuery_SkipsBlankInput(t *testing.T) {
 	}
 	if f.calls != 0 {
 		t.Errorf("blank input should bypass translator, calls=%d", f.calls)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Metrics: counters increment with the right labels.
+// ---------------------------------------------------------------------------
+
+func resetMetrics() {
+	translatorCallsTotal.Reset()
+	translatorDurationSeconds.Reset()
+	translatorDetectedLangsTotal.Reset()
+}
+
+func TestMetrics_TranslatedIncrementsCounterAndHistogram(t *testing.T) {
+	resetMetrics()
+	h := &WeaviateHandler{translator: &fakeTranslator{out: "How many?"}}
+	h.translateQuery(context.Background(), "Wieviele?", "prepare")
+
+	got := testutil.ToFloat64(translatorCallsTotal.WithLabelValues("prepare", "translated"))
+	if got != 1 {
+		t.Errorf("translated counter: got %v want 1", got)
+	}
+	if c := testutil.CollectAndCount(translatorDurationSeconds, "weaviate_plugin_translator_duration_seconds"); c == 0 {
+		t.Errorf("expected at least one duration sample, got %d", c)
+	}
+}
+
+func TestMetrics_FailedIncrementsFailCounter(t *testing.T) {
+	resetMetrics()
+	h := &WeaviateHandler{translator: &fakeTranslator{err: errors.New("boom")}}
+	h.translateQuery(context.Background(), "anything", "search")
+
+	got := testutil.ToFloat64(translatorCallsTotal.WithLabelValues("search", "failed"))
+	if got != 1 {
+		t.Errorf("failed counter: got %v want 1", got)
+	}
+}
+
+func TestMetrics_NoopIncrementsSkippedDisabled(t *testing.T) {
+	resetMetrics()
+	h := &WeaviateHandler{translator: noopTranslator{}}
+	h.translateQuery(context.Background(), "x", "ask_knowledge")
+
+	got := testutil.ToFloat64(translatorCallsTotal.WithLabelValues("ask_knowledge", "skipped_disabled"))
+	if got != 1 {
+		t.Errorf("skipped_disabled counter: got %v want 1", got)
+	}
+}
+
+func TestMetrics_NilTranslatorIncrementsSkippedDisabled(t *testing.T) {
+	resetMetrics()
+	h := &WeaviateHandler{}
+	h.translateQuery(context.Background(), "x", "hybrid_search")
+
+	got := testutil.ToFloat64(translatorCallsTotal.WithLabelValues("hybrid_search", "skipped_disabled"))
+	if got != 1 {
+		t.Errorf("nil translator: got %v want 1", got)
+	}
+}
+
+func TestMetrics_SkippedTargetLangCounted(t *testing.T) {
+	resetMetrics()
+	// Translate returns the same text → counted as skipped_target_lang.
+	h := &WeaviateHandler{translator: &fakeTranslator{out: "x"}}
+	h.translateQuery(context.Background(), "x", "prepare")
+
+	got := testutil.ToFloat64(translatorCallsTotal.WithLabelValues("prepare", "skipped_target_lang"))
+	if got != 1 {
+		t.Errorf("skipped_target_lang counter: got %v want 1", got)
+	}
+}
+
+func TestMetrics_DetectedLangsCounted(t *testing.T) {
+	resetMetrics()
+	srv := newLibreServer(t)
+	srv.detectLang = "fr"
+	srv.detectConf = 50 // below threshold so we'll still translate
+	ts := srv.start()
+	defer ts.Close()
+
+	tr := newTranslator(&TranslatorConfig{Enabled: true, URL: ts.URL})
+	_, _ = tr.Translate(context.Background(), "salut")
+
+	got := testutil.ToFloat64(translatorDetectedLangsTotal.WithLabelValues("fr"))
+	if got != 1 {
+		t.Errorf("detected lang fr counter: got %v want 1", got)
 	}
 }

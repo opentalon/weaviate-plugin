@@ -349,7 +349,11 @@ func (h *WeaviateHandler) search(req plugin.Request) plugin.Response {
 	}
 
 	ctx := context.Background()
+	original := query
 	query = h.translateQuery(ctx, query, "search")
+	if query != original {
+		log.Printf("weaviate-plugin: search: query=%q search_text=%q", original, query)
+	}
 
 	result, err := h.client.GraphQL().Get().
 		WithClassName(h.collection).
@@ -371,7 +375,11 @@ func (h *WeaviateHandler) hybridSearch(req plugin.Request) plugin.Response {
 	}
 
 	ctx := context.Background()
+	original := query
 	query = h.translateQuery(ctx, query, "hybrid_search")
+	if query != original {
+		log.Printf("weaviate-plugin: hybrid_search: query=%q search_text=%q", original, query)
+	}
 
 	hybrid := h.client.GraphQL().HybridArgumentBuilder().WithQuery(query)
 	if v, ok := req.Args["alpha"]; ok && v != "" {
@@ -628,7 +636,11 @@ func (h *WeaviateHandler) askKnowledge(req plugin.Request) plugin.Response {
 	}
 
 	ctx := context.Background()
+	original := query
 	query = h.translateQuery(ctx, query, "ask_knowledge")
+	if query != original {
+		log.Printf("weaviate-plugin: ask_knowledge: query=%q search_text=%q", original, query)
+	}
 
 	limit := 3
 	if v, ok := req.Args["limit"]; ok && v != "" {
@@ -712,7 +724,11 @@ func (h *WeaviateHandler) searchInstructions(req plugin.Request) plugin.Response
 	}
 
 	ctx := context.Background()
+	original := query
 	query = h.translateQuery(ctx, query, "search_instructions")
+	if query != original {
+		log.Printf("weaviate-plugin: search_instructions: query=%q search_text=%q", original, query)
+	}
 
 	limit := 5
 	if v, ok := req.Args["limit"]; ok && v != "" {

@@ -80,6 +80,54 @@ plugins:
         api_key: ""                                                 # only if the translator requires LT_API_KEYS
 ```
 
+### Translator observability
+
+When `http_addr` is configured, the plugin exposes:
+
+| Endpoint | Auth | Purpose |
+|---|---|---|
+| `GET /metrics` | open (network-restricted) | Prometheus exposition with translator + plugin metrics |
+| `POST /api/v1/debug/prepare` | bearer token | Run a query through the full prepare pipeline and return a structured trace |
+
+Translator metrics:
+
+* `weaviate_plugin_translator_calls_total{callsite,result}` — `result` is `translated` / `skipped_target_lang` / `skipped_disabled` / `failed`. The `callsite` label tells you whether a translate happened in `prepare`, `search`, `hybrid_search`, `ask_knowledge`, `search_instructions`, or `debug_prepare`.
+* `weaviate_plugin_translator_duration_seconds{callsite,result}` — wall-time of the full translator step (detect + translate, or just detect for the skip case). 1ms..2s buckets.
+* `weaviate_plugin_translator_detected_lang_total{lang}` — source-language distribution from the `/detect` short-circuit.
+
+Debug trace (sample):
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" \
+     -H "Content-Type: application/json" \
+     -d '{"text":"Wieviele Lagerartikel habe ich?"}' \
+     http://weaviate-plugin:8082/api/v1/debug/prepare
+```
+
+```json
+{
+  "original": "Wieviele Lagerartikel habe ich?",
+  "search_text": "How many storage items do I have?",
+  "translated": true,
+  "translator_ms": 84.2,
+  "min_prepare_score": 0.45,
+  "matched_tools": ["timly.list-items", "weaviate.ask_knowledge"],
+  "actions_top": [
+    {"score": 0.81, "plugin_name": "timly", "action_name": "list-items"},
+    {"score": 0.42, "plugin_name": "timly", "action_name": "list-locations"}
+  ],
+  "knowledge_top": [
+    {"score": 0.31, "title": "timly MCP server instructions", "source": "mcp:timly"}
+  ],
+  "weaviate_ms": 38.1,
+  "knowledge_query": "How many storage items do I have?"
+}
+```
+
+The debug endpoint runs through the same code path as `prepare` (translator,
+hybrid search, score-threshold filter), so it's a faithful reproduction of
+what the orchestrator sees — minus the LLM-bound message envelope.
+
 ### Translator (cross-lingual query pre-processor)
 
 When the corpus is indexed in one language (typically English) but users ask

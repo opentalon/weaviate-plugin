@@ -151,7 +151,7 @@ func (t *libreTranslator) detect(ctx context.Context, text string) (string, floa
 	if err != nil {
 		return "", 0, fmt.Errorf("call %s: %w", t.detectURL, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	raw, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -169,6 +169,7 @@ func (t *libreTranslator) detect(ctx context.Context, text string) (string, floa
 	if len(parsed) == 0 {
 		return "", 0, fmt.Errorf("empty detect response")
 	}
+	translatorDetectedLangsTotal.WithLabelValues(parsed[0].Language).Inc()
 	return parsed[0].Language, parsed[0].Confidence / 100.0, nil
 }
 
@@ -213,7 +214,7 @@ func (t *libreTranslator) Translate(ctx context.Context, text string) (string, e
 	if err != nil {
 		return text, fmt.Errorf("call %s: %w", t.translateURL, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	raw, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -248,21 +249,41 @@ func truncate(s string, n int) string {
 // used by every search-side caller in handler.go: any error is logged and
 // the ORIGINAL text is returned so the search still runs (just without
 // the cross-lingual normalisation).
+//
+// Also records Prometheus metrics: a call counter labelled by callsite +
+// outcome and a duration histogram. The result label is one of
+// `translated`, `skipped_target_lang`, `skipped_disabled`, `failed`.
 func (h *WeaviateHandler) translateQuery(ctx context.Context, text, callsite string) string {
 	if h.translator == nil {
+		translatorCallsTotal.WithLabelValues(callsite, "skipped_disabled").Inc()
 		return text
 	}
 	if _, ok := h.translator.(noopTranslator); ok {
+		translatorCallsTotal.WithLabelValues(callsite, "skipped_disabled").Inc()
 		return text
 	}
 	if strings.TrimSpace(text) == "" {
 		return text
 	}
+
+	start := time.Now()
 	out, err := h.translator.Translate(ctx, text)
+	elapsed := time.Since(start).Seconds()
+
 	if err != nil {
+		translatorCallsTotal.WithLabelValues(callsite, "failed").Inc()
+		translatorDurationSeconds.WithLabelValues(callsite, "failed").Observe(elapsed)
 		log.Printf("weaviate-plugin: translator: %s: fail-open, using original: %v", callsite, err)
 		return text
 	}
+
+	result := "translated"
+	if out == text {
+		result = "skipped_target_lang"
+	}
+	translatorCallsTotal.WithLabelValues(callsite, result).Inc()
+	translatorDurationSeconds.WithLabelValues(callsite, result).Observe(elapsed)
+
 	if out != text {
 		log.Printf("weaviate-plugin: translator: %s: %q -> %q", callsite, truncate(text, 80), truncate(out, 80))
 	}
