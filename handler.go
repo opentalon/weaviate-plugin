@@ -995,7 +995,7 @@ func (h *WeaviateHandler) syncActions(req plugin.Request) plugin.Response {
 			}
 			pruned = n
 		}
-		respBody := fmt.Sprintf(`{"skipped":true,"reason":"hash_match"`)
+		respBody := `{"skipped":true,"reason":"hash_match"`
 		if len(payload.KeepPlugins) > 0 {
 			respBody += fmt.Sprintf(`,"orphans_pruned":%d`, pruned)
 		}
