@@ -11,7 +11,8 @@ An [OpenTalon](https://github.com/opentalon/opentalon) plugin that performs sema
 | `weaviate.search` | LLM tool | nearText semantic search — the LLM calls this when it decides retrieval is needed |
 | `weaviate.hybrid_search` | LLM tool | Hybrid BM25 + vector. `alpha`: `0` = keyword only, `1` = vector only (default `0.5`) |
 | `weaviate.prepare` | **preparer** | Automatic RAG: runs before every LLM call, enriches the user message with retrieved context |
-| `weaviate.sync_actions` | orchestrator | Upserts plugin action definitions into the `MCPActions` collection for retrieval-based tool filtering |
+| `weaviate.sync_actions` | orchestrator | Upserts plugin action definitions into the `MCPActions` collection for retrieval-based tool filtering. Supports hash-based skip |
+| `weaviate.sync_glossary` | orchestrator | Syncs glossary term/definition pairs into the `Glossary` collection for automatic context injection. Supports hash-based skip and continuation batches |
 | `weaviate.ingest` | LLM tool / API | Insert a single knowledge article into the `KnowledgeArticles` collection |
 | `weaviate.ingest_batch` | LLM tool / API | Batch insert multiple knowledge articles |
 
@@ -30,6 +31,21 @@ user message -> weaviate.prepare(text=message) -> [retrieved_context]...message 
 ```
 
 Use preparer mode when you always want retrieved context in the prompt (RAG-by-default). Use tool mode when retrieval should be conditional.
+
+**Glossary injection** — when glossary entries have been synced via `sync_glossary`, `prepare` also searches the Glossary collection and injects matching term definitions:
+
+```
+[glossary_context]
+- **SLA**: Service Level Agreement — contractual response time for support tickets
+- **P1 Incident**: Production-critical outage affecting >50% of users, 15min response required
+[/glossary_context]
+
+[knowledge_context]
+...matching knowledge articles...
+[/knowledge_context]
+
+What's the SLA for P1 incidents?
+```
 
 ## Configuration
 
@@ -57,7 +73,8 @@ plugins:
       # Knowledge-augmented RAG (Phase 1)
       actions_collection: "MCPActions"           # collection for indexed plugin capabilities (default)
       knowledge_collection: "KnowledgeArticles"  # collection for knowledge articles (default)
-      auto_create_schema: true                   # auto-create MCPActions & KnowledgeArticles on startup (default true)
+      glossary_collection: "Glossary"            # collection for glossary term/definition pairs (default)
+      auto_create_schema: true                   # auto-create MCPActions, KnowledgeArticles & Glossary on startup (default true)
 
       # Client timeout
       timeout: "2m"                # Weaviate HTTP client timeout (default 2m); increase for large batch syncs
@@ -225,12 +242,13 @@ Weaviate's legacy English-only word-embedding vectorizer. Not recommended for Ge
 
 ### Auto-schema creation
 
-When `auto_create_schema` is `true` (the default), the plugin creates two Weaviate collections on startup if they don't already exist:
+When `auto_create_schema` is `true` (the default), the plugin creates three Weaviate collections on startup if they don't already exist:
 
 | Collection | Properties | Purpose |
 |---|---|---|
 | `MCPActions` | `pluginName`, `actionName`, `description`, `parameters` | Indexed plugin capabilities for retrieval-based tool filtering |
 | `KnowledgeArticles` | `title`, `content`, `source`, `tags` | Domain knowledge and how-to guides |
+| `Glossary` | `term`, `definition`, `category`, `tags`, `synonyms` | Domain terminology definitions, auto-injected via prepare |
 
 Collections are created with the configured `vectorizer` and `module_config`. Set `auto_create_schema: false` to manage schemas manually.
 
@@ -287,6 +305,44 @@ curl -X POST http://localhost:8081/api/v1/actions/sync \
 ```
 
 Response: `{"synced":2}`
+
+### POST /api/v1/glossary/sync
+
+Sync glossary term/definition pairs into the Glossary collection. Uses deterministic UUIDs (keyed on term) and supports hash-based skip + continuation batches.
+
+```bash
+curl -X POST http://localhost:8081/api/v1/glossary/sync \
+  -H "Authorization: Bearer my-secret-token" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "glossary_hash": "sha256:9f86d0...",
+    "entries": [
+      {"term": "SLA", "definition": "Service Level Agreement — contractual response time", "category": "support", "tags": ["contracts"], "synonyms": ["Service Level Agreement"]},
+      {"term": "P1 Incident", "definition": "Production-critical outage affecting >50% of users", "category": "incidents", "synonyms": ["Priority 1", "Sev1"]}
+    ],
+    "is_continuation_batch": false
+  }'
+```
+
+Response: `{"synced":2}`
+
+If the hash matches the previous sync: `{"skipped":true,"reason":"hash_match"}`
+
+For large glossaries, split into batches. Batch 0 (`is_continuation_batch: false`) deletes old entries and inserts. Batches 1..N (`is_continuation_batch: true`) only insert.
+
+### Hash-based sync skip
+
+Both `sync_actions` and `sync_glossary` support hash-based skip to avoid re-writing unchanged data to Weaviate.
+
+**sync_actions**: add a `hash` field to the payload. The plugin stores the last-seen hash per plugin. On batch 0, if the hash matches, the upsert is skipped (orphan prune via `keep_plugins` still runs).
+
+```json
+{"plugin_name": "jira", "hash": "sha256:abc...", "actions": [...], "keep_plugins": ["jira"]}
+```
+
+**sync_glossary**: the `glossary_hash` field works the same way. On batch 0, if the hash matches, the entire sync is skipped. Continuation batches always upsert.
+
+The hash is opaque to the plugin — the orchestrator computes it over the source data (e.g. SHA-256) and the plugin simply compares strings.
 
 ## Install
 
