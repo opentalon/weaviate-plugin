@@ -7,6 +7,7 @@ import (
 	"log"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-openapi/strfmt"
@@ -67,6 +68,45 @@ type Config struct {
 	Translator *TranslatorConfig `json:"translator,omitempty"`
 }
 
+// syncJobKind identifies the type of background sync work.
+type syncJobKind int
+
+const (
+	syncJobActions  syncJobKind = iota
+	syncJobGlossary
+)
+
+func (k syncJobKind) String() string {
+	switch k {
+	case syncJobActions:
+		return "sync_actions"
+	case syncJobGlossary:
+		return "sync_glossary"
+	default:
+		return "unknown"
+	}
+}
+
+// syncJob is the envelope queued for background processing.
+type syncJob struct {
+	kind    syncJobKind
+	reqID   string // original request ID for log correlation
+	payload string // raw JSON payload (already validated)
+}
+
+// syncStatusState exposes counters and timestamps for the background sync worker.
+type syncStatusState struct {
+	ActionsQueued     int64     `json:"actions_queued"`
+	ActionsCompleted  int64     `json:"actions_completed"`
+	ActionsFailed     int64     `json:"actions_failed"`
+	GlossaryQueued    int64     `json:"glossary_queued"`
+	GlossaryCompleted int64     `json:"glossary_completed"`
+	GlossaryFailed    int64     `json:"glossary_failed"`
+	LastActionSync    time.Time `json:"last_action_sync,omitempty"`
+	LastGlossarySync  time.Time `json:"last_glossary_sync,omitempty"`
+	WorkerRunning     bool      `json:"worker_running"`
+}
+
 // WeaviateHandler implements plugin.Handler.
 type WeaviateHandler struct {
 	client              *weaviate.Client
@@ -87,6 +127,11 @@ type WeaviateHandler struct {
 	// Hash-based sync skip: avoid re-writing unchanged data to Weaviate.
 	actionHashes map[string]string // pluginName → last-seen hash from sync_actions
 	glossaryHash string            // last-seen hash from sync_glossary
+
+	// Background sync worker.
+	syncJobCh  chan syncJob
+	syncMu     sync.RWMutex
+	syncStatus syncStatusState
 }
 
 // Configure is called by the SDK during the Init RPC with the JSON config block.
@@ -185,6 +230,11 @@ func (h *WeaviateHandler) Configure(configJSON string) error {
 		}
 		log.Println("weaviate-plugin: schemas ready")
 	}
+
+	// Start the background sync worker. All sync_actions and sync_glossary
+	// calls are enqueued here so the orchestrator returns immediately.
+	h.syncJobCh = make(chan syncJob, 64)
+	go h.runSyncWorker(context.Background())
 
 	if h.httpAddr != "" {
 		log.Printf("weaviate-plugin: starting HTTP server on %s (token protected)", h.httpAddr)
@@ -334,6 +384,11 @@ func (h *WeaviateHandler) Capabilities() plugin.CapabilitiesMsg {
 				},
 			},
 			{
+				Name:        "sync_status",
+				Description: "Returns the current background sync worker status: queued, completed, and failed job counts.",
+				Parameters:  []plugin.ParameterMsg{},
+			},
+			{
 				Name:        "refresh",
 				Description: "Re-create Weaviate collections if they were deleted externally. Called automatically on session clear.",
 				Parameters:  []plugin.ParameterMsg{},
@@ -355,7 +410,7 @@ func (h *WeaviateHandler) Execute(req plugin.Request) plugin.Response {
 	case "prepare":
 		return h.prepare(req)
 	case "sync_actions":
-		return h.syncActions(req)
+		return h.enqueueSyncActions(req)
 	case "ingest":
 		return h.ingest(req)
 	case "ingest_batch":
@@ -365,7 +420,9 @@ func (h *WeaviateHandler) Execute(req plugin.Request) plugin.Response {
 	case "search_instructions":
 		return h.searchInstructions(req)
 	case "sync_glossary":
-		return h.syncGlossary(req)
+		return h.enqueueSyncGlossary(req)
+	case "sync_status":
+		return h.getSyncStatus(req)
 	case "refresh":
 		return h.refresh(req)
 	default:
@@ -964,18 +1021,39 @@ type syncActionEntry struct {
 	Parameters  json.RawMessage `json:"parameters"`
 }
 
-func (h *WeaviateHandler) syncActions(req plugin.Request) plugin.Response {
+// enqueueSyncActions validates the payload synchronously and enqueues the
+// actual Weaviate work for the background sync worker. Returns immediately.
+func (h *WeaviateHandler) enqueueSyncActions(req plugin.Request) plugin.Response {
 	raw, ok := req.Args["payload"]
 	if !ok || raw == "" {
 		return plugin.Response{CallID: req.ID, Error: "payload is required"}
 	}
-
 	var payload syncActionsPayload
 	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
 		return plugin.Response{CallID: req.ID, Error: fmt.Sprintf("parse payload: %v", err)}
 	}
 	if payload.PluginName == "" {
 		return plugin.Response{CallID: req.ID, Error: "plugin_name is required"}
+	}
+
+	h.syncJobCh <- syncJob{kind: syncJobActions, reqID: req.ID, payload: raw}
+
+	h.syncMu.Lock()
+	h.syncStatus.ActionsQueued++
+	h.syncMu.Unlock()
+	syncJobsEnqueued.WithLabelValues("sync_actions").Inc()
+	syncQueueDepth.Inc()
+
+	log.Printf("weaviate-plugin: sync_actions: queued for %s (req=%s)", payload.PluginName, req.ID)
+	return plugin.Response{CallID: req.ID, Content: `{"queued":true,"action":"sync_actions"}`}
+}
+
+// syncActionsWork performs the actual sync_actions Weaviate operations.
+// Called by the background worker goroutine.
+func (h *WeaviateHandler) syncActionsWork(reqID string, raw string) error {
+	var payload syncActionsPayload
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+		return fmt.Errorf("parse payload: %v", err)
 	}
 
 	ctx := context.Background()
@@ -985,22 +1063,20 @@ func (h *WeaviateHandler) syncActions(req plugin.Request) plugin.Response {
 	// prune via keep_plugins still runs — it's cheap and keeps the index clean
 	// across plugin additions/removals. Continuation batches skip the hash
 	// check (the decision was made on batch 0).
-	if !payload.IsContinuationBatch && payload.Hash != "" && payload.Hash == h.actionHashes[payload.PluginName] {
+	h.syncMu.RLock()
+	hashMatch := !payload.IsContinuationBatch && payload.Hash != "" && payload.Hash == h.actionHashes[payload.PluginName]
+	h.syncMu.RUnlock()
+
+	if hashMatch {
 		log.Printf("weaviate-plugin: sync_actions: hash match for %s (%s), skipping upsert", payload.PluginName, payload.Hash)
-		pruned := 0
 		if len(payload.KeepPlugins) > 0 {
-			n, err := h.pruneOrphans(ctx, payload.KeepPlugins)
-			if err != nil {
+			if n, err := h.pruneOrphans(ctx, payload.KeepPlugins); err != nil {
 				log.Printf("weaviate-plugin: prune_orphans failed: %v", err)
+			} else if n > 0 {
+				log.Printf("weaviate-plugin: sync_actions: pruned %d orphans", n)
 			}
-			pruned = n
 		}
-		respBody := `{"skipped":true,"reason":"hash_match"`
-		if len(payload.KeepPlugins) > 0 {
-			respBody += fmt.Sprintf(`,"orphans_pruned":%d`, pruned)
-		}
-		respBody += `}`
-		return plugin.Response{CallID: req.ID, Content: respBody}
+		return nil
 	}
 
 	// Delete all existing actions for this plugin before re-syncing so that
@@ -1048,10 +1124,11 @@ func (h *WeaviateHandler) syncActions(req plugin.Request) plugin.Response {
 	// the orchestrator forwarded it. Keyed by deterministic UUID so re-runs are
 	// idempotent and a removed plugin's record is overwritten cleanly on the
 	// next sync (or pruned via keep_plugins below).
-	var instructionsObj *wmodels.Object
+	hasInstructions := false
 	if payload.ServerInstructions != "" {
 		log.Printf("weaviate-plugin: sync_actions: storing server instructions for %s (%d bytes)", payload.PluginName, len(payload.ServerInstructions))
-		instructionsObj = &wmodels.Object{
+		hasInstructions = true
+		objects = append(objects, &wmodels.Object{
 			Class: h.knowledgeCollection,
 			ID:    strfmt.UUID(serverInstructionsUUID(payload.PluginName)),
 			Properties: map[string]interface{}{
@@ -1060,52 +1137,127 @@ func (h *WeaviateHandler) syncActions(req plugin.Request) plugin.Response {
 				"source":  MCPSourcePrefix + payload.PluginName,
 				"tags":    []string{"opentalon", "mcp", "server-instructions", payload.PluginName},
 			},
-		}
-		objects = append(objects, instructionsObj)
+		})
 	}
 
 	syncedActions := len(payload.Actions)
 	if len(objects) > 0 {
 		results, err := h.client.Batch().ObjectsBatcher().WithObjects(objects...).Do(ctx)
 		if err != nil {
-			return plugin.Response{CallID: req.ID, Error: fmt.Sprintf("batch sync: %v", err)}
+			return fmt.Errorf("batch sync: %v", err)
 		}
 		if err := checkBatchErrors(results); err != nil {
-			return plugin.Response{CallID: req.ID, Error: fmt.Sprintf("batch sync: %v", err)}
+			return fmt.Errorf("batch sync: %v", err)
 		}
 	}
 
-	// Inter-plugin orphan prune: when the orchestrator ships the authoritative
-	// live-plugin list, delete records for plugins no longer present. Idempotent
-	// across the per-plugin calls of one full startup sync, so it's safe to
-	// apply on every call. Skip when keep_plugins is empty — that could
-	// legitimately mean "no plugins" but it's also the legacy / corrupted-payload
-	// case, and nuking the whole index on a bad input is too costly.
+	// Inter-plugin orphan prune.
 	pruned := 0
 	if len(payload.KeepPlugins) > 0 {
 		n, err := h.pruneOrphans(ctx, payload.KeepPlugins)
 		if err != nil {
 			log.Printf("weaviate-plugin: prune_orphans failed: %v", err)
-			// Don't fail the sync_actions call on prune error — upserts already
-			// succeeded, and a transient delete failure is recoverable on next sync.
 		}
 		pruned = n
 	}
 
 	// Store hash on successful sync so next call with the same hash can skip.
 	if payload.Hash != "" {
+		h.syncMu.Lock()
 		h.actionHashes[payload.PluginName] = payload.Hash
+		h.syncMu.Unlock()
 	}
 
-	respBody := fmt.Sprintf(`{"synced":%d`, syncedActions)
-	if instructionsObj != nil {
-		respBody += `,"server_instructions_synced":1`
+	log.Printf("weaviate-plugin: sync_actions: completed for %s (req=%s synced=%d instructions=%v pruned=%d)",
+		payload.PluginName, reqID, syncedActions, hasInstructions, pruned)
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Background sync worker
+// ---------------------------------------------------------------------------
+
+// runSyncWorker is a long-lived goroutine that drains syncJobCh sequentially,
+// preserving continuation batch ordering (FIFO).
+func (h *WeaviateHandler) runSyncWorker(ctx context.Context) {
+	log.Println("weaviate-plugin: background sync worker started")
+	h.syncMu.Lock()
+	h.syncStatus.WorkerRunning = true
+	h.syncMu.Unlock()
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Println("weaviate-plugin: background sync worker stopping")
+			h.syncMu.Lock()
+			h.syncStatus.WorkerRunning = false
+			h.syncMu.Unlock()
+			return
+		case job := <-h.syncJobCh:
+			h.processSyncJob(job)
+		}
 	}
-	if len(payload.KeepPlugins) > 0 {
-		respBody += fmt.Sprintf(`,"orphans_pruned":%d`, pruned)
+}
+
+func (h *WeaviateHandler) processSyncJob(job syncJob) {
+	syncQueueDepth.Dec()
+	start := time.Now()
+	var err error
+
+	switch job.kind {
+	case syncJobActions:
+		err = h.syncActionsWork(job.reqID, job.payload)
+		h.syncMu.Lock()
+		if err != nil {
+			h.syncStatus.ActionsFailed++
+		} else {
+			h.syncStatus.ActionsCompleted++
+			h.syncStatus.LastActionSync = time.Now()
+		}
+		h.syncMu.Unlock()
+	case syncJobGlossary:
+		err = h.syncGlossaryWork(job.reqID, job.payload)
+		h.syncMu.Lock()
+		if err != nil {
+			h.syncStatus.GlossaryFailed++
+		} else {
+			h.syncStatus.GlossaryCompleted++
+			h.syncStatus.LastGlossarySync = time.Now()
+		}
+		h.syncMu.Unlock()
 	}
-	respBody += `}`
-	return plugin.Response{CallID: req.ID, Content: respBody}
+
+	duration := time.Since(start).Seconds()
+	status := "ok"
+	if err != nil {
+		status = "error"
+		log.Printf("weaviate-plugin: background sync job failed (%s, req=%s): %v", job.kind, job.reqID, err)
+	}
+	syncJobDuration.WithLabelValues(job.kind.String(), status).Observe(duration)
+}
+
+// getSyncStatus returns the current background sync worker state.
+func (h *WeaviateHandler) getSyncStatus(req plugin.Request) plugin.Response {
+	h.syncMu.RLock()
+	s := h.syncStatus
+	h.syncMu.RUnlock()
+
+	pending := (s.ActionsQueued - s.ActionsCompleted - s.ActionsFailed) +
+		(s.GlossaryQueued - s.GlossaryCompleted - s.GlossaryFailed)
+
+	body, _ := json.Marshal(map[string]interface{}{
+		"actions_queued":     s.ActionsQueued,
+		"actions_completed":  s.ActionsCompleted,
+		"actions_failed":     s.ActionsFailed,
+		"glossary_queued":    s.GlossaryQueued,
+		"glossary_completed": s.GlossaryCompleted,
+		"glossary_failed":    s.GlossaryFailed,
+		"pending":            pending,
+		"worker_running":     s.WorkerRunning,
+		"last_action_sync":   s.LastActionSync,
+		"last_glossary_sync": s.LastGlossarySync,
+	})
+	return plugin.Response{CallID: req.ID, Content: string(body)}
 }
 
 // pruneOrphans deletes any MCPActions and any auto-generated KnowledgeArticles
@@ -1241,30 +1393,51 @@ type glossaryEntry struct {
 	Synonyms   []string `json:"synonyms,omitempty"`
 }
 
-func (h *WeaviateHandler) syncGlossary(req plugin.Request) plugin.Response {
+// enqueueSyncGlossary validates the payload and enqueues glossary sync
+// for the background worker. Returns immediately.
+func (h *WeaviateHandler) enqueueSyncGlossary(req plugin.Request) plugin.Response {
 	raw, ok := req.Args["payload"]
 	if !ok || raw == "" {
 		return plugin.Response{CallID: req.ID, Error: "payload is required"}
 	}
-
 	var payload syncGlossaryPayload
 	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
 		return plugin.Response{CallID: req.ID, Error: fmt.Sprintf("parse payload: %v", err)}
 	}
 
+	h.syncJobCh <- syncJob{kind: syncJobGlossary, reqID: req.ID, payload: raw}
+
+	h.syncMu.Lock()
+	h.syncStatus.GlossaryQueued++
+	h.syncMu.Unlock()
+	syncJobsEnqueued.WithLabelValues("sync_glossary").Inc()
+	syncQueueDepth.Inc()
+
+	log.Printf("weaviate-plugin: sync_glossary: queued (req=%s entries=%d)", req.ID, len(payload.Entries))
+	return plugin.Response{CallID: req.ID, Content: `{"queued":true,"action":"sync_glossary"}`}
+}
+
+// syncGlossaryWork performs the actual glossary sync Weaviate operations.
+// Called by the background worker goroutine.
+func (h *WeaviateHandler) syncGlossaryWork(reqID string, raw string) error {
+	var payload syncGlossaryPayload
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+		return fmt.Errorf("parse payload: %v", err)
+	}
+
 	ctx := context.Background()
 
-	// Hash-based skip on batch 0: if the hash matches the last-seen value,
-	// the glossary hasn't changed — skip the expensive delete+reinsert.
-	// Continuation batches bypass the hash check (decision was on batch 0).
-	if !payload.IsContinuationBatch && payload.GlossaryHash != "" && payload.GlossaryHash == h.glossaryHash {
+	// Hash-based skip on batch 0.
+	h.syncMu.RLock()
+	hashMatch := !payload.IsContinuationBatch && payload.GlossaryHash != "" && payload.GlossaryHash == h.glossaryHash
+	h.syncMu.RUnlock()
+
+	if hashMatch {
 		log.Printf("weaviate-plugin: sync_glossary: hash match (%s), skipping", payload.GlossaryHash)
-		return plugin.Response{CallID: req.ID, Content: `{"skipped":true,"reason":"hash_match"}`}
+		return nil
 	}
 
 	// Batch 0: delete all existing glossary entries for a clean full replace.
-	// Glossary is global (not per-plugin) so we delete everything.
-	// Continuation batches skip the delete to preserve previous batches.
 	if !payload.IsContinuationBatch {
 		_, delErr := h.client.Batch().ObjectsBatchDeleter().
 			WithClassName(h.glossaryCollection).
@@ -1306,20 +1479,23 @@ func (h *WeaviateHandler) syncGlossary(req plugin.Request) plugin.Response {
 	if len(objects) > 0 {
 		results, err := h.client.Batch().ObjectsBatcher().WithObjects(objects...).Do(ctx)
 		if err != nil {
-			return plugin.Response{CallID: req.ID, Error: fmt.Sprintf("batch sync glossary: %v", err)}
+			return fmt.Errorf("batch sync glossary: %v", err)
 		}
 		if err := checkBatchErrors(results); err != nil {
-			return plugin.Response{CallID: req.ID, Error: fmt.Sprintf("batch sync glossary: %v", err)}
+			return fmt.Errorf("batch sync glossary: %v", err)
 		}
 	}
 
 	// Store hash after successful sync.
 	if payload.GlossaryHash != "" {
+		h.syncMu.Lock()
 		h.glossaryHash = payload.GlossaryHash
+		h.syncMu.Unlock()
 	}
 
-	log.Printf("weaviate-plugin: sync_glossary: synced %d entries (hash=%s continuation=%v)", len(objects), payload.GlossaryHash, payload.IsContinuationBatch)
-	return plugin.Response{CallID: req.ID, Content: fmt.Sprintf(`{"synced":%d}`, len(objects))}
+	log.Printf("weaviate-plugin: sync_glossary: completed (req=%s synced=%d hash=%s continuation=%v)",
+		reqID, len(objects), payload.GlossaryHash, payload.IsContinuationBatch)
+	return nil
 }
 
 // serverInstructionsUUID returns a deterministic UUID v5 for the
