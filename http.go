@@ -31,6 +31,7 @@ func (h *WeaviateHandler) listenHTTP() error {
 	mux.HandleFunc("DELETE /api/v1/articles", h.requireToken(h.handleDeleteArticlesBySource))
 	mux.HandleFunc("POST /api/v1/actions/sync", h.requireToken(h.handleSyncActions))
 	mux.HandleFunc("POST /api/v1/glossary/sync", h.requireToken(h.handleSyncGlossary))
+	mux.HandleFunc("GET /api/v1/sync/status", h.requireToken(h.handleSyncStatus))
 	mux.HandleFunc("POST /api/v1/debug/prepare", h.requireToken(h.handleDebugPrepare))
 	return http.ListenAndServe(h.httpAddr, mux)
 }
@@ -167,6 +168,11 @@ func writePluginResponse(w http.ResponseWriter, resp plugin.Response) {
 		return
 	}
 	_, _ = w.Write([]byte(resp.Content))
+}
+
+func (h *WeaviateHandler) handleSyncStatus(w http.ResponseWriter, _ *http.Request) {
+	resp := h.Execute(plugin.Request{ID: "http", Action: "sync_status"})
+	writePluginResponse(w, resp)
 }
 
 func (h *WeaviateHandler) handleHealth(w http.ResponseWriter, _ *http.Request) {

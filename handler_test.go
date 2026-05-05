@@ -218,6 +218,30 @@ func seedRAGData() {
 	time.Sleep(300 * time.Millisecond)
 }
 
+// waitSyncDrain polls sync_status until all queued jobs have completed or
+// the timeout expires. Used by tests that enqueue background sync work and
+// then need to verify Weaviate state.
+func waitSyncDrain(t *testing.T, h *WeaviateHandler, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		resp := h.Execute(plugin.Request{ID: "drain-poll", Action: "sync_status"})
+		if resp.Error != "" {
+			t.Fatalf("sync_status error: %s", resp.Error)
+		}
+		var status map[string]interface{}
+		if err := json.Unmarshal([]byte(resp.Content), &status); err != nil {
+			t.Fatalf("parse sync_status: %v", err)
+		}
+		pending, _ := status["pending"].(float64)
+		if pending == 0 {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("sync jobs did not drain within %s", timeout)
+}
+
 func newHandler(t *testing.T) *WeaviateHandler {
 	t.Helper()
 	cfg, _ := json.Marshal(map[string]interface{}{
@@ -257,7 +281,7 @@ func TestCapabilities(t *testing.T) {
 	for _, a := range caps.Actions {
 		actions[a.Name] = true
 	}
-	for _, want := range []string{"search", "hybrid_search", "prepare", "sync_actions", "ingest", "ingest_batch", "refresh"} {
+	for _, want := range []string{"search", "hybrid_search", "prepare", "sync_actions", "ingest", "ingest_batch", "sync_status", "refresh"} {
 		if !actions[want] {
 			t.Errorf("missing action %q", want)
 		}
@@ -560,8 +584,18 @@ func TestSyncActions(t *testing.T) {
 	if resp.Error != "" {
 		t.Fatalf("Execute error: %s", resp.Error)
 	}
-	if !strings.Contains(resp.Content, `"synced":2`) {
-		t.Errorf("expected synced:2, got: %s", resp.Content)
+	if !strings.Contains(resp.Content, `"queued":true`) {
+		t.Errorf("expected queued:true, got: %s", resp.Content)
+	}
+	waitSyncDrain(t, h, 10*time.Second)
+
+	// Verify both actions exist in Weaviate.
+	for _, name := range []string{"create_issue", "list_issues"} {
+		id := actionUUID("test-plugin", name)
+		objs, err := rawClient.Data().ObjectsGetter().WithClassName(DefaultActionsCollection).WithID(id).Do(context.Background())
+		if err != nil || len(objs) == 0 {
+			t.Errorf("action %s missing after sync: err=%v", name, err)
+		}
 	}
 }
 
@@ -583,6 +617,7 @@ func TestSyncActions_upsert(t *testing.T) {
 	if resp.Error != "" {
 		t.Fatalf("first sync error: %s", resp.Error)
 	}
+	waitSyncDrain(t, h, 10*time.Second)
 
 	// Sync again with updated description — should not fail.
 	payload, _ = json.Marshal(syncActionsPayload{
@@ -600,9 +635,10 @@ func TestSyncActions_upsert(t *testing.T) {
 	if resp.Error != "" {
 		t.Fatalf("upsert sync error: %s", resp.Error)
 	}
-	if !strings.Contains(resp.Content, `"synced":1`) {
-		t.Errorf("expected synced:1, got: %s", resp.Content)
+	if !strings.Contains(resp.Content, `"queued":true`) {
+		t.Errorf("expected queued:true, got: %s", resp.Content)
 	}
+	waitSyncDrain(t, h, 10*time.Second)
 }
 
 func TestSyncActions_missingPayload(t *testing.T) {
@@ -648,7 +684,7 @@ func TestSyncActions_deletesStaleActions(t *testing.T) {
 	if resp.Error != "" {
 		t.Fatalf("first sync error: %s", resp.Error)
 	}
-
+	waitSyncDrain(t, h, 10*time.Second)
 	time.Sleep(300 * time.Millisecond)
 
 	// Second sync: only keep_action — old_action should be deleted.
@@ -666,7 +702,7 @@ func TestSyncActions_deletesStaleActions(t *testing.T) {
 	if resp.Error != "" {
 		t.Fatalf("second sync error: %s", resp.Error)
 	}
-
+	waitSyncDrain(t, h, 10*time.Second)
 	time.Sleep(300 * time.Millisecond)
 
 	// Verify old_action no longer exists by searching for it.
@@ -733,6 +769,7 @@ func TestSyncActions_continuationBatchSkipsPreDelete(t *testing.T) {
 		t.Fatalf("batch 1 error: %s", resp.Error)
 	}
 
+	waitSyncDrain(t, h, 10*time.Second)
 	time.Sleep(300 * time.Millisecond)
 
 	// All six actions from both batches must be present.
@@ -765,9 +802,10 @@ func TestSyncActions_emptyActions(t *testing.T) {
 	if resp.Error != "" {
 		t.Fatalf("Execute error: %s", resp.Error)
 	}
-	if !strings.Contains(resp.Content, `"synced":0`) {
-		t.Errorf("expected synced:0, got: %s", resp.Content)
+	if !strings.Contains(resp.Content, `"queued":true`) {
+		t.Errorf("expected queued:true, got: %s", resp.Content)
 	}
+	waitSyncDrain(t, h, 10*time.Second)
 }
 
 func TestSyncActions_serverInstructions(t *testing.T) {
@@ -783,9 +821,10 @@ func TestSyncActions_serverInstructions(t *testing.T) {
 	if resp.Error != "" {
 		t.Fatalf("Execute error: %s", resp.Error)
 	}
-	if !strings.Contains(resp.Content, `"server_instructions_synced":1`) {
-		t.Errorf("expected server_instructions_synced:1, got: %s", resp.Content)
+	if !strings.Contains(resp.Content, `"queued":true`) {
+		t.Errorf("expected queued:true, got: %s", resp.Content)
 	}
+	waitSyncDrain(t, h, 10*time.Second)
 	time.Sleep(300 * time.Millisecond)
 
 	// Verify the article exists with the deterministic UUID and expected fields.
@@ -818,6 +857,7 @@ func TestSyncActions_serverInstructions(t *testing.T) {
 	if resp.Error != "" {
 		t.Fatalf("re-sync error: %s", resp.Error)
 	}
+	waitSyncDrain(t, h, 10*time.Second)
 	time.Sleep(300 * time.Millisecond)
 	got, err = rawClient.Data().ObjectsGetter().
 		WithClassName(DefaultKnowledgeCollection).
@@ -847,6 +887,7 @@ func TestSyncActions_pruneOrphans(t *testing.T) {
 			t.Fatalf("seed %s: %s", name, resp.Error)
 		}
 	}
+	waitSyncDrain(t, h, 10*time.Second)
 	time.Sleep(300 * time.Millisecond)
 
 	// Re-sync with keep_plugins listing only the kept plugin — orphan must vanish.
@@ -859,9 +900,7 @@ func TestSyncActions_pruneOrphans(t *testing.T) {
 	if resp.Error != "" {
 		t.Fatalf("prune call: %s", resp.Error)
 	}
-	if !strings.Contains(resp.Content, `"orphans_pruned":`) {
-		t.Errorf("expected orphans_pruned in response: %s", resp.Content)
-	}
+	waitSyncDrain(t, h, 10*time.Second)
 	time.Sleep(300 * time.Millisecond)
 
 	// MCPActions: kept plugin's action survives, orphan's action is gone.
@@ -901,6 +940,7 @@ func TestSyncActions_emptyKeepPluginsSkipsPrune(t *testing.T) {
 	if resp.Error != "" {
 		t.Fatalf("seed: %s", resp.Error)
 	}
+	waitSyncDrain(t, h, 10*time.Second)
 
 	// Send an empty keep_plugins — must NOT trigger a delete-everything-in-class.
 	payload, _ = json.Marshal(syncActionsPayload{
@@ -912,9 +952,7 @@ func TestSyncActions_emptyKeepPluginsSkipsPrune(t *testing.T) {
 	if resp.Error != "" {
 		t.Fatalf("skip-prune call: %s", resp.Error)
 	}
-	if strings.Contains(resp.Content, `"orphans_pruned"`) {
-		t.Errorf("empty keep_plugins must not trigger prune: %s", resp.Content)
-	}
+	waitSyncDrain(t, h, 10*time.Second)
 	time.Sleep(300 * time.Millisecond)
 
 	// Verify the seeded record still exists.
@@ -940,6 +978,7 @@ func TestSyncActions_pruneAlsoWithoutInstructions(t *testing.T) {
 	if resp.Error != "" {
 		t.Fatalf("seed: %s", resp.Error)
 	}
+	waitSyncDrain(t, h, 10*time.Second)
 	time.Sleep(300 * time.Millisecond)
 
 	// Now sync a different plugin and prune.
@@ -952,6 +991,7 @@ func TestSyncActions_pruneAlsoWithoutInstructions(t *testing.T) {
 	if resp.Error != "" {
 		t.Fatalf("prune call: %s", resp.Error)
 	}
+	waitSyncDrain(t, h, 10*time.Second)
 	time.Sleep(300 * time.Millisecond)
 
 	orphanID := actionUUID("no-instr-orphan", "act")
@@ -1183,9 +1223,10 @@ func TestHTTP_syncActions(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("status: got %d want %d; body: %s", w.Code, http.StatusOK, w.Body.String())
 	}
-	if !strings.Contains(w.Body.String(), `"synced":1`) {
-		t.Errorf("expected synced:1, got: %s", w.Body.String())
+	if !strings.Contains(w.Body.String(), `"queued":true`) {
+		t.Errorf("expected queued:true, got: %s", w.Body.String())
 	}
+	waitSyncDrain(t, h, 10*time.Second)
 }
 
 func TestHTTP_ingestBatch(t *testing.T) {
