@@ -1372,6 +1372,15 @@ func (h *WeaviateHandler) pruneOrphans(ctx context.Context, keep []string) (int,
 	// KnowledgeArticles, server-instructions records: scope to MCP-managed
 	// (source LIKE "mcp:*"), discover distinct sources, delete each orphan
 	// by Equal on source. Source format: "mcp:<plugin>" (1:1 plugin mapping).
+	//
+	// IMPORTANT — Weaviate's Like operator on tokenized text fields matches
+	// per-token, so the pattern "mcp:*" returns ANY record whose tokens
+	// include "mcp" (e.g. "mcp-knowledge:foo:bar" tokens contain "mcp"
+	// because "-" is a token separator). Filter the discovered sources by
+	// exact-string prefix before treating them as server-instructions
+	// records — without that, mcp-knowledge:* rows would be misclassified
+	// here, fail the TrimPrefix-based plugin extraction, and get deleted
+	// as orphans on every prune.
 	mcpScope := filters.Where().
 		WithPath([]string{"source"}).
 		WithOperator(filters.Like).
@@ -1381,6 +1390,9 @@ func (h *WeaviateHandler) pruneOrphans(ctx context.Context, keep []string) (int,
 		firstErr = fmt.Errorf("KnowledgeArticles distinct: %w", err)
 	}
 	for _, src := range sources {
+		if !strings.HasPrefix(src, MCPSourcePrefix) || strings.HasPrefix(src, MCPKnowledgeSourcePrefix) {
+			continue
+		}
 		plugin := strings.TrimPrefix(src, MCPSourcePrefix)
 		if keepSet[plugin] {
 			continue
@@ -1395,7 +1407,8 @@ func (h *WeaviateHandler) pruneOrphans(ctx context.Context, keep []string) (int,
 	// KnowledgeArticles, knowledge-section records: scope to plugin-contributed
 	// sections (source LIKE "mcp-knowledge:*"), discover distinct sources, then
 	// delete each orphan. Source format: "mcp-knowledge:<plugin>:<article-id>"
-	// — extract plugin between the first and second ':'.
+	// — extract plugin between the first and second ':'. Same per-token
+	// over-match concern as above; gate on exact-string prefix.
 	knowledgeScope := filters.Where().
 		WithPath([]string{"source"}).
 		WithOperator(filters.Like).
@@ -1405,6 +1418,9 @@ func (h *WeaviateHandler) pruneOrphans(ctx context.Context, keep []string) (int,
 		firstErr = fmt.Errorf("KnowledgeArticles knowledge-distinct: %w", err)
 	}
 	for _, src := range knowledgeSources {
+		if !strings.HasPrefix(src, MCPKnowledgeSourcePrefix) {
+			continue
+		}
 		rest := strings.TrimPrefix(src, MCPKnowledgeSourcePrefix)
 		plugin := rest
 		if i := strings.IndexByte(rest, ':'); i >= 0 {

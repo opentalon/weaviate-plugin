@@ -1853,6 +1853,83 @@ func TestSyncActions_knowledgeArticlesPruneOrphans(t *testing.T) {
 	}
 }
 
+func TestSyncActions_pruneScopesAreDisjointAcrossSourcePrefixes(t *testing.T) {
+	// Regression: Weaviate's Like operator on tokenized text matches per-token,
+	// so the prune scope `Like mcp:*` over-matches mcp-knowledge:* records
+	// (both share the "mcp" token). Without an explicit HasPrefix gate, the
+	// over-matched mcp-knowledge:* sources fall through TrimPrefix unchanged
+	// and look like orphans, getting deleted on every prune cycle even when
+	// their plugin is in keep_plugins.
+	h := newHandler(t)
+
+	// One plugin contributes BOTH a server-instructions blob (mcp:<plugin>)
+	// AND per-section knowledge articles (mcp-knowledge:<plugin>:<id>).
+	payload, _ := json.Marshal(syncActionsPayload{
+		PluginName:         "mixed-keep",
+		ServerInstructions: "Server prose for mixed-keep.",
+		KnowledgeArticles: []knowledgeArticleEntry{
+			{ID: "section-a", Title: "A", Content: "first"},
+		},
+	})
+	h.Execute(plugin.Request{ID: "mix-seed", Action: "sync_actions", Args: map[string]string{"payload": string(payload)}})
+
+	// A second plugin to be pruned as orphan.
+	payload, _ = json.Marshal(syncActionsPayload{
+		PluginName:         "mixed-orphan",
+		ServerInstructions: "Server prose for mixed-orphan.",
+		KnowledgeArticles: []knowledgeArticleEntry{
+			{ID: "section-a", Title: "B", Content: "second"},
+		},
+	})
+	h.Execute(plugin.Request{ID: "mix-seed-orphan", Action: "sync_actions", Args: map[string]string{"payload": string(payload)}})
+
+	waitSyncDrain(t, h, 10*time.Second)
+	time.Sleep(300 * time.Millisecond)
+
+	// Re-sync mixed-keep with KeepPlugins=[mixed-keep]. Both prune scopes
+	// (mcp:* and mcp-knowledge:*) execute. The kept plugin's records — across
+	// BOTH prefixes — must survive.
+	payload, _ = json.Marshal(syncActionsPayload{
+		PluginName:         "mixed-keep",
+		ServerInstructions: "Server prose for mixed-keep.",
+		KnowledgeArticles: []knowledgeArticleEntry{
+			{ID: "section-a", Title: "A", Content: "first"},
+		},
+		KeepPlugins: []string{"mixed-keep"},
+	})
+	h.Execute(plugin.Request{ID: "mix-resync", Action: "sync_actions", Args: map[string]string{"payload": string(payload)}})
+	waitSyncDrain(t, h, 10*time.Second)
+	time.Sleep(300 * time.Millisecond)
+
+	// Kept plugin's server-instructions article (source = "mcp:mixed-keep") survives.
+	keepInstrID := serverInstructionsUUID("mixed-keep")
+	got, err := rawClient.Data().ObjectsGetter().WithClassName(DefaultKnowledgeCollection).WithID(keepInstrID).Do(context.Background())
+	if err != nil || len(got) != 1 {
+		t.Errorf("kept server-instructions article missing after cross-prefix prune: err=%v len=%d", err, len(got))
+	}
+
+	// Kept plugin's knowledge-section article (source = "mcp-knowledge:mixed-keep:section-a")
+	// survives. Without the HasPrefix gate this would be deleted by the mcp:*
+	// scan misclassifying it as a foreign plugin.
+	keepKnowledgeID := knowledgeArticleUUID("mixed-keep", "section-a")
+	got, err = rawClient.Data().ObjectsGetter().WithClassName(DefaultKnowledgeCollection).WithID(keepKnowledgeID).Do(context.Background())
+	if err != nil || len(got) != 1 {
+		t.Errorf("kept knowledge-section article missing after cross-prefix prune: err=%v len=%d", err, len(got))
+	}
+
+	// Orphan plugin's records — both prefixes — vanish.
+	orphanInstrID := serverInstructionsUUID("mixed-orphan")
+	got, err = rawClient.Data().ObjectsGetter().WithClassName(DefaultKnowledgeCollection).WithID(orphanInstrID).Do(context.Background())
+	if err == nil && len(got) != 0 {
+		t.Errorf("orphan server-instructions article still present: %d records", len(got))
+	}
+	orphanKnowledgeID := knowledgeArticleUUID("mixed-orphan", "section-a")
+	got, err = rawClient.Data().ObjectsGetter().WithClassName(DefaultKnowledgeCollection).WithID(orphanKnowledgeID).Do(context.Background())
+	if err == nil && len(got) != 0 {
+		t.Errorf("orphan knowledge-section article still present: %d records", len(got))
+	}
+}
+
 func TestSyncActions_knowledgeArticlesPrepareNotFiltered(t *testing.T) {
 	h := newHandler(t)
 
