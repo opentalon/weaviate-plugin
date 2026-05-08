@@ -1674,3 +1674,293 @@ func TestRefresh(t *testing.T) {
 		t.Errorf("expected refreshed:true, got: %s", resp.Content)
 	}
 }
+
+func TestSyncActions_knowledgeArticles(t *testing.T) {
+	h := newHandler(t)
+
+	payload, _ := json.Marshal(syncActionsPayload{
+		PluginName: "ka-test",
+		KnowledgeArticles: []knowledgeArticleEntry{
+			{ID: "org-units-vs-containers", Title: "Org-units vs Containers (Places)", Content: "A Place is a storage unit; an Org-unit is a structural unit.", Tags: []string{"places"}},
+			{ID: "users-vs-persons", Title: "Users vs Persons", Content: "A User logs in; a Person is a managed record."},
+		},
+	})
+	resp := h.Execute(plugin.Request{ID: "sync-ka", Action: "sync_actions", Args: map[string]string{"payload": string(payload)}})
+	if resp.Error != "" {
+		t.Fatalf("Execute error: %s", resp.Error)
+	}
+	waitSyncDrain(t, h, 10*time.Second)
+	time.Sleep(300 * time.Millisecond)
+
+	// Both records exist with deterministic UUID, expected source format and tag set.
+	cases := []struct {
+		articleID string
+		title     string
+		source    string
+		hasTag    string
+	}{
+		{"org-units-vs-containers", "Org-units vs Containers (Places)", "mcp-knowledge:ka-test:org-units-vs-containers", "places"},
+		{"users-vs-persons", "Users vs Persons", "mcp-knowledge:ka-test:users-vs-persons", "knowledge"},
+	}
+	for _, c := range cases {
+		id := knowledgeArticleUUID("ka-test", c.articleID)
+		got, err := rawClient.Data().ObjectsGetter().
+			WithClassName(DefaultKnowledgeCollection).
+			WithID(id).
+			Do(context.Background())
+		if err != nil {
+			t.Fatalf("get article by ID %s: %v", id, err)
+		}
+		if len(got) != 1 {
+			t.Fatalf("article %s: expected 1, got %d", c.articleID, len(got))
+		}
+		props := got[0].Properties.(map[string]interface{})
+		if title, _ := props["title"].(string); title != c.title {
+			t.Errorf("article %s: title = %q, want %q", c.articleID, title, c.title)
+		}
+		if src, _ := props["source"].(string); src != c.source {
+			t.Errorf("article %s: source = %q, want %q", c.articleID, src, c.source)
+		}
+		tags, _ := props["tags"].([]interface{})
+		found := false
+		for _, tg := range tags {
+			if s, _ := tg.(string); s == c.hasTag {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("article %s: missing tag %q in %v", c.articleID, c.hasTag, tags)
+		}
+	}
+
+	// Idempotency: re-sync with updated content overwrites in place.
+	payload, _ = json.Marshal(syncActionsPayload{
+		PluginName: "ka-test",
+		KnowledgeArticles: []knowledgeArticleEntry{
+			{ID: "org-units-vs-containers", Title: "Org-units vs Containers (Places)", Content: "Revised content."},
+			{ID: "users-vs-persons", Title: "Users vs Persons", Content: "A User logs in; a Person is a managed record."},
+		},
+	})
+	resp = h.Execute(plugin.Request{ID: "sync-ka-2", Action: "sync_actions", Args: map[string]string{"payload": string(payload)}})
+	if resp.Error != "" {
+		t.Fatalf("re-sync error: %s", resp.Error)
+	}
+	waitSyncDrain(t, h, 10*time.Second)
+	time.Sleep(300 * time.Millisecond)
+
+	id := knowledgeArticleUUID("ka-test", "org-units-vs-containers")
+	got, err := rawClient.Data().ObjectsGetter().WithClassName(DefaultKnowledgeCollection).WithID(id).Do(context.Background())
+	if err != nil || len(got) != 1 {
+		t.Fatalf("re-fetch: err=%v len=%d", err, len(got))
+	}
+	props := got[0].Properties.(map[string]interface{})
+	if content, _ := props["content"].(string); content != "Revised content." {
+		t.Errorf("content not updated: %q", content)
+	}
+}
+
+func TestSyncActions_knowledgeArticlesStaleSectionRemoved(t *testing.T) {
+	h := newHandler(t)
+
+	// Seed two sections.
+	payload, _ := json.Marshal(syncActionsPayload{
+		PluginName: "ka-stale-test",
+		KnowledgeArticles: []knowledgeArticleEntry{
+			{ID: "section-a", Title: "A", Content: "first"},
+			{ID: "section-b", Title: "B", Content: "second"},
+		},
+	})
+	resp := h.Execute(plugin.Request{ID: "stale-seed", Action: "sync_actions", Args: map[string]string{"payload": string(payload)}})
+	if resp.Error != "" {
+		t.Fatalf("seed: %s", resp.Error)
+	}
+	waitSyncDrain(t, h, 10*time.Second)
+	time.Sleep(300 * time.Millisecond)
+
+	// Re-sync without section-b — it must be cleared by the per-plugin pre-delete.
+	payload, _ = json.Marshal(syncActionsPayload{
+		PluginName: "ka-stale-test",
+		KnowledgeArticles: []knowledgeArticleEntry{
+			{ID: "section-a", Title: "A", Content: "first"},
+		},
+	})
+	resp = h.Execute(plugin.Request{ID: "stale-resync", Action: "sync_actions", Args: map[string]string{"payload": string(payload)}})
+	if resp.Error != "" {
+		t.Fatalf("re-sync: %s", resp.Error)
+	}
+	waitSyncDrain(t, h, 10*time.Second)
+	time.Sleep(300 * time.Millisecond)
+
+	// section-a still exists.
+	keepID := knowledgeArticleUUID("ka-stale-test", "section-a")
+	got, err := rawClient.Data().ObjectsGetter().WithClassName(DefaultKnowledgeCollection).WithID(keepID).Do(context.Background())
+	if err != nil || len(got) != 1 {
+		t.Errorf("section-a missing: err=%v len=%d", err, len(got))
+	}
+	// section-b is gone.
+	staleID := knowledgeArticleUUID("ka-stale-test", "section-b")
+	got, err = rawClient.Data().ObjectsGetter().WithClassName(DefaultKnowledgeCollection).WithID(staleID).Do(context.Background())
+	if err == nil && len(got) != 0 {
+		t.Errorf("section-b still present after re-sync: %d records", len(got))
+	}
+}
+
+func TestSyncActions_knowledgeArticlesPruneOrphans(t *testing.T) {
+	h := newHandler(t)
+
+	// Seed two plugins, each with one knowledge article.
+	for _, name := range []string{"ka-prune-keep", "ka-prune-orphan"} {
+		payload, _ := json.Marshal(syncActionsPayload{
+			PluginName: name,
+			KnowledgeArticles: []knowledgeArticleEntry{
+				{ID: "section-a", Title: "Section A for " + name, Content: "x"},
+			},
+		})
+		resp := h.Execute(plugin.Request{ID: "ka-seed-" + name, Action: "sync_actions", Args: map[string]string{"payload": string(payload)}})
+		if resp.Error != "" {
+			t.Fatalf("seed %s: %s", name, resp.Error)
+		}
+	}
+	waitSyncDrain(t, h, 10*time.Second)
+	time.Sleep(300 * time.Millisecond)
+
+	// Re-sync with keep_plugins listing only the kept plugin — orphan plugin's
+	// knowledge article must vanish through the new mcp-knowledge:* prune scan.
+	payload, _ := json.Marshal(syncActionsPayload{
+		PluginName: "ka-prune-keep",
+		KnowledgeArticles: []knowledgeArticleEntry{
+			{ID: "section-a", Title: "Section A for ka-prune-keep", Content: "x"},
+		},
+		KeepPlugins: []string{"ka-prune-keep"},
+	})
+	resp := h.Execute(plugin.Request{ID: "ka-prune-call", Action: "sync_actions", Args: map[string]string{"payload": string(payload)}})
+	if resp.Error != "" {
+		t.Fatalf("prune call: %s", resp.Error)
+	}
+	waitSyncDrain(t, h, 10*time.Second)
+	time.Sleep(300 * time.Millisecond)
+
+	keepID := knowledgeArticleUUID("ka-prune-keep", "section-a")
+	got, err := rawClient.Data().ObjectsGetter().WithClassName(DefaultKnowledgeCollection).WithID(keepID).Do(context.Background())
+	if err != nil || len(got) != 1 {
+		t.Errorf("kept knowledge article missing: err=%v len=%d", err, len(got))
+	}
+	orphanID := knowledgeArticleUUID("ka-prune-orphan", "section-a")
+	got, err = rawClient.Data().ObjectsGetter().WithClassName(DefaultKnowledgeCollection).WithID(orphanID).Do(context.Background())
+	if err == nil && len(got) != 0 {
+		t.Errorf("orphan knowledge article still present after prune: %d records", len(got))
+	}
+}
+
+func TestSyncActions_pruneScopesAreDisjointAcrossSourcePrefixes(t *testing.T) {
+	// Regression: Weaviate's Like operator on tokenized text matches per-token,
+	// so the prune scope `Like mcp:*` over-matches mcp-knowledge:* records
+	// (both share the "mcp" token). Without an explicit HasPrefix gate, the
+	// over-matched mcp-knowledge:* sources fall through TrimPrefix unchanged
+	// and look like orphans, getting deleted on every prune cycle even when
+	// their plugin is in keep_plugins.
+	h := newHandler(t)
+
+	// One plugin contributes BOTH a server-instructions blob (mcp:<plugin>)
+	// AND per-section knowledge articles (mcp-knowledge:<plugin>:<id>).
+	payload, _ := json.Marshal(syncActionsPayload{
+		PluginName:         "mixed-keep",
+		ServerInstructions: "Server prose for mixed-keep.",
+		KnowledgeArticles: []knowledgeArticleEntry{
+			{ID: "section-a", Title: "A", Content: "first"},
+		},
+	})
+	h.Execute(plugin.Request{ID: "mix-seed", Action: "sync_actions", Args: map[string]string{"payload": string(payload)}})
+
+	// A second plugin to be pruned as orphan.
+	payload, _ = json.Marshal(syncActionsPayload{
+		PluginName:         "mixed-orphan",
+		ServerInstructions: "Server prose for mixed-orphan.",
+		KnowledgeArticles: []knowledgeArticleEntry{
+			{ID: "section-a", Title: "B", Content: "second"},
+		},
+	})
+	h.Execute(plugin.Request{ID: "mix-seed-orphan", Action: "sync_actions", Args: map[string]string{"payload": string(payload)}})
+
+	waitSyncDrain(t, h, 10*time.Second)
+	time.Sleep(300 * time.Millisecond)
+
+	// Re-sync mixed-keep with KeepPlugins=[mixed-keep]. Both prune scopes
+	// (mcp:* and mcp-knowledge:*) execute. The kept plugin's records — across
+	// BOTH prefixes — must survive.
+	payload, _ = json.Marshal(syncActionsPayload{
+		PluginName:         "mixed-keep",
+		ServerInstructions: "Server prose for mixed-keep.",
+		KnowledgeArticles: []knowledgeArticleEntry{
+			{ID: "section-a", Title: "A", Content: "first"},
+		},
+		KeepPlugins: []string{"mixed-keep"},
+	})
+	h.Execute(plugin.Request{ID: "mix-resync", Action: "sync_actions", Args: map[string]string{"payload": string(payload)}})
+	waitSyncDrain(t, h, 10*time.Second)
+	time.Sleep(300 * time.Millisecond)
+
+	// Kept plugin's server-instructions article (source = "mcp:mixed-keep") survives.
+	keepInstrID := serverInstructionsUUID("mixed-keep")
+	got, err := rawClient.Data().ObjectsGetter().WithClassName(DefaultKnowledgeCollection).WithID(keepInstrID).Do(context.Background())
+	if err != nil || len(got) != 1 {
+		t.Errorf("kept server-instructions article missing after cross-prefix prune: err=%v len=%d", err, len(got))
+	}
+
+	// Kept plugin's knowledge-section article (source = "mcp-knowledge:mixed-keep:section-a")
+	// survives. Without the HasPrefix gate this would be deleted by the mcp:*
+	// scan misclassifying it as a foreign plugin.
+	keepKnowledgeID := knowledgeArticleUUID("mixed-keep", "section-a")
+	got, err = rawClient.Data().ObjectsGetter().WithClassName(DefaultKnowledgeCollection).WithID(keepKnowledgeID).Do(context.Background())
+	if err != nil || len(got) != 1 {
+		t.Errorf("kept knowledge-section article missing after cross-prefix prune: err=%v len=%d", err, len(got))
+	}
+
+	// Orphan plugin's records — both prefixes — vanish.
+	orphanInstrID := serverInstructionsUUID("mixed-orphan")
+	got, err = rawClient.Data().ObjectsGetter().WithClassName(DefaultKnowledgeCollection).WithID(orphanInstrID).Do(context.Background())
+	if err == nil && len(got) != 0 {
+		t.Errorf("orphan server-instructions article still present: %d records", len(got))
+	}
+	orphanKnowledgeID := knowledgeArticleUUID("mixed-orphan", "section-a")
+	got, err = rawClient.Data().ObjectsGetter().WithClassName(DefaultKnowledgeCollection).WithID(orphanKnowledgeID).Do(context.Background())
+	if err == nil && len(got) != 0 {
+		t.Errorf("orphan knowledge-section article still present: %d records", len(got))
+	}
+}
+
+func TestSyncActions_knowledgeArticlesPrepareNotFiltered(t *testing.T) {
+	h := newHandler(t)
+
+	// A knowledge article with content that the prepare path can match against
+	// a related query ("places", "containers").
+	payload, _ := json.Marshal(syncActionsPayload{
+		PluginName: "ka-prepare-test",
+		KnowledgeArticles: []knowledgeArticleEntry{
+			{ID: "org-units-vs-containers", Title: "Org-units vs Containers (Places)", Content: "A Place is a storage unit (container, garage, cabinet, box) — discovered via list-containers."},
+		},
+	})
+	resp := h.Execute(plugin.Request{ID: "prep-seed", Action: "sync_actions", Args: map[string]string{"payload": string(payload)}})
+	if resp.Error != "" {
+		t.Fatalf("seed: %s", resp.Error)
+	}
+	waitSyncDrain(t, h, 10*time.Second)
+	time.Sleep(300 * time.Millisecond)
+
+	// Article must be retrievable directly (sanity).
+	id := knowledgeArticleUUID("ka-prepare-test", "org-units-vs-containers")
+	got, err := rawClient.Data().ObjectsGetter().WithClassName(DefaultKnowledgeCollection).WithID(id).Do(context.Background())
+	if err != nil || len(got) != 1 {
+		t.Fatalf("article missing: err=%v len=%d", err, len(got))
+	}
+	src, _ := got[0].Properties.(map[string]interface{})["source"].(string)
+
+	// filterOutMCPItems is what the prepare path uses to drop the always-injected
+	// "mcp:" records. mcp-knowledge:* records must NOT be filtered out — they're
+	// the whole point of the per-section split.
+	filtered := filterOutMCPItems([]map[string]interface{}{{"source": src, "title": "x"}})
+	if len(filtered) != 1 {
+		t.Errorf("filterOutMCPItems dropped a knowledge article (source=%q); knowledge sections must reach [knowledge_context]", src)
+	}
+}
