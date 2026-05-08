@@ -43,6 +43,15 @@ var glossaryNS = uuid.MustParse("f6a0b3c4-7d5e-6f8a-b1c2-3d4e5f6a7b8c")
 // for filtered prune queries — only auto-managed records are deleted.
 const MCPSourcePrefix = "mcp:"
 
+// MCPKnowledgeSourcePrefix tags KnowledgeArticles records contributed by a
+// plugin via the per-section `knowledge_articles[]` field on sync_actions.
+// Each record's source is "mcp-knowledge:<plugin>:<article-id>". Distinct
+// from MCPSourcePrefix ("mcp:") so the prepare-path filter that excludes
+// the always-injected SystemPromptAddition (mcp:<plugin>) keeps these
+// section articles available for [knowledge_context] retrieval — the whole
+// point of splitting them out.
+const MCPKnowledgeSourcePrefix = "mcp-knowledge:"
+
 // Config is the JSON config block passed via the Init RPC.
 type Config struct {
 	Host                string         `json:"host"`
@@ -1001,11 +1010,20 @@ type syncActionsPayload struct {
 	PluginName         string            `json:"plugin_name"`
 	Actions            []syncActionEntry `json:"actions"`
 	ServerInstructions string            `json:"server_instructions,omitempty"`
-	KeepPlugins        []string          `json:"keep_plugins,omitempty"`
+	// KnowledgeArticles ships per-section knowledge contributed by the plugin
+	// via the MCP `initialize._meta.knowledge_articles` field. Each entry is
+	// stored as one KnowledgeArticles record with source
+	// "mcp-knowledge:<plugin>:<id>" so the prepare-path RAG can pull just the
+	// relevant sections into [knowledge_context] instead of injecting the full
+	// per-plugin instructions blob into every system prompt. Optional; older
+	// orchestrators that omit the field keep the legacy single-blob shape.
+	KnowledgeArticles []knowledgeArticleEntry `json:"knowledge_articles,omitempty"`
+	KeepPlugins       []string                `json:"keep_plugins,omitempty"`
 	// Hash is an opaque string computed by the orchestrator over the combined
-	// actions + server_instructions for this plugin. When present and matching
-	// the last-seen hash, the plugin skips the upsert (but still runs orphan
-	// prune). Older orchestrators that omit it get the legacy always-sync.
+	// actions + server_instructions + knowledge_articles for this plugin. When
+	// present and matching the last-seen hash, the plugin skips the upsert
+	// (but still runs orphan prune). Older orchestrators that omit it get the
+	// legacy always-sync.
 	Hash string `json:"hash,omitempty"`
 	// IsContinuationBatch is set by the orchestrator on batches 1..N of a
 	// chunked plugin sync so the plugin skips the per-plugin pre-delete that
@@ -1019,6 +1037,18 @@ type syncActionEntry struct {
 	Name        string          `json:"name"`
 	Description string          `json:"description"`
 	Parameters  json.RawMessage `json:"parameters"`
+}
+
+// knowledgeArticleEntry is one section payload from sync_actions's
+// knowledge_articles[]. ID, Title and Content are required. Tags is optional
+// and gets augmented with ["opentalon", "mcp", "knowledge", <plugin>] on
+// storage so list/search by tag works the same as for the other auto-managed
+// KnowledgeArticles records.
+type knowledgeArticleEntry struct {
+	ID      string   `json:"id"`
+	Title   string   `json:"title"`
+	Content string   `json:"content"`
+	Tags    []string `json:"tags,omitempty"`
 }
 
 // enqueueSyncActions validates the payload synchronously and enqueues the
@@ -1140,6 +1170,44 @@ func (h *WeaviateHandler) syncActionsWork(reqID string, raw string) error {
 		})
 	}
 
+	// Pre-delete all "mcp-knowledge:<plugin>:*" records on batch 0 so sections
+	// that the plugin removed or renamed between syncs vanish from the index
+	// (deterministic-UUID upsert overwrites in place but cannot delete a row
+	// no longer in payload). Mirrors the per-plugin actions pre-delete above.
+	// Skipped on continuation batches — those would wipe earlier batches' inserts.
+	if !payload.IsContinuationBatch && len(payload.KnowledgeArticles) > 0 {
+		_, delErr := h.client.Batch().ObjectsBatchDeleter().
+			WithClassName(h.knowledgeCollection).
+			WithWhere(filters.Where().
+				WithPath([]string{"source"}).
+				WithOperator(filters.Like).
+				WithValueText(MCPKnowledgeSourcePrefix + payload.PluginName + ":*")).
+			Do(ctx)
+		if delErr != nil {
+			log.Printf("weaviate-plugin: sync_actions: failed to delete old knowledge articles for %s: %v", payload.PluginName, delErr)
+		}
+	}
+
+	knowledgeCount := 0
+	for _, ka := range payload.KnowledgeArticles {
+		if ka.ID == "" || ka.Title == "" || ka.Content == "" {
+			log.Printf("weaviate-plugin: sync_actions: skipping invalid knowledge article for %s (id=%q title=%q)", payload.PluginName, ka.ID, ka.Title)
+			continue
+		}
+		tags := append([]string{"opentalon", "mcp", "knowledge", payload.PluginName}, ka.Tags...)
+		objects = append(objects, &wmodels.Object{
+			Class: h.knowledgeCollection,
+			ID:    strfmt.UUID(knowledgeArticleUUID(payload.PluginName, ka.ID)),
+			Properties: map[string]interface{}{
+				"title":   ka.Title,
+				"content": ka.Content,
+				"source":  MCPKnowledgeSourcePrefix + payload.PluginName + ":" + ka.ID,
+				"tags":    tags,
+			},
+		})
+		knowledgeCount++
+	}
+
 	syncedActions := len(payload.Actions)
 	if len(objects) > 0 {
 		results, err := h.client.Batch().ObjectsBatcher().WithObjects(objects...).Do(ctx)
@@ -1168,8 +1236,8 @@ func (h *WeaviateHandler) syncActionsWork(reqID string, raw string) error {
 		h.syncMu.Unlock()
 	}
 
-	log.Printf("weaviate-plugin: sync_actions: completed for %s (req=%s synced=%d instructions=%v pruned=%d)",
-		payload.PluginName, reqID, syncedActions, hasInstructions, pruned)
+	log.Printf("weaviate-plugin: sync_actions: completed for %s (req=%s synced=%d instructions=%v knowledge=%d pruned=%d)",
+		payload.PluginName, reqID, syncedActions, hasInstructions, knowledgeCount, pruned)
 	return nil
 }
 
@@ -1261,7 +1329,8 @@ func (h *WeaviateHandler) getSyncStatus(req plugin.Request) plugin.Response {
 }
 
 // pruneOrphans deletes any MCPActions and any auto-generated KnowledgeArticles
-// (those with source matching MCPSourcePrefix) whose plugin is NOT in keep.
+// (those with source matching MCPSourcePrefix or MCPKnowledgeSourcePrefix)
+// whose plugin is NOT in keep.
 //
 // Implementation note: instead of a single batch-delete with a NotEqual filter
 // (Weaviate's NotEqual on tokenized text fields produces unreliable results
@@ -1270,8 +1339,8 @@ func (h *WeaviateHandler) getSyncStatus(req plugin.Request) plugin.Response {
 // Equal on tokenized text matches the full property value reliably — same
 // pattern PR #16's intra-plugin pre-delete depends on.
 //
-// Returns the total deletion count across both collections (best-effort:
-// per-class errors are recorded but do not abort the second class delete).
+// Returns the total deletion count across all collections (best-effort:
+// per-class errors are recorded but do not abort subsequent deletes).
 func (h *WeaviateHandler) pruneOrphans(ctx context.Context, keep []string) (int, error) {
 	if len(keep) == 0 {
 		return 0, nil
@@ -1300,8 +1369,9 @@ func (h *WeaviateHandler) pruneOrphans(ctx context.Context, keep []string) (int,
 		}
 	}
 
-	// KnowledgeArticles: scope to MCP-managed records (source LIKE "mcp:*"),
-	// discover distinct sources, delete each orphan by Equal on source.
+	// KnowledgeArticles, server-instructions records: scope to MCP-managed
+	// (source LIKE "mcp:*"), discover distinct sources, delete each orphan
+	// by Equal on source. Source format: "mcp:<plugin>" (1:1 plugin mapping).
 	mcpScope := filters.Where().
 		WithPath([]string{"source"}).
 		WithOperator(filters.Like).
@@ -1321,6 +1391,35 @@ func (h *WeaviateHandler) pruneOrphans(ctx context.Context, keep []string) (int,
 			firstErr = fmt.Errorf("KnowledgeArticles delete %s: %w", src, err)
 		}
 	}
+
+	// KnowledgeArticles, knowledge-section records: scope to plugin-contributed
+	// sections (source LIKE "mcp-knowledge:*"), discover distinct sources, then
+	// delete each orphan. Source format: "mcp-knowledge:<plugin>:<article-id>"
+	// — extract plugin between the first and second ':'.
+	knowledgeScope := filters.Where().
+		WithPath([]string{"source"}).
+		WithOperator(filters.Like).
+		WithValueText(MCPKnowledgeSourcePrefix + "*")
+	knowledgeSources, err := h.distinctValues(ctx, h.knowledgeCollection, "source", knowledgeScope)
+	if err != nil && firstErr == nil {
+		firstErr = fmt.Errorf("KnowledgeArticles knowledge-distinct: %w", err)
+	}
+	for _, src := range knowledgeSources {
+		rest := strings.TrimPrefix(src, MCPKnowledgeSourcePrefix)
+		plugin := rest
+		if i := strings.IndexByte(rest, ':'); i >= 0 {
+			plugin = rest[:i]
+		}
+		if keepSet[plugin] {
+			continue
+		}
+		n, err := h.batchDeleteEqual(ctx, h.knowledgeCollection, "source", src)
+		total += n
+		if err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("KnowledgeArticles knowledge-delete %s: %w", src, err)
+		}
+	}
+
 	return total, firstErr
 }
 
@@ -1502,6 +1601,14 @@ func (h *WeaviateHandler) syncGlossaryWork(reqID string, raw string) error {
 // per-plugin server-instructions article. Re-runs upsert in place.
 func serverInstructionsUUID(pluginName string) string {
 	return uuid.NewSHA1(articleNS, []byte("mcp-server-instructions:"+pluginName)).String()
+}
+
+// knowledgeArticleUUID returns a deterministic UUID v5 for one section
+// article contributed by a plugin via sync_actions's knowledge_articles[].
+// The key embeds plugin + article ID so that two plugins shipping the same
+// article ID get distinct rows, and re-runs upsert in place.
+func knowledgeArticleUUID(pluginName, articleID string) string {
+	return uuid.NewSHA1(articleNS, []byte(MCPKnowledgeSourcePrefix+pluginName+":"+articleID)).String()
 }
 
 type knowledgeArticle struct {
