@@ -277,7 +277,7 @@ func (h *WeaviateHandler) handleDebugPrepare(w http.ResponseWriter, r *http.Requ
 
 	wStart := time.Now()
 	knowledgeResult, _ := h.searchCollection(ctx, h.knowledgeCollection, knowledgeFields, knowledgeQuery, 5, nil)
-	actionsResult, _ := h.searchCollection(ctx, h.actionsCollection, actionFields, searchText, 5, actionsWhere)
+	actionsResult, _ := h.searchCollection(ctx, h.actionsCollection, actionFields, searchText, 10, actionsWhere)
 	glossaryResult, _ := h.searchCollection(ctx, h.glossaryCollection, glossaryFields, searchText, 5, nil)
 	weaviateMs := float64(time.Since(wStart).Microseconds()) / 1000.0
 
