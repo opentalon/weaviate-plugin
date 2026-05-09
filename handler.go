@@ -564,7 +564,7 @@ func (h *WeaviateHandler) prepare(req plugin.Request) plugin.Response {
 			WithOperator(filters.ContainsAny).
 			WithValueText(allowedPlugins...)
 	}
-	actionsResult, actionsErr := h.searchCollection(ctx, h.actionsCollection, actionFields, searchText, 5, actionsWhere)
+	actionsResult, actionsErr := h.searchCollection(ctx, h.actionsCollection, actionFields, searchText, 10, actionsWhere)
 
 	// Search Glossary (limit 5) for matching terms/definitions.
 	glossaryFields := []graphql.Field{
