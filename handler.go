@@ -503,10 +503,25 @@ func (h *WeaviateHandler) hybridSearch(req plugin.Request) plugin.Response {
 }
 
 // prepareResponse is the structured JSON returned by the prepare action.
+//
+// KnowledgeCandidates / GlossaryCandidates / ToolCandidates are the
+// RFC #249 (opentalon/opentalon#249) structured shape the orchestrator
+// consumes for Phase 3 dedup and Phase 4 tier-decision. Emitted
+// alongside the legacy Message + RelevantTools fields: when the
+// orchestrator runs the new code path it picks the structured slices
+// (responseUsesLegacyKnowledgeInjection short-circuits on
+// len(KnowledgeCandidates) > 0); older orchestrators ignore the unknown
+// fields and continue to read Message + RelevantTools. This dual-shape
+// emission is the graceful-migration path that lets the same plugin
+// binary run against pre- and post-#251 cores during rollout.
 type prepareResponse struct {
 	SendToLLM     bool     `json:"send_to_llm"`
 	Message       string   `json:"message"`
 	RelevantTools []string `json:"relevant_tools"`
+
+	KnowledgeCandidates []KnowledgeCandidate `json:"knowledge_candidates,omitempty"`
+	GlossaryCandidates  []GlossaryCandidate  `json:"glossary_candidates,omitempty"`
+	ToolCandidates      []ToolCandidate      `json:"tool_candidates,omitempty"`
 }
 
 // defaultMinPrepareScore is the default minimum hybrid-search score for a
@@ -540,9 +555,13 @@ func (h *WeaviateHandler) prepare(req plugin.Request) plugin.Response {
 	}
 
 	// Search KnowledgeArticles (limit 5) with plugin-boosted query.
+	// `_additional.id` is requested so structured KnowledgeCandidates
+	// can carry a stable ArticleID downstream (RFC #249 Phase 3 dedup
+	// uses ContentSHA256 as the primary key, but ArticleID is the
+	// audit-trail identifier the api-plugin surfaces in events).
 	knowledgeFields := []graphql.Field{
 		{Name: "title"}, {Name: "content"}, {Name: "source"},
-		{Name: "_additional", Fields: []graphql.Field{{Name: "score"}}},
+		{Name: "_additional", Fields: []graphql.Field{{Name: "id"}, {Name: "score"}}},
 	}
 	knowledgeQuery := searchText
 	if len(allowedPlugins) > 0 {
@@ -567,9 +586,12 @@ func (h *WeaviateHandler) prepare(req plugin.Request) plugin.Response {
 	actionsResult, actionsErr := h.searchCollection(ctx, h.actionsCollection, actionFields, searchText, 10, actionsWhere)
 
 	// Search Glossary (limit 5) for matching terms/definitions.
+	// `_additional.id` is requested for the same reason as the
+	// KnowledgeArticles search above — feeds structured
+	// GlossaryCandidates downstream.
 	glossaryFields := []graphql.Field{
 		{Name: "term"}, {Name: "definition"},
-		{Name: "_additional", Fields: []graphql.Field{{Name: "score"}}},
+		{Name: "_additional", Fields: []graphql.Field{{Name: "id"}, {Name: "score"}}},
 	}
 	glossaryResult, glossaryErr := h.searchCollection(ctx, h.glossaryCollection, glossaryFields, searchText, 5, nil)
 
@@ -604,7 +626,18 @@ func (h *WeaviateHandler) prepare(req plugin.Request) plugin.Response {
 	// Action/tool context is NOT injected into the message — the orchestrator
 	// already provides full tool definitions in the system prompt filtered by
 	// relevant_tools. Duplicating them here wastes tokens.
+	//
+	// Alongside the legacy text blocks, populate the structured
+	// *Candidates slices (RFC #249) from the same filtered item set so
+	// the orchestrator's Phase 3 dedup + Phase 4 tier-decision pick the
+	// structured path. The legacy blocks stay in Message for backwards
+	// compatibility with pre-#251 cores; the orchestrator's
+	// applyDedupToContent strips the parsed-out [knowledge_context]
+	// block before re-rendering from the deduped Candidates so there's
+	// no double injection.
 	message := text
+	var knowledgeCandidates []KnowledgeCandidate
+	var glossaryCandidates []GlossaryCandidate
 	if knowledgeErr == nil {
 		knowledgeItems := extractItems(knowledgeResult, h.knowledgeCollection)
 		// Exclude MCP server-instructions articles — they are already in the
@@ -612,6 +645,7 @@ func (h *WeaviateHandler) prepare(req plugin.Request) plugin.Response {
 		// [knowledge_context] would duplicate them on every LLM call.
 		knowledgeItems = filterOutMCPItems(knowledgeItems)
 		log.Printf("weaviate-plugin: prepare: knowledge_items=%d knowledge_err=%v", len(knowledgeItems), knowledgeErr)
+		knowledgeCandidates = extractKnowledgeCandidates(knowledgeItems, h.minPrepareScore)
 		if knowledgeText := formatItemsCompact(knowledgeItems, h.minPrepareScore); knowledgeText != "" {
 			log.Printf("weaviate-plugin: prepare: injecting knowledge_context len=%d", len(knowledgeText))
 			message = fmt.Sprintf("[knowledge_context]\n%s\n[/knowledge_context]\n\n%s", knowledgeText, text)
@@ -619,16 +653,24 @@ func (h *WeaviateHandler) prepare(req plugin.Request) plugin.Response {
 	}
 	if glossaryErr == nil {
 		glossaryItems := extractItems(glossaryResult, h.glossaryCollection)
+		glossaryCandidates = extractGlossaryCandidates(glossaryItems, h.minPrepareScore)
 		if glossaryText := formatGlossaryItems(glossaryItems, h.minPrepareScore); glossaryText != "" {
 			log.Printf("weaviate-plugin: prepare: injecting glossary_context len=%d", len(glossaryText))
 			message = fmt.Sprintf("[glossary_context]\n%s\n[/glossary_context]\n\n%s", glossaryText, message)
 		}
 	}
+	var toolCandidates []ToolCandidate
+	if actionsErr == nil {
+		toolCandidates = extractToolCandidatesFromResult(actionsResult, h.actionsCollection, h.minPrepareScore)
+	}
 
 	return marshalPrepareResponse(req.ID, prepareResponse{
-		SendToLLM:     true,
-		Message:       message,
-		RelevantTools: tools,
+		SendToLLM:           true,
+		Message:             message,
+		RelevantTools:       tools,
+		KnowledgeCandidates: knowledgeCandidates,
+		GlossaryCandidates:  glossaryCandidates,
+		ToolCandidates:      toolCandidates,
 	})
 }
 
