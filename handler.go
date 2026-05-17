@@ -76,7 +76,19 @@ type Config struct {
 	Token               string         `json:"token"`
 	Vectorizer          string         `json:"vectorizer"`
 	ModuleConfig        map[string]any `json:"module_config"`
-	MinPrepareScore     *float64       `json:"min_prepare_score"`
+	MinPrepareScore     *float64       `json:"min_prepare_score"` // fallback applied when the per-collection knobs below are unset
+	// Per-collection minimum-score gates for `prepare`. Tools, knowledge,
+	// and glossary often want different thresholds: the tools retriever
+	// can tolerate a permissive cut-off because the orchestrator ranks
+	// tools into tiers and most low-score tools end up in Tier 3
+	// (name-only) anyway, while a low-score knowledge article is
+	// surfaced to the LLM as a full text block where noise costs tokens
+	// + can derail the answer. Each falls back to MinPrepareScore (or
+	// defaultMinPrepareScore when both are unset) so a deployment that
+	// only sets the top-level field keeps the prior behaviour.
+	MinPrepareScoreTools     *float64 `json:"min_prepare_score_tools,omitempty"`
+	MinPrepareScoreKnowledge *float64 `json:"min_prepare_score_knowledge,omitempty"`
+	MinPrepareScoreGlossary  *float64 `json:"min_prepare_score_glossary,omitempty"`
 	Timeout             string         `json:"timeout"` // Weaviate HTTP client timeout as duration string (e.g. "2m", "90s"); default "2m"
 	GlossaryCollection string `json:"glossary_collection"`
 	// Translator is the optional LibreTranslate-compatible query
@@ -142,7 +154,10 @@ type WeaviateHandler struct {
 	token               string
 	vectorizer          string
 	moduleConfig        map[string]any
-	minPrepareScore     float64
+	minPrepareScore          float64
+	minPrepareScoreTools     float64
+	minPrepareScoreKnowledge float64
+	minPrepareScoreGlossary  float64
 	clientTimeout       time.Duration
 	translator          Translator
 
@@ -245,6 +260,14 @@ func (h *WeaviateHandler) Configure(configJSON string) error {
 	} else {
 		h.minPrepareScore = defaultMinPrepareScore
 	}
+	// Each per-collection knob falls back to the umbrella minPrepareScore
+	// when unset, so a deployment that only sets min_prepare_score keeps
+	// the prior single-threshold behaviour and a deployment that wants
+	// asymmetric gates (e.g. permissive for tools, strict for knowledge)
+	// only declares the deltas.
+	h.minPrepareScoreTools = pickPositive(cfg.MinPrepareScoreTools, h.minPrepareScore)
+	h.minPrepareScoreKnowledge = pickPositive(cfg.MinPrepareScoreKnowledge, h.minPrepareScore)
+	h.minPrepareScoreGlossary = pickPositive(cfg.MinPrepareScoreGlossary, h.minPrepareScore)
 
 	h.translator = newTranslator(cfg.Translator)
 
@@ -254,6 +277,8 @@ func (h *WeaviateHandler) Configure(configJSON string) error {
 
 	log.Printf("weaviate-plugin: collection=%s vectorizer=%s limit=%d min_prepare_score=%.4f fields=%v",
 		h.collection, h.vectorizer, h.limit, h.minPrepareScore, h.fields)
+	log.Printf("weaviate-plugin: per-collection min_prepare_score tools=%.4f knowledge=%.4f glossary=%.4f",
+		h.minPrepareScoreTools, h.minPrepareScoreKnowledge, h.minPrepareScoreGlossary)
 	log.Printf("weaviate-plugin: prepare limits knowledge=%d actions=%d glossary=%d",
 		h.prepareKnowledgeLimit, h.prepareActionsLimit, h.prepareGlossaryLimit)
 	log.Printf("weaviate-plugin: actions_collection=%s knowledge_collection=%s glossary_collection=%s",
@@ -554,8 +579,22 @@ type prepareResponse struct {
 
 // defaultMinPrepareScore is the default minimum hybrid-search score for a
 // result to be included in the prepare response. Configurable via
-// config.min_prepare_score.
+// config.min_prepare_score. Per-collection knobs
+// (min_prepare_score_tools / _knowledge / _glossary) further override
+// this for one collection at a time.
 const defaultMinPrepareScore = 0.012
+
+// pickPositive returns *override if it points at a positive float,
+// otherwise the supplied fallback. Used for per-collection score
+// thresholds: a deployment that only sets the umbrella
+// min_prepare_score reuses it for all three collections; one that
+// wants asymmetric gates declares only the deltas.
+func pickPositive(override *float64, fallback float64) float64 {
+	if override != nil && *override > 0 {
+		return *override
+	}
+	return fallback
+}
 
 // Default per-collection ceilings for `prepare`. See Config.PrepareKnowledgeLimit
 // for the rationale. These need to exceed the orchestrator's downstream
@@ -650,7 +689,7 @@ func (h *WeaviateHandler) prepare(req plugin.Request) plugin.Response {
 
 	// Extract relevant tool names (above score threshold) for system prompt filtering.
 	// The orchestrator uses this list to decide which tools to show the LLM.
-	tools := extractToolNamesAboveScore(actionsResult, h.actionsCollection, h.minPrepareScore)
+	tools := extractToolNamesAboveScore(actionsResult, h.actionsCollection, h.minPrepareScoreTools)
 
 	// When no real tools matched, return nil so the orchestrator shows ALL
 	// tools (relevantToolsActive=false). Only activate filtering when we
@@ -663,8 +702,8 @@ func (h *WeaviateHandler) prepare(req plugin.Request) plugin.Response {
 		tools = nil
 	}
 
-	log.Printf("weaviate-plugin: prepare: query=%q search_text=%q min_score=%.4f matched_tools=%d tools=%v",
-		text, searchText, h.minPrepareScore, len(tools), tools)
+	log.Printf("weaviate-plugin: prepare: query=%q search_text=%q min_score_tools=%.4f matched_tools=%d tools=%v",
+		text, searchText, h.minPrepareScoreTools, len(tools), tools)
 
 	// Build message: inject glossary and knowledge context blocks (if non-empty).
 	// Action/tool context is NOT injected into the message — the orchestrator
@@ -689,23 +728,23 @@ func (h *WeaviateHandler) prepare(req plugin.Request) plugin.Response {
 		// [knowledge_context] would duplicate them on every LLM call.
 		knowledgeItems = filterOutMCPItems(knowledgeItems)
 		log.Printf("weaviate-plugin: prepare: knowledge_items=%d knowledge_err=%v", len(knowledgeItems), knowledgeErr)
-		knowledgeCandidates = extractKnowledgeCandidates(knowledgeItems, h.minPrepareScore)
-		if knowledgeText := formatItemsCompact(knowledgeItems, h.minPrepareScore); knowledgeText != "" {
+		knowledgeCandidates = extractKnowledgeCandidates(knowledgeItems, h.minPrepareScoreKnowledge)
+		if knowledgeText := formatItemsCompact(knowledgeItems, h.minPrepareScoreKnowledge); knowledgeText != "" {
 			log.Printf("weaviate-plugin: prepare: injecting knowledge_context len=%d", len(knowledgeText))
 			message = fmt.Sprintf("[knowledge_context]\n%s\n[/knowledge_context]\n\n%s", knowledgeText, text)
 		}
 	}
 	if glossaryErr == nil {
 		glossaryItems := extractItems(glossaryResult, h.glossaryCollection)
-		glossaryCandidates = extractGlossaryCandidates(glossaryItems, h.minPrepareScore)
-		if glossaryText := formatGlossaryItems(glossaryItems, h.minPrepareScore); glossaryText != "" {
+		glossaryCandidates = extractGlossaryCandidates(glossaryItems, h.minPrepareScoreGlossary)
+		if glossaryText := formatGlossaryItems(glossaryItems, h.minPrepareScoreGlossary); glossaryText != "" {
 			log.Printf("weaviate-plugin: prepare: injecting glossary_context len=%d", len(glossaryText))
 			message = fmt.Sprintf("[glossary_context]\n%s\n[/glossary_context]\n\n%s", glossaryText, message)
 		}
 	}
 	var toolCandidates []ToolCandidate
 	if actionsErr == nil {
-		toolCandidates = extractToolCandidatesFromResult(actionsResult, h.actionsCollection, h.minPrepareScore)
+		toolCandidates = extractToolCandidatesFromResult(actionsResult, h.actionsCollection, h.minPrepareScoreTools)
 	}
 
 	return marshalPrepareResponse(req.ID, prepareResponse{
