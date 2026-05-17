@@ -310,8 +310,160 @@ func TestConfigure_defaults(t *testing.T) {
 	if h.knowledgeCollection != DefaultKnowledgeCollection {
 		t.Errorf("knowledge_collection: got %q want %q", h.knowledgeCollection, DefaultKnowledgeCollection)
 	}
+	// Prepare-fan-out defaults must exceed the orchestrator's downstream
+	// budgets, otherwise the `cap_exceeded` dedup reason and Tier 2 tool
+	// promotion become unreachable. See defaultPrepareKnowledgeLimit comment.
+	if h.prepareKnowledgeLimit != defaultPrepareKnowledgeLimit {
+		t.Errorf("prepareKnowledgeLimit: got %d want %d", h.prepareKnowledgeLimit, defaultPrepareKnowledgeLimit)
+	}
+	if h.prepareActionsLimit != defaultPrepareActionsLimit {
+		t.Errorf("prepareActionsLimit: got %d want %d", h.prepareActionsLimit, defaultPrepareActionsLimit)
+	}
+	if h.prepareGlossaryLimit != defaultPrepareGlossaryLimit {
+		t.Errorf("prepareGlossaryLimit: got %d want %d", h.prepareGlossaryLimit, defaultPrepareGlossaryLimit)
+	}
 	if h.client == nil {
 		t.Error("client is nil after Configure")
+	}
+}
+
+func TestConfigure_prepareLimitsOverride(t *testing.T) {
+	// Explicit overrides must be honoured verbatim. Zero / missing falls
+	// back to the default (covered by TestConfigure_defaults); a negative
+	// or zero override is treated as "not set" so a misconfig can't ship
+	// a useless 0-limit query that would silently return nothing.
+	h := &WeaviateHandler{}
+	cfg, _ := json.Marshal(map[string]interface{}{
+		"host":                    weaviateHost(),
+		"collection":              testClass,
+		"auto_create_schema":      false,
+		"prepare_knowledge_limit": 7,
+		"prepare_actions_limit":   33,
+		"prepare_glossary_limit":  4,
+	})
+	if err := h.Configure(string(cfg)); err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+	if h.prepareKnowledgeLimit != 7 {
+		t.Errorf("prepareKnowledgeLimit: got %d want 7", h.prepareKnowledgeLimit)
+	}
+	if h.prepareActionsLimit != 33 {
+		t.Errorf("prepareActionsLimit: got %d want 33", h.prepareActionsLimit)
+	}
+	if h.prepareGlossaryLimit != 4 {
+		t.Errorf("prepareGlossaryLimit: got %d want 4", h.prepareGlossaryLimit)
+	}
+}
+
+func TestConfigure_prepareLimitsZeroFallsBackToDefault(t *testing.T) {
+	// A zero override is indistinguishable from "not set" once JSON
+	// unmarshal hits a Go int field; the Configure path must treat
+	// it as "fall back to default" rather than ship a 0-limit query.
+	h := &WeaviateHandler{}
+	cfg, _ := json.Marshal(map[string]interface{}{
+		"host":                    weaviateHost(),
+		"collection":              testClass,
+		"auto_create_schema":      false,
+		"prepare_knowledge_limit": 0,
+		"prepare_actions_limit":   0,
+		"prepare_glossary_limit":  0,
+	})
+	if err := h.Configure(string(cfg)); err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+	if h.prepareKnowledgeLimit != defaultPrepareKnowledgeLimit {
+		t.Errorf("prepareKnowledgeLimit: got %d want %d (default)", h.prepareKnowledgeLimit, defaultPrepareKnowledgeLimit)
+	}
+	if h.prepareActionsLimit != defaultPrepareActionsLimit {
+		t.Errorf("prepareActionsLimit: got %d want %d (default)", h.prepareActionsLimit, defaultPrepareActionsLimit)
+	}
+	if h.prepareGlossaryLimit != defaultPrepareGlossaryLimit {
+		t.Errorf("prepareGlossaryLimit: got %d want %d (default)", h.prepareGlossaryLimit, defaultPrepareGlossaryLimit)
+	}
+}
+
+func TestConfigure_perCollectionMinPrepareScore_FallbacksToUmbrella(t *testing.T) {
+	// When only the umbrella min_prepare_score is set, all three
+	// per-collection thresholds adopt the same value. Pins the
+	// backward-compat path: a deployment that hasn't migrated to the
+	// per-collection knobs keeps the prior single-threshold behaviour.
+	h := &WeaviateHandler{}
+	cfg, _ := json.Marshal(map[string]interface{}{
+		"host":               weaviateHost(),
+		"collection":         testClass,
+		"auto_create_schema": false,
+		"min_prepare_score":  0.55,
+	})
+	if err := h.Configure(string(cfg)); err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+	if h.minPrepareScore != 0.55 {
+		t.Errorf("umbrella minPrepareScore: got %v want 0.55", h.minPrepareScore)
+	}
+	if h.minPrepareScoreTools != 0.55 {
+		t.Errorf("minPrepareScoreTools fallback: got %v want 0.55", h.minPrepareScoreTools)
+	}
+	if h.minPrepareScoreKnowledge != 0.55 {
+		t.Errorf("minPrepareScoreKnowledge fallback: got %v want 0.55", h.minPrepareScoreKnowledge)
+	}
+	if h.minPrepareScoreGlossary != 0.55 {
+		t.Errorf("minPrepareScoreGlossary fallback: got %v want 0.55", h.minPrepareScoreGlossary)
+	}
+}
+
+func TestConfigure_perCollectionMinPrepareScore_Overrides(t *testing.T) {
+	// Each per-collection knob, when explicitly set, wins over the
+	// umbrella value. Lets a deployment keep a permissive cut-off for
+	// tools (where the orchestrator's tier algorithm relegates noise
+	// to Tier 3 anyway) while gating knowledge-text injection more
+	// strictly — low-score knowledge articles are surfaced as full
+	// text blocks where noise costs LLM tokens + can derail the answer.
+	h := &WeaviateHandler{}
+	cfg, _ := json.Marshal(map[string]interface{}{
+		"host":                        weaviateHost(),
+		"collection":                  testClass,
+		"auto_create_schema":          false,
+		"min_prepare_score":           0.30,
+		"min_prepare_score_tools":     0.40,
+		"min_prepare_score_knowledge": 0.75,
+		"min_prepare_score_glossary":  0.50,
+	})
+	if err := h.Configure(string(cfg)); err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+	if h.minPrepareScoreTools != 0.40 {
+		t.Errorf("minPrepareScoreTools: got %v want 0.40", h.minPrepareScoreTools)
+	}
+	if h.minPrepareScoreKnowledge != 0.75 {
+		t.Errorf("minPrepareScoreKnowledge: got %v want 0.75", h.minPrepareScoreKnowledge)
+	}
+	if h.minPrepareScoreGlossary != 0.50 {
+		t.Errorf("minPrepareScoreGlossary: got %v want 0.50", h.minPrepareScoreGlossary)
+	}
+}
+
+func TestConfigure_perCollectionMinPrepareScore_AllUnsetUsesDefault(t *testing.T) {
+	// Neither the umbrella nor the per-collection knobs are configured
+	// → all three per-collection fields fall back to
+	// defaultMinPrepareScore. Locks the chain: per-collection unset →
+	// umbrella unset → default.
+	h := &WeaviateHandler{}
+	cfg, _ := json.Marshal(map[string]interface{}{
+		"host":               weaviateHost(),
+		"collection":         testClass,
+		"auto_create_schema": false,
+	})
+	if err := h.Configure(string(cfg)); err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+	if h.minPrepareScoreTools != defaultMinPrepareScore {
+		t.Errorf("minPrepareScoreTools: got %v want %v (default)", h.minPrepareScoreTools, defaultMinPrepareScore)
+	}
+	if h.minPrepareScoreKnowledge != defaultMinPrepareScore {
+		t.Errorf("minPrepareScoreKnowledge: got %v want %v (default)", h.minPrepareScoreKnowledge, defaultMinPrepareScore)
+	}
+	if h.minPrepareScoreGlossary != defaultMinPrepareScore {
+		t.Errorf("minPrepareScoreGlossary: got %v want %v (default)", h.minPrepareScoreGlossary, defaultMinPrepareScore)
 	}
 }
 

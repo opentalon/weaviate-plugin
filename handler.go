@@ -61,12 +61,34 @@ type Config struct {
 	KnowledgeCollection string         `json:"knowledge_collection"`
 	Fields              []string       `json:"fields"`
 	Limit               int            `json:"limit"`
+	// Per-collection ceilings for the `prepare` RAG fan-out. The orchestrator's
+	// downstream tier-budget (tier1_cap + tier2_cap) and per-turn knowledge cap
+	// can only fire when the upstream candidate pool exceeds them — when the
+	// prepare limits silently clip the pool first, those code paths become
+	// unreachable. Defaults: knowledge=15, actions=25 (covers default
+	// tier1_cap=10 + tier2_cap=15), glossary=10. Override per-deployment when
+	// tuning Tier 2 width or the knowledge dedup cap.
+	PrepareKnowledgeLimit int            `json:"prepare_knowledge_limit"`
+	PrepareActionsLimit   int            `json:"prepare_actions_limit"`
+	PrepareGlossaryLimit  int            `json:"prepare_glossary_limit"`
 	AutoCreateSchema    *bool          `json:"auto_create_schema"`
 	HTTPAddr            string         `json:"http_addr"`
 	Token               string         `json:"token"`
 	Vectorizer          string         `json:"vectorizer"`
 	ModuleConfig        map[string]any `json:"module_config"`
-	MinPrepareScore     *float64       `json:"min_prepare_score"`
+	MinPrepareScore     *float64       `json:"min_prepare_score"` // fallback applied when the per-collection knobs below are unset
+	// Per-collection minimum-score gates for `prepare`. Tools, knowledge,
+	// and glossary often want different thresholds: the tools retriever
+	// can tolerate a permissive cut-off because the orchestrator ranks
+	// tools into tiers and most low-score tools end up in Tier 3
+	// (name-only) anyway, while a low-score knowledge article is
+	// surfaced to the LLM as a full text block where noise costs tokens
+	// + can derail the answer. Each falls back to MinPrepareScore (or
+	// defaultMinPrepareScore when both are unset) so a deployment that
+	// only sets the top-level field keeps the prior behaviour.
+	MinPrepareScoreTools     *float64 `json:"min_prepare_score_tools,omitempty"`
+	MinPrepareScoreKnowledge *float64 `json:"min_prepare_score_knowledge,omitempty"`
+	MinPrepareScoreGlossary  *float64 `json:"min_prepare_score_glossary,omitempty"`
 	Timeout             string         `json:"timeout"` // Weaviate HTTP client timeout as duration string (e.g. "2m", "90s"); default "2m"
 	GlossaryCollection string `json:"glossary_collection"`
 	// Translator is the optional LibreTranslate-compatible query
@@ -125,11 +147,17 @@ type WeaviateHandler struct {
 	glossaryCollection  string
 	fields              []string
 	limit               int
+	prepareKnowledgeLimit int
+	prepareActionsLimit   int
+	prepareGlossaryLimit  int
 	httpAddr            string
 	token               string
 	vectorizer          string
 	moduleConfig        map[string]any
-	minPrepareScore     float64
+	minPrepareScore          float64
+	minPrepareScoreTools     float64
+	minPrepareScoreKnowledge float64
+	minPrepareScoreGlossary  float64
 	clientTimeout       time.Duration
 	translator          Translator
 
@@ -190,6 +218,19 @@ func (h *WeaviateHandler) Configure(configJSON string) error {
 		h.limit = 5
 	}
 
+	h.prepareKnowledgeLimit = cfg.PrepareKnowledgeLimit
+	if h.prepareKnowledgeLimit <= 0 {
+		h.prepareKnowledgeLimit = defaultPrepareKnowledgeLimit
+	}
+	h.prepareActionsLimit = cfg.PrepareActionsLimit
+	if h.prepareActionsLimit <= 0 {
+		h.prepareActionsLimit = defaultPrepareActionsLimit
+	}
+	h.prepareGlossaryLimit = cfg.PrepareGlossaryLimit
+	if h.prepareGlossaryLimit <= 0 {
+		h.prepareGlossaryLimit = defaultPrepareGlossaryLimit
+	}
+
 	h.actionsCollection = cfg.ActionsCollection
 	if h.actionsCollection == "" {
 		h.actionsCollection = DefaultActionsCollection
@@ -219,6 +260,14 @@ func (h *WeaviateHandler) Configure(configJSON string) error {
 	} else {
 		h.minPrepareScore = defaultMinPrepareScore
 	}
+	// Each per-collection knob falls back to the umbrella minPrepareScore
+	// when unset, so a deployment that only sets min_prepare_score keeps
+	// the prior single-threshold behaviour and a deployment that wants
+	// asymmetric gates (e.g. permissive for tools, strict for knowledge)
+	// only declares the deltas.
+	h.minPrepareScoreTools = pickPositive(cfg.MinPrepareScoreTools, h.minPrepareScore)
+	h.minPrepareScoreKnowledge = pickPositive(cfg.MinPrepareScoreKnowledge, h.minPrepareScore)
+	h.minPrepareScoreGlossary = pickPositive(cfg.MinPrepareScoreGlossary, h.minPrepareScore)
 
 	h.translator = newTranslator(cfg.Translator)
 
@@ -228,6 +277,10 @@ func (h *WeaviateHandler) Configure(configJSON string) error {
 
 	log.Printf("weaviate-plugin: collection=%s vectorizer=%s limit=%d min_prepare_score=%.4f fields=%v",
 		h.collection, h.vectorizer, h.limit, h.minPrepareScore, h.fields)
+	log.Printf("weaviate-plugin: per-collection min_prepare_score tools=%.4f knowledge=%.4f glossary=%.4f",
+		h.minPrepareScoreTools, h.minPrepareScoreKnowledge, h.minPrepareScoreGlossary)
+	log.Printf("weaviate-plugin: prepare limits knowledge=%d actions=%d glossary=%d",
+		h.prepareKnowledgeLimit, h.prepareActionsLimit, h.prepareGlossaryLimit)
 	log.Printf("weaviate-plugin: actions_collection=%s knowledge_collection=%s glossary_collection=%s",
 		h.actionsCollection, h.knowledgeCollection, h.glossaryCollection)
 
@@ -503,16 +556,55 @@ func (h *WeaviateHandler) hybridSearch(req plugin.Request) plugin.Response {
 }
 
 // prepareResponse is the structured JSON returned by the prepare action.
+//
+// KnowledgeCandidates / GlossaryCandidates / ToolCandidates are the
+// RFC #249 (opentalon/opentalon#249) structured shape the orchestrator
+// consumes for Phase 3 dedup and Phase 4 tier-decision. Emitted
+// alongside the legacy Message + RelevantTools fields: when the
+// orchestrator runs the new code path it picks the structured slices
+// (responseUsesLegacyKnowledgeInjection short-circuits on
+// len(KnowledgeCandidates) > 0); older orchestrators ignore the unknown
+// fields and continue to read Message + RelevantTools. This dual-shape
+// emission is the graceful-migration path that lets the same plugin
+// binary run against pre- and post-#251 cores during rollout.
 type prepareResponse struct {
 	SendToLLM     bool     `json:"send_to_llm"`
 	Message       string   `json:"message"`
 	RelevantTools []string `json:"relevant_tools"`
+
+	KnowledgeCandidates []KnowledgeCandidate `json:"knowledge_candidates,omitempty"`
+	GlossaryCandidates  []GlossaryCandidate  `json:"glossary_candidates,omitempty"`
+	ToolCandidates      []ToolCandidate      `json:"tool_candidates,omitempty"`
 }
 
 // defaultMinPrepareScore is the default minimum hybrid-search score for a
 // result to be included in the prepare response. Configurable via
-// config.min_prepare_score.
+// config.min_prepare_score. Per-collection knobs
+// (min_prepare_score_tools / _knowledge / _glossary) further override
+// this for one collection at a time.
 const defaultMinPrepareScore = 0.012
+
+// pickPositive returns *override if it points at a positive float,
+// otherwise the supplied fallback. Used for per-collection score
+// thresholds: a deployment that only sets the umbrella
+// min_prepare_score reuses it for all three collections; one that
+// wants asymmetric gates declares only the deltas.
+func pickPositive(override *float64, fallback float64) float64 {
+	if override != nil && *override > 0 {
+		return *override
+	}
+	return fallback
+}
+
+// Default per-collection ceilings for `prepare`. See Config.PrepareKnowledgeLimit
+// for the rationale. These need to exceed the orchestrator's downstream
+// tier/cap settings; if they don't, the dedup `cap_exceeded` and tier 2
+// promotion code paths are unreachable.
+const (
+	defaultPrepareKnowledgeLimit = 15
+	defaultPrepareActionsLimit   = 25
+	defaultPrepareGlossaryLimit  = 10
+)
 
 func (h *WeaviateHandler) prepare(req plugin.Request) plugin.Response {
 	text := req.Args["text"]
@@ -539,20 +631,30 @@ func (h *WeaviateHandler) prepare(req plugin.Request) plugin.Response {
 		_ = json.Unmarshal([]byte(v), &allowedPlugins)
 	}
 
-	// Search KnowledgeArticles (limit 5) with plugin-boosted query.
+	// Search KnowledgeArticles with plugin-boosted query. Limit is
+	// h.prepareKnowledgeLimit (default 15) — needs to exceed the
+	// orchestrator's cap_per_turn so the dedup `cap_exceeded` reason can fire.
+	// `_additional.id` is requested so structured KnowledgeCandidates can
+	// carry a stable ArticleID downstream (RFC #249 Phase 3 dedup uses
+	// ContentSHA256 as the primary key, but ArticleID is the audit-trail
+	// identifier the api-plugin surfaces in events).
 	knowledgeFields := []graphql.Field{
 		{Name: "title"}, {Name: "content"}, {Name: "source"},
-		{Name: "_additional", Fields: []graphql.Field{{Name: "score"}}},
+		{Name: "_additional", Fields: []graphql.Field{{Name: "id"}, {Name: "score"}}},
 	}
 	knowledgeQuery := searchText
 	if len(allowedPlugins) > 0 {
 		knowledgeQuery = searchText + " " + strings.Join(allowedPlugins, " ")
 	}
-	knowledgeResult, knowledgeErr := h.searchCollection(ctx, h.knowledgeCollection, knowledgeFields, knowledgeQuery, 5, nil)
+	knowledgeResult, knowledgeErr := h.searchCollection(ctx, h.knowledgeCollection, knowledgeFields, knowledgeQuery, h.prepareKnowledgeLimit, nil)
 
-	// Search MCPActions (limit 5) with optional plugin filter.
-	// Only pluginName + actionName + score needed — the orchestrator already
-	// has full tool definitions in the system prompt via relevant_tools filtering.
+	// Search MCPActions with optional plugin filter. Limit is
+	// h.prepareActionsLimit (default 25) — needs to exceed
+	// tier1_cap + tier2_cap so the orchestrator can actually populate Tier 2;
+	// when the limit is ≤ tier1_cap, every retrieved tool fits into Tier 1
+	// and Tier 2 stays empty. Only pluginName + actionName + score needed —
+	// the orchestrator already has full tool definitions in the system prompt
+	// via relevant_tools filtering.
 	actionFields := []graphql.Field{
 		{Name: "pluginName"}, {Name: "actionName"},
 		{Name: "_additional", Fields: []graphql.Field{{Name: "score"}}},
@@ -564,14 +666,17 @@ func (h *WeaviateHandler) prepare(req plugin.Request) plugin.Response {
 			WithOperator(filters.ContainsAny).
 			WithValueText(allowedPlugins...)
 	}
-	actionsResult, actionsErr := h.searchCollection(ctx, h.actionsCollection, actionFields, searchText, 10, actionsWhere)
+	actionsResult, actionsErr := h.searchCollection(ctx, h.actionsCollection, actionFields, searchText, h.prepareActionsLimit, actionsWhere)
 
-	// Search Glossary (limit 5) for matching terms/definitions.
+	// Search Glossary for matching terms/definitions. Limit is
+	// h.prepareGlossaryLimit (default 10). `_additional.id` is requested for
+	// the same reason as the KnowledgeArticles search above — feeds
+	// structured GlossaryCandidates downstream.
 	glossaryFields := []graphql.Field{
 		{Name: "term"}, {Name: "definition"},
-		{Name: "_additional", Fields: []graphql.Field{{Name: "score"}}},
+		{Name: "_additional", Fields: []graphql.Field{{Name: "id"}, {Name: "score"}}},
 	}
-	glossaryResult, glossaryErr := h.searchCollection(ctx, h.glossaryCollection, glossaryFields, searchText, 5, nil)
+	glossaryResult, glossaryErr := h.searchCollection(ctx, h.glossaryCollection, glossaryFields, searchText, h.prepareGlossaryLimit, nil)
 
 	// Fail-open: if all searches fail, pass through unchanged.
 	if knowledgeErr != nil && actionsErr != nil && glossaryErr != nil {
@@ -584,7 +689,7 @@ func (h *WeaviateHandler) prepare(req plugin.Request) plugin.Response {
 
 	// Extract relevant tool names (above score threshold) for system prompt filtering.
 	// The orchestrator uses this list to decide which tools to show the LLM.
-	tools := extractToolNamesAboveScore(actionsResult, h.actionsCollection, h.minPrepareScore)
+	tools := extractToolNamesAboveScore(actionsResult, h.actionsCollection, h.minPrepareScoreTools)
 
 	// When no real tools matched, return nil so the orchestrator shows ALL
 	// tools (relevantToolsActive=false). Only activate filtering when we
@@ -597,14 +702,25 @@ func (h *WeaviateHandler) prepare(req plugin.Request) plugin.Response {
 		tools = nil
 	}
 
-	log.Printf("weaviate-plugin: prepare: query=%q search_text=%q min_score=%.4f matched_tools=%d tools=%v",
-		text, searchText, h.minPrepareScore, len(tools), tools)
+	log.Printf("weaviate-plugin: prepare: query=%q search_text=%q min_score_tools=%.4f matched_tools=%d tools=%v",
+		text, searchText, h.minPrepareScoreTools, len(tools), tools)
 
 	// Build message: inject glossary and knowledge context blocks (if non-empty).
 	// Action/tool context is NOT injected into the message — the orchestrator
 	// already provides full tool definitions in the system prompt filtered by
 	// relevant_tools. Duplicating them here wastes tokens.
+	//
+	// Alongside the legacy text blocks, populate the structured
+	// *Candidates slices (RFC #249) from the same filtered item set so
+	// the orchestrator's Phase 3 dedup + Phase 4 tier-decision pick the
+	// structured path. The legacy blocks stay in Message for backwards
+	// compatibility with pre-#251 cores; the orchestrator's
+	// applyDedupToContent strips the parsed-out [knowledge_context]
+	// block before re-rendering from the deduped Candidates so there's
+	// no double injection.
 	message := text
+	var knowledgeCandidates []KnowledgeCandidate
+	var glossaryCandidates []GlossaryCandidate
 	if knowledgeErr == nil {
 		knowledgeItems := extractItems(knowledgeResult, h.knowledgeCollection)
 		// Exclude MCP server-instructions articles — they are already in the
@@ -612,23 +728,32 @@ func (h *WeaviateHandler) prepare(req plugin.Request) plugin.Response {
 		// [knowledge_context] would duplicate them on every LLM call.
 		knowledgeItems = filterOutMCPItems(knowledgeItems)
 		log.Printf("weaviate-plugin: prepare: knowledge_items=%d knowledge_err=%v", len(knowledgeItems), knowledgeErr)
-		if knowledgeText := formatItemsCompact(knowledgeItems, h.minPrepareScore); knowledgeText != "" {
+		knowledgeCandidates = extractKnowledgeCandidates(knowledgeItems, h.minPrepareScoreKnowledge)
+		if knowledgeText := formatItemsCompact(knowledgeItems, h.minPrepareScoreKnowledge); knowledgeText != "" {
 			log.Printf("weaviate-plugin: prepare: injecting knowledge_context len=%d", len(knowledgeText))
 			message = fmt.Sprintf("[knowledge_context]\n%s\n[/knowledge_context]\n\n%s", knowledgeText, text)
 		}
 	}
 	if glossaryErr == nil {
 		glossaryItems := extractItems(glossaryResult, h.glossaryCollection)
-		if glossaryText := formatGlossaryItems(glossaryItems, h.minPrepareScore); glossaryText != "" {
+		glossaryCandidates = extractGlossaryCandidates(glossaryItems, h.minPrepareScoreGlossary)
+		if glossaryText := formatGlossaryItems(glossaryItems, h.minPrepareScoreGlossary); glossaryText != "" {
 			log.Printf("weaviate-plugin: prepare: injecting glossary_context len=%d", len(glossaryText))
 			message = fmt.Sprintf("[glossary_context]\n%s\n[/glossary_context]\n\n%s", glossaryText, message)
 		}
 	}
+	var toolCandidates []ToolCandidate
+	if actionsErr == nil {
+		toolCandidates = extractToolCandidatesFromResult(actionsResult, h.actionsCollection, h.minPrepareScoreTools)
+	}
 
 	return marshalPrepareResponse(req.ID, prepareResponse{
-		SendToLLM:     true,
-		Message:       message,
-		RelevantTools: tools,
+		SendToLLM:           true,
+		Message:             message,
+		RelevantTools:       tools,
+		KnowledgeCandidates: knowledgeCandidates,
+		GlossaryCandidates:  glossaryCandidates,
+		ToolCandidates:      toolCandidates,
 	})
 }
 
