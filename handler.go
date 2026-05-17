@@ -61,6 +61,16 @@ type Config struct {
 	KnowledgeCollection string         `json:"knowledge_collection"`
 	Fields              []string       `json:"fields"`
 	Limit               int            `json:"limit"`
+	// Per-collection ceilings for the `prepare` RAG fan-out. The orchestrator's
+	// downstream tier-budget (tier1_cap + tier2_cap) and per-turn knowledge cap
+	// can only fire when the upstream candidate pool exceeds them — when the
+	// prepare limits silently clip the pool first, those code paths become
+	// unreachable. Defaults: knowledge=15, actions=25 (covers default
+	// tier1_cap=10 + tier2_cap=15), glossary=10. Override per-deployment when
+	// tuning Tier 2 width or the knowledge dedup cap.
+	PrepareKnowledgeLimit int            `json:"prepare_knowledge_limit"`
+	PrepareActionsLimit   int            `json:"prepare_actions_limit"`
+	PrepareGlossaryLimit  int            `json:"prepare_glossary_limit"`
 	AutoCreateSchema    *bool          `json:"auto_create_schema"`
 	HTTPAddr            string         `json:"http_addr"`
 	Token               string         `json:"token"`
@@ -125,6 +135,9 @@ type WeaviateHandler struct {
 	glossaryCollection  string
 	fields              []string
 	limit               int
+	prepareKnowledgeLimit int
+	prepareActionsLimit   int
+	prepareGlossaryLimit  int
 	httpAddr            string
 	token               string
 	vectorizer          string
@@ -190,6 +203,19 @@ func (h *WeaviateHandler) Configure(configJSON string) error {
 		h.limit = 5
 	}
 
+	h.prepareKnowledgeLimit = cfg.PrepareKnowledgeLimit
+	if h.prepareKnowledgeLimit <= 0 {
+		h.prepareKnowledgeLimit = defaultPrepareKnowledgeLimit
+	}
+	h.prepareActionsLimit = cfg.PrepareActionsLimit
+	if h.prepareActionsLimit <= 0 {
+		h.prepareActionsLimit = defaultPrepareActionsLimit
+	}
+	h.prepareGlossaryLimit = cfg.PrepareGlossaryLimit
+	if h.prepareGlossaryLimit <= 0 {
+		h.prepareGlossaryLimit = defaultPrepareGlossaryLimit
+	}
+
 	h.actionsCollection = cfg.ActionsCollection
 	if h.actionsCollection == "" {
 		h.actionsCollection = DefaultActionsCollection
@@ -228,6 +254,8 @@ func (h *WeaviateHandler) Configure(configJSON string) error {
 
 	log.Printf("weaviate-plugin: collection=%s vectorizer=%s limit=%d min_prepare_score=%.4f fields=%v",
 		h.collection, h.vectorizer, h.limit, h.minPrepareScore, h.fields)
+	log.Printf("weaviate-plugin: prepare limits knowledge=%d actions=%d glossary=%d",
+		h.prepareKnowledgeLimit, h.prepareActionsLimit, h.prepareGlossaryLimit)
 	log.Printf("weaviate-plugin: actions_collection=%s knowledge_collection=%s glossary_collection=%s",
 		h.actionsCollection, h.knowledgeCollection, h.glossaryCollection)
 
@@ -529,6 +557,16 @@ type prepareResponse struct {
 // config.min_prepare_score.
 const defaultMinPrepareScore = 0.012
 
+// Default per-collection ceilings for `prepare`. See Config.PrepareKnowledgeLimit
+// for the rationale. These need to exceed the orchestrator's downstream
+// tier/cap settings; if they don't, the dedup `cap_exceeded` and tier 2
+// promotion code paths are unreachable.
+const (
+	defaultPrepareKnowledgeLimit = 15
+	defaultPrepareActionsLimit   = 25
+	defaultPrepareGlossaryLimit  = 10
+)
+
 func (h *WeaviateHandler) prepare(req plugin.Request) plugin.Response {
 	text := req.Args["text"]
 	if text == "" {
@@ -554,11 +592,13 @@ func (h *WeaviateHandler) prepare(req plugin.Request) plugin.Response {
 		_ = json.Unmarshal([]byte(v), &allowedPlugins)
 	}
 
-	// Search KnowledgeArticles (limit 5) with plugin-boosted query.
-	// `_additional.id` is requested so structured KnowledgeCandidates
-	// can carry a stable ArticleID downstream (RFC #249 Phase 3 dedup
-	// uses ContentSHA256 as the primary key, but ArticleID is the
-	// audit-trail identifier the api-plugin surfaces in events).
+	// Search KnowledgeArticles with plugin-boosted query. Limit is
+	// h.prepareKnowledgeLimit (default 15) — needs to exceed the
+	// orchestrator's cap_per_turn so the dedup `cap_exceeded` reason can fire.
+	// `_additional.id` is requested so structured KnowledgeCandidates can
+	// carry a stable ArticleID downstream (RFC #249 Phase 3 dedup uses
+	// ContentSHA256 as the primary key, but ArticleID is the audit-trail
+	// identifier the api-plugin surfaces in events).
 	knowledgeFields := []graphql.Field{
 		{Name: "title"}, {Name: "content"}, {Name: "source"},
 		{Name: "_additional", Fields: []graphql.Field{{Name: "id"}, {Name: "score"}}},
@@ -567,11 +607,15 @@ func (h *WeaviateHandler) prepare(req plugin.Request) plugin.Response {
 	if len(allowedPlugins) > 0 {
 		knowledgeQuery = searchText + " " + strings.Join(allowedPlugins, " ")
 	}
-	knowledgeResult, knowledgeErr := h.searchCollection(ctx, h.knowledgeCollection, knowledgeFields, knowledgeQuery, 5, nil)
+	knowledgeResult, knowledgeErr := h.searchCollection(ctx, h.knowledgeCollection, knowledgeFields, knowledgeQuery, h.prepareKnowledgeLimit, nil)
 
-	// Search MCPActions (limit 5) with optional plugin filter.
-	// Only pluginName + actionName + score needed — the orchestrator already
-	// has full tool definitions in the system prompt via relevant_tools filtering.
+	// Search MCPActions with optional plugin filter. Limit is
+	// h.prepareActionsLimit (default 25) — needs to exceed
+	// tier1_cap + tier2_cap so the orchestrator can actually populate Tier 2;
+	// when the limit is ≤ tier1_cap, every retrieved tool fits into Tier 1
+	// and Tier 2 stays empty. Only pluginName + actionName + score needed —
+	// the orchestrator already has full tool definitions in the system prompt
+	// via relevant_tools filtering.
 	actionFields := []graphql.Field{
 		{Name: "pluginName"}, {Name: "actionName"},
 		{Name: "_additional", Fields: []graphql.Field{{Name: "score"}}},
@@ -583,17 +627,17 @@ func (h *WeaviateHandler) prepare(req plugin.Request) plugin.Response {
 			WithOperator(filters.ContainsAny).
 			WithValueText(allowedPlugins...)
 	}
-	actionsResult, actionsErr := h.searchCollection(ctx, h.actionsCollection, actionFields, searchText, 10, actionsWhere)
+	actionsResult, actionsErr := h.searchCollection(ctx, h.actionsCollection, actionFields, searchText, h.prepareActionsLimit, actionsWhere)
 
-	// Search Glossary (limit 5) for matching terms/definitions.
-	// `_additional.id` is requested for the same reason as the
-	// KnowledgeArticles search above — feeds structured
-	// GlossaryCandidates downstream.
+	// Search Glossary for matching terms/definitions. Limit is
+	// h.prepareGlossaryLimit (default 10). `_additional.id` is requested for
+	// the same reason as the KnowledgeArticles search above — feeds
+	// structured GlossaryCandidates downstream.
 	glossaryFields := []graphql.Field{
 		{Name: "term"}, {Name: "definition"},
 		{Name: "_additional", Fields: []graphql.Field{{Name: "id"}, {Name: "score"}}},
 	}
-	glossaryResult, glossaryErr := h.searchCollection(ctx, h.glossaryCollection, glossaryFields, searchText, 5, nil)
+	glossaryResult, glossaryErr := h.searchCollection(ctx, h.glossaryCollection, glossaryFields, searchText, h.prepareGlossaryLimit, nil)
 
 	// Fail-open: if all searches fail, pass through unchanged.
 	if knowledgeErr != nil && actionsErr != nil && glossaryErr != nil {

@@ -310,8 +310,75 @@ func TestConfigure_defaults(t *testing.T) {
 	if h.knowledgeCollection != DefaultKnowledgeCollection {
 		t.Errorf("knowledge_collection: got %q want %q", h.knowledgeCollection, DefaultKnowledgeCollection)
 	}
+	// Prepare-fan-out defaults must exceed the orchestrator's downstream
+	// budgets, otherwise the `cap_exceeded` dedup reason and Tier 2 tool
+	// promotion become unreachable. See defaultPrepareKnowledgeLimit comment.
+	if h.prepareKnowledgeLimit != defaultPrepareKnowledgeLimit {
+		t.Errorf("prepareKnowledgeLimit: got %d want %d", h.prepareKnowledgeLimit, defaultPrepareKnowledgeLimit)
+	}
+	if h.prepareActionsLimit != defaultPrepareActionsLimit {
+		t.Errorf("prepareActionsLimit: got %d want %d", h.prepareActionsLimit, defaultPrepareActionsLimit)
+	}
+	if h.prepareGlossaryLimit != defaultPrepareGlossaryLimit {
+		t.Errorf("prepareGlossaryLimit: got %d want %d", h.prepareGlossaryLimit, defaultPrepareGlossaryLimit)
+	}
 	if h.client == nil {
 		t.Error("client is nil after Configure")
+	}
+}
+
+func TestConfigure_prepareLimitsOverride(t *testing.T) {
+	// Explicit overrides must be honoured verbatim. Zero / missing falls
+	// back to the default (covered by TestConfigure_defaults); a negative
+	// or zero override is treated as "not set" so a misconfig can't ship
+	// a useless 0-limit query that would silently return nothing.
+	h := &WeaviateHandler{}
+	cfg, _ := json.Marshal(map[string]interface{}{
+		"host":                    weaviateHost(),
+		"collection":              testClass,
+		"auto_create_schema":      false,
+		"prepare_knowledge_limit": 7,
+		"prepare_actions_limit":   33,
+		"prepare_glossary_limit":  4,
+	})
+	if err := h.Configure(string(cfg)); err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+	if h.prepareKnowledgeLimit != 7 {
+		t.Errorf("prepareKnowledgeLimit: got %d want 7", h.prepareKnowledgeLimit)
+	}
+	if h.prepareActionsLimit != 33 {
+		t.Errorf("prepareActionsLimit: got %d want 33", h.prepareActionsLimit)
+	}
+	if h.prepareGlossaryLimit != 4 {
+		t.Errorf("prepareGlossaryLimit: got %d want 4", h.prepareGlossaryLimit)
+	}
+}
+
+func TestConfigure_prepareLimitsZeroFallsBackToDefault(t *testing.T) {
+	// A zero override is indistinguishable from "not set" once JSON
+	// unmarshal hits a Go int field; the Configure path must treat
+	// it as "fall back to default" rather than ship a 0-limit query.
+	h := &WeaviateHandler{}
+	cfg, _ := json.Marshal(map[string]interface{}{
+		"host":                    weaviateHost(),
+		"collection":              testClass,
+		"auto_create_schema":      false,
+		"prepare_knowledge_limit": 0,
+		"prepare_actions_limit":   0,
+		"prepare_glossary_limit":  0,
+	})
+	if err := h.Configure(string(cfg)); err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+	if h.prepareKnowledgeLimit != defaultPrepareKnowledgeLimit {
+		t.Errorf("prepareKnowledgeLimit: got %d want %d (default)", h.prepareKnowledgeLimit, defaultPrepareKnowledgeLimit)
+	}
+	if h.prepareActionsLimit != defaultPrepareActionsLimit {
+		t.Errorf("prepareActionsLimit: got %d want %d (default)", h.prepareActionsLimit, defaultPrepareActionsLimit)
+	}
+	if h.prepareGlossaryLimit != defaultPrepareGlossaryLimit {
+		t.Errorf("prepareGlossaryLimit: got %d want %d (default)", h.prepareGlossaryLimit, defaultPrepareGlossaryLimit)
 	}
 }
 
