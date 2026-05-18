@@ -5,7 +5,7 @@ go 1.25.0
 require (
 	github.com/go-openapi/strfmt v0.23.0
 	github.com/google/uuid v1.6.0
-	github.com/opentalon/opentalon v0.0.11
+	github.com/opentalon/opentalon v0.0.17
 	github.com/prometheus/client_golang v1.23.2
 	github.com/weaviate/weaviate v1.30.0
 	github.com/weaviate/weaviate-go-client/v5 v5.1.0
