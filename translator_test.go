@@ -23,6 +23,7 @@ type fakeTranslator struct {
 	skippedTargetLang bool    // set the SkippedTargetLang flag on the outcome
 	detectedLang      string  // populated into TranslatorOutcome.SourceLangDetected
 	detectedConf      float64 // populated into TranslatorOutcome.SourceLangConfidence
+	targetLang        string  // returned from TargetLang(); default "en" when unset
 }
 
 func (f *fakeTranslator) Translate(_ context.Context, text string) (TranslatorOutcome, error) {
@@ -41,6 +42,13 @@ func (f *fakeTranslator) Translate(_ context.Context, text string) (TranslatorOu
 		SourceLangConfidence: f.detectedConf,
 		SkippedTargetLang:    f.skippedTargetLang,
 	}, nil
+}
+
+func (f *fakeTranslator) TargetLang() string {
+	if f.targetLang == "" {
+		return "en"
+	}
+	return f.targetLang
 }
 
 // ---------------------------------------------------------------------------

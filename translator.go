@@ -45,6 +45,12 @@ type Translator interface {
 	// allow the call site to record the full audit trail (lang + confidence
 	// + outcome) into a session_events row — see opentalon/opentalon#256.
 	Translate(ctx context.Context, text string) (TranslatorOutcome, error)
+
+	// TargetLang returns the ISO-639-1 code the implementation translates
+	// INTO. Used by translateQuery to populate audit-row metadata without
+	// reaching into implementation internals. Empty string when no target
+	// is configured (e.g. noopTranslator).
+	TargetLang() string
 }
 
 // TranslatorOutcome is the verbose return of Translator.Translate. Carries
@@ -73,6 +79,8 @@ type noopTranslator struct{}
 func (noopTranslator) Translate(_ context.Context, text string) (TranslatorOutcome, error) {
 	return TranslatorOutcome{Text: text}, nil
 }
+
+func (noopTranslator) TargetLang() string { return "" }
 
 // libreTranslator calls a LibreTranslate-compatible HTTP endpoint.
 type libreTranslator struct {
@@ -199,39 +207,36 @@ func (t *libreTranslator) detect(ctx context.Context, text string) (string, floa
 	return parsed[0].Language, parsed[0].Confidence / 100.0, nil
 }
 
-func (t *libreTranslator) Translate(ctx context.Context, text string) (TranslatorOutcome, error) {
+func (t *libreTranslator) TargetLang() string { return t.target }
+
+// Translate runs the optional /detect pre-flight and the /translate call.
+// Uses a named return so every error-return path can stay one line:
+// `outcome.Text` defaults to the input (fail-open contract), and detect
+// output is recorded on the outcome the moment detect succeeds, so a
+// failed /translate downstream still produces a useful audit row.
+func (t *libreTranslator) Translate(ctx context.Context, text string) (outcome TranslatorOutcome, err error) {
+	outcome.Text = text
 	if strings.TrimSpace(text) == "" {
-		return TranslatorOutcome{Text: text}, nil
+		return outcome, nil
 	}
 
 	// Optional pre-flight: if the input already looks like the target
 	// language with high confidence, skip the translate roundtrip.
 	// LibreTranslate's confidence is reported as 0..100 in /detect — we
-	// normalise to 0..1 in detect() above. Detect output also feeds the
-	// session-events audit row: source_lang_detected + confidence are
-	// populated for both the skip path AND the fall-through-to-translate
-	// path so the audit row records what the detector saw even when the
-	// translate failed.
-	var detectedLang string
-	var detectedConf float64
+	// normalise to 0..1 in detect() above. On detect error we fall through
+	// to translate — fail-open: we'd rather pay the EN→EN roundtrip than
+	// silently lose the cross-lingual fix when the detector is having a
+	// bad minute. Source lang/confidence stay zero-valued in that case so
+	// the audit reflects "no detect signal".
 	if t.skipIfTargetCfg > 0 {
-		lang, conf, err := t.detect(ctx, text)
-		if err == nil {
-			detectedLang = lang
-			detectedConf = conf
+		if lang, conf, detectErr := t.detect(ctx, text); detectErr == nil {
+			outcome.SourceLangDetected = lang
+			outcome.SourceLangConfidence = conf
 			if lang == t.target && conf >= t.skipIfTargetCfg {
-				return TranslatorOutcome{
-					Text:                 text,
-					SourceLangDetected:   lang,
-					SourceLangConfidence: conf,
-					SkippedTargetLang:    true,
-				}, nil
+				outcome.SkippedTargetLang = true
+				return outcome, nil
 			}
 		}
-		// On detect error we fall through to translate — fail-open: we'd
-		// rather pay the EN→EN roundtrip than silently lose the cross-lingual
-		// fix when the detector is having a bad minute. detectedLang stays
-		// "" / detectedConf stays 0 so the audit reflects "no detect signal".
 	}
 
 	body, err := json.Marshal(translateRequest{
@@ -242,46 +247,43 @@ func (t *libreTranslator) Translate(ctx context.Context, text string) (Translato
 		APIKey: t.apiKey,
 	})
 	if err != nil {
-		return TranslatorOutcome{Text: text, SourceLangDetected: detectedLang, SourceLangConfidence: detectedConf}, fmt.Errorf("marshal request: %w", err)
+		return outcome, fmt.Errorf("marshal request: %w", err)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, t.translateURL, bytes.NewReader(body))
 	if err != nil {
-		return TranslatorOutcome{Text: text, SourceLangDetected: detectedLang, SourceLangConfidence: detectedConf}, fmt.Errorf("build request: %w", err)
+		return outcome, fmt.Errorf("build request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
 
 	resp, err := t.client.Do(req)
 	if err != nil {
-		return TranslatorOutcome{Text: text, SourceLangDetected: detectedLang, SourceLangConfidence: detectedConf}, fmt.Errorf("call %s: %w", t.translateURL, err)
+		return outcome, fmt.Errorf("call %s: %w", t.translateURL, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	raw, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return TranslatorOutcome{Text: text, SourceLangDetected: detectedLang, SourceLangConfidence: detectedConf}, fmt.Errorf("read response: %w", err)
+		return outcome, fmt.Errorf("read response: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return TranslatorOutcome{Text: text, SourceLangDetected: detectedLang, SourceLangConfidence: detectedConf}, fmt.Errorf("translator status %d: %s", resp.StatusCode, truncate(string(raw), 200))
+		return outcome, fmt.Errorf("translator status %d: %s", resp.StatusCode, truncate(string(raw), 200))
 	}
 
 	var parsed translateResponse
-	if err := json.Unmarshal(raw, &parsed); err != nil {
-		return TranslatorOutcome{Text: text, SourceLangDetected: detectedLang, SourceLangConfidence: detectedConf}, fmt.Errorf("parse response: %w", err)
+	if err = json.Unmarshal(raw, &parsed); err != nil {
+		return outcome, fmt.Errorf("parse response: %w", err)
 	}
 	if parsed.Error != "" {
-		return TranslatorOutcome{Text: text, SourceLangDetected: detectedLang, SourceLangConfidence: detectedConf}, fmt.Errorf("translator error: %s", parsed.Error)
+		return outcome, fmt.Errorf("translator error: %s", parsed.Error)
 	}
 	out := strings.TrimSpace(parsed.TranslatedText)
 	if out == "" {
-		return TranslatorOutcome{Text: text, SourceLangDetected: detectedLang, SourceLangConfidence: detectedConf}, fmt.Errorf("translator returned empty translatedText")
+		return outcome, fmt.Errorf("translator returned empty translatedText")
 	}
-	return TranslatorOutcome{
-		Text:                 out,
-		SourceLangDetected:   detectedLang,
-		SourceLangConfidence: detectedConf,
-	}, nil
+	outcome.Text = out
+	return outcome, nil
 }
 
 func truncate(s string, n int) string {
@@ -342,11 +344,7 @@ func (h *WeaviateHandler) translateQuery(ctx context.Context, text, callsite str
 		return text, nil
 	}
 
-	targetLang := ""
-	if lt, ok := h.translator.(*libreTranslator); ok {
-		targetLang = lt.target
-	}
-
+	targetLang := h.translator.TargetLang()
 	start := time.Now()
 	outcome, err := h.translator.Translate(ctx, text)
 	elapsed := time.Since(start)
