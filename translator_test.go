@@ -16,19 +16,31 @@ import (
 
 // fakeTranslator is a configurable in-memory Translator for handler tests.
 type fakeTranslator struct {
-	out   string
-	err   error
-	calls int
-	last  string
+	out               string
+	err               error
+	calls             int
+	last              string
+	skippedTargetLang bool    // set the SkippedTargetLang flag on the outcome
+	detectedLang      string  // populated into TranslatorOutcome.SourceLangDetected
+	detectedConf      float64 // populated into TranslatorOutcome.SourceLangConfidence
 }
 
-func (f *fakeTranslator) Translate(_ context.Context, text string) (string, error) {
+func (f *fakeTranslator) Translate(_ context.Context, text string) (TranslatorOutcome, error) {
 	f.calls++
 	f.last = text
 	if f.err != nil {
-		return text, f.err
+		return TranslatorOutcome{
+			Text:                 text,
+			SourceLangDetected:   f.detectedLang,
+			SourceLangConfidence: f.detectedConf,
+		}, f.err
 	}
-	return f.out, nil
+	return TranslatorOutcome{
+		Text:                 f.out,
+		SourceLangDetected:   f.detectedLang,
+		SourceLangConfidence: f.detectedConf,
+		SkippedTargetLang:    f.skippedTargetLang,
+	}, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -151,8 +163,15 @@ func TestLibreTranslator_Translate_HappyPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("translate err: %v", err)
 	}
-	if got != "WIEVIELE LAGERARTIKEL HABE ICH?" {
-		t.Errorf("translate output: got %q", got)
+	if got.Text != "WIEVIELE LAGERARTIKEL HABE ICH?" {
+		t.Errorf("translate output: got %q", got.Text)
+	}
+	// #256: detect ran (skipIfTargetCfg>0 default), so its result populates the outcome.
+	if got.SourceLangDetected == "" || got.SourceLangConfidence == 0 {
+		t.Errorf("detect output missing on translated outcome: %+v", got)
+	}
+	if got.SkippedTargetLang {
+		t.Errorf("SkippedTargetLang should be false when translate ran, got true")
 	}
 	if srv.calls.detect != 1 {
 		t.Errorf("expected 1 /detect call, got %d", srv.calls.detect)
@@ -177,8 +196,14 @@ func TestLibreTranslator_SkipsTranslateWhenAlreadyTarget(t *testing.T) {
 	if err != nil {
 		t.Fatalf("translate err: %v", err)
 	}
-	if got != "How many stock items do I have?" {
-		t.Errorf("expected pass-through, got %q", got)
+	if got.Text != "How many stock items do I have?" {
+		t.Errorf("expected pass-through, got %q", got.Text)
+	}
+	if !got.SkippedTargetLang {
+		t.Errorf("SkippedTargetLang should be true on target-lang short-circuit, got false")
+	}
+	if got.SourceLangDetected != "en" || got.SourceLangConfidence < 0.7 {
+		t.Errorf("detect output should report en + high confidence: %+v", got)
 	}
 	if srv.calls.detect != 1 {
 		t.Errorf("expected 1 /detect call, got %d", srv.calls.detect)
@@ -256,8 +281,8 @@ func TestLibreTranslator_NonOKReturnsErrorWithOriginal(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected error on 502")
 	}
-	if got != "input" {
-		t.Errorf("on error must return original, got %q", got)
+	if got.Text != "input" {
+		t.Errorf("on error must return original, got %q", got.Text)
 	}
 }
 
@@ -272,8 +297,8 @@ func TestLibreTranslator_EmptyResponseReturnsErrorWithOriginal(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected error on empty translatedText")
 	}
-	if got != "input" {
-		t.Errorf("on error must return original, got %q", got)
+	if got.Text != "input" {
+		t.Errorf("on error must return original, got %q", got.Text)
 	}
 }
 
@@ -287,8 +312,8 @@ func TestLibreTranslator_BlankInputIsNoop(t *testing.T) {
 	if err != nil {
 		t.Fatalf("blank translate: %v", err)
 	}
-	if got != "   " {
-		t.Errorf("blank input: got %q want %q", got, "   ")
+	if got.Text != "   " {
+		t.Errorf("blank input: got %q want %q", got.Text, "   ")
 	}
 	if srv.calls.detect+srv.calls.translate != 0 {
 		t.Errorf("blank input should not hit translator, calls detect=%d translate=%d",
@@ -302,7 +327,7 @@ func TestLibreTranslator_BlankInputIsNoop(t *testing.T) {
 
 func TestTranslateQuery_FailsOpenOnError(t *testing.T) {
 	h := &WeaviateHandler{translator: &fakeTranslator{err: errors.New("nope")}}
-	got := h.translateQuery(context.Background(), "Wie geht's?", "test")
+	got, _ := h.translateQuery(context.Background(), "Wie geht's?", "test")
 	if got != "Wie geht's?" {
 		t.Errorf("fail-open: got %q want original", got)
 	}
@@ -310,7 +335,7 @@ func TestTranslateQuery_FailsOpenOnError(t *testing.T) {
 
 func TestTranslateQuery_NilTranslatorIsNoop(t *testing.T) {
 	h := &WeaviateHandler{}
-	got := h.translateQuery(context.Background(), "anything", "test")
+	got, _ := h.translateQuery(context.Background(), "anything", "test")
 	if got != "anything" {
 		t.Errorf("nil translator: got %q", got)
 	}
@@ -318,7 +343,7 @@ func TestTranslateQuery_NilTranslatorIsNoop(t *testing.T) {
 
 func TestTranslateQuery_NoopTranslatorIsNoop(t *testing.T) {
 	h := &WeaviateHandler{translator: noopTranslator{}}
-	got := h.translateQuery(context.Background(), "anything", "test")
+	got, _ := h.translateQuery(context.Background(), "anything", "test")
 	if got != "anything" {
 		t.Errorf("noop translator: got %q", got)
 	}
@@ -327,7 +352,7 @@ func TestTranslateQuery_NoopTranslatorIsNoop(t *testing.T) {
 func TestTranslateQuery_TranslatesNonEmpty(t *testing.T) {
 	f := &fakeTranslator{out: "How many stock items do I have?"}
 	h := &WeaviateHandler{translator: f}
-	got := h.translateQuery(context.Background(), "Wieviele Lagerartikel habe ich?", "prepare")
+	got, _ := h.translateQuery(context.Background(), "Wieviele Lagerartikel habe ich?", "prepare")
 	if got != "How many stock items do I have?" {
 		t.Errorf("translate: got %q", got)
 	}
@@ -339,7 +364,7 @@ func TestTranslateQuery_TranslatesNonEmpty(t *testing.T) {
 func TestTranslateQuery_SkipsBlankInput(t *testing.T) {
 	f := &fakeTranslator{out: "should-not-be-used"}
 	h := &WeaviateHandler{translator: f}
-	got := h.translateQuery(context.Background(), "   ", "prepare")
+	got, _ := h.translateQuery(context.Background(), "   ", "prepare")
 	if got != "   " {
 		t.Errorf("blank: got %q", got)
 	}
@@ -431,5 +456,156 @@ func TestMetrics_DetectedLangsCounted(t *testing.T) {
 	got := testutil.ToFloat64(translatorDetectedLangsTotal.WithLabelValues("fr"))
 	if got != 1 {
 		t.Errorf("detected lang fr counter: got %v want 1", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// #256: TranslatorEvent return from translateQuery + JSON shape on the wire.
+// ---------------------------------------------------------------------------
+
+// TestTranslateQuery_TranslatedEventCarriesAllFields covers the happy path:
+// translateQuery returns a non-nil TranslatorEvent whose Outcome is
+// "translated", with all metadata fields populated correctly.
+func TestTranslateQuery_TranslatedEventCarriesAllFields(t *testing.T) {
+	f := &fakeTranslator{
+		out:          "How many items do I have?",
+		detectedLang: "de",
+		detectedConf: 0.93,
+	}
+	h := &WeaviateHandler{translator: f}
+	got, evt := h.translateQuery(context.Background(), "Wieviele Items habe ich?", "prepare")
+	if got != "How many items do I have?" {
+		t.Errorf("text: got %q", got)
+	}
+	if evt == nil {
+		t.Fatal("expected non-nil TranslatorEvent")
+	}
+	if evt.Callsite != "prepare" {
+		t.Errorf("Callsite: got %q want prepare", evt.Callsite)
+	}
+	if evt.Outcome != translatorOutcomeTranslated {
+		t.Errorf("Outcome: got %q want translated", evt.Outcome)
+	}
+	if evt.SourceLangDetected != "de" || evt.SourceLangConfidence != 0.93 {
+		t.Errorf("lang/conf: %+v", evt)
+	}
+	if evt.InputText != "Wieviele Items habe ich?" {
+		t.Errorf("InputText: got %q", evt.InputText)
+	}
+	if evt.OutputText != "How many items do I have?" {
+		t.Errorf("OutputText: got %q", evt.OutputText)
+	}
+}
+
+// TestTranslateQuery_SkippedTargetLangEventOutcome covers a fakeTranslator
+// that flags SkippedTargetLang — translateQuery should still return an
+// event, with Outcome=skipped_target_lang and matching input/output.
+func TestTranslateQuery_SkippedTargetLangEventOutcome(t *testing.T) {
+	f := &fakeTranslator{
+		out:               "list items",
+		skippedTargetLang: true,
+		detectedLang:      "en",
+		detectedConf:      0.98,
+	}
+	h := &WeaviateHandler{translator: f}
+	got, evt := h.translateQuery(context.Background(), "list items", "prepare")
+	if got != "list items" {
+		t.Errorf("text: got %q", got)
+	}
+	if evt == nil {
+		t.Fatal("expected non-nil TranslatorEvent")
+	}
+	if evt.Outcome != translatorOutcomeSkippedTargetLang {
+		t.Errorf("Outcome: got %q want skipped_target_lang", evt.Outcome)
+	}
+}
+
+// TestTranslateQuery_FailedEventOutcome covers the fail-open path:
+// translator errors, translateQuery returns the original text PLUS an
+// event with Outcome=failed and empty OutputText.
+func TestTranslateQuery_FailedEventOutcome(t *testing.T) {
+	f := &fakeTranslator{
+		err:          errors.New("connect refused"),
+		detectedLang: "de",
+		detectedConf: 0.91,
+	}
+	h := &WeaviateHandler{translator: f}
+	got, evt := h.translateQuery(context.Background(), "Wieviele Items?", "prepare")
+	if got != "Wieviele Items?" {
+		t.Errorf("fail-open text: got %q", got)
+	}
+	if evt == nil {
+		t.Fatal("expected non-nil TranslatorEvent on failure (audit signal worth recording)")
+	}
+	if evt.Outcome != translatorOutcomeFailed {
+		t.Errorf("Outcome: got %q want failed", evt.Outcome)
+	}
+	if evt.OutputText != "" {
+		t.Errorf("failed OutputText should be empty, got %q", evt.OutputText)
+	}
+	if evt.SourceLangDetected != "de" {
+		t.Errorf("detect output must survive translate failure for audit: %+v", evt)
+	}
+}
+
+// TestTranslateQuery_DisabledReturnsNilEvent covers the two no-audit paths:
+// the orchestrator should not emit a translation event when the translator
+// was disabled or the input was empty.
+func TestTranslateQuery_DisabledReturnsNilEvent(t *testing.T) {
+	t.Run("nil translator", func(t *testing.T) {
+		h := &WeaviateHandler{}
+		_, evt := h.translateQuery(context.Background(), "anything", "test")
+		if evt != nil {
+			t.Errorf("nil translator should yield nil event, got %+v", evt)
+		}
+	})
+	t.Run("noop translator", func(t *testing.T) {
+		h := &WeaviateHandler{translator: noopTranslator{}}
+		_, evt := h.translateQuery(context.Background(), "anything", "test")
+		if evt != nil {
+			t.Errorf("noopTranslator should yield nil event, got %+v", evt)
+		}
+	})
+	t.Run("blank input", func(t *testing.T) {
+		h := &WeaviateHandler{translator: &fakeTranslator{out: "ignored"}}
+		_, evt := h.translateQuery(context.Background(), "   ", "test")
+		if evt != nil {
+			t.Errorf("blank input should yield nil event, got %+v", evt)
+		}
+	})
+}
+
+// TestTranslatorEventJSONShape locks the wire-format the orchestrator
+// expects on the prepareResponse.translator_events field. Tag names
+// MUST match opentalon's PreparerTranslatorEvent struct verbatim.
+func TestTranslatorEventJSONShape(t *testing.T) {
+	evt := TranslatorEvent{
+		Callsite:             "prepare",
+		Outcome:              "translated",
+		SourceLangDetected:   "de",
+		SourceLangConfidence: 0.93,
+		TargetLang:           "en",
+		InputText:            "Wieviele Items?",
+		OutputText:           "How many items?",
+		DurationMS:           42,
+	}
+	raw, err := json.Marshal(evt)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	// Every field opentalon reads MUST be present at the snake_case key.
+	for _, k := range []string{
+		`"callsite":"prepare"`,
+		`"outcome":"translated"`,
+		`"source_lang_detected":"de"`,
+		`"source_lang_confidence":0.93`,
+		`"target_lang":"en"`,
+		`"input_text":"Wieviele Items?"`,
+		`"output_text":"How many items?"`,
+		`"duration_ms":42`,
+	} {
+		if !strings.Contains(string(raw), k) {
+			t.Errorf("JSON missing %s; full: %s", k, string(raw))
+		}
 	}
 }

@@ -35,17 +35,43 @@ type TranslatorConfig struct {
 // Translator translates a single short query string. Implementations must
 // be safe for concurrent use.
 type Translator interface {
-	// Translate returns the translation of `text`. On any failure (network,
-	// non-2xx, parse) it MUST return the original text plus a non-nil error
-	// so callers can fail open without branching.
-	Translate(ctx context.Context, text string) (string, error)
+	// Translate returns the translation outcome of `text`. The returned
+	// TranslatorOutcome.Text is what the caller should hand downstream —
+	// the post-translate string, or the original text when the translation
+	// was skipped (target-lang match) or failed (fail-open contract).
+	//
+	// SourceLang* fields are populated when a /detect call succeeded,
+	// regardless of whether the subsequent /translate succeeded. They
+	// allow the call site to record the full audit trail (lang + confidence
+	// + outcome) into a session_events row — see opentalon/opentalon#256.
+	Translate(ctx context.Context, text string) (TranslatorOutcome, error)
+}
+
+// TranslatorOutcome is the verbose return of Translator.Translate. Carries
+// the post-translate text plus the metadata an audit-log emitter needs to
+// reconstruct what the translator did. opentalon/opentalon#256.
+type TranslatorOutcome struct {
+	// Text is the translated string. Equals the input on SkippedTargetLang
+	// or on translate failure (the Translator's fail-open contract).
+	Text string
+
+	// SourceLangDetected is the ISO-639-1 code (or empty when the detect
+	// call did not run / failed); SourceLangConfidence is the matching
+	// 0..1 confidence (or 0 in the same cases).
+	SourceLangDetected   string
+	SourceLangConfidence float64
+
+	// SkippedTargetLang is true when the implementation short-circuited
+	// because the detected source language matched the target with high
+	// enough confidence — the /translate call did not run.
+	SkippedTargetLang bool
 }
 
 // noopTranslator is the zero value used when translation is disabled.
 type noopTranslator struct{}
 
-func (noopTranslator) Translate(_ context.Context, text string) (string, error) {
-	return text, nil
+func (noopTranslator) Translate(_ context.Context, text string) (TranslatorOutcome, error) {
+	return TranslatorOutcome{Text: text}, nil
 }
 
 // libreTranslator calls a LibreTranslate-compatible HTTP endpoint.
@@ -173,23 +199,39 @@ func (t *libreTranslator) detect(ctx context.Context, text string) (string, floa
 	return parsed[0].Language, parsed[0].Confidence / 100.0, nil
 }
 
-func (t *libreTranslator) Translate(ctx context.Context, text string) (string, error) {
+func (t *libreTranslator) Translate(ctx context.Context, text string) (TranslatorOutcome, error) {
 	if strings.TrimSpace(text) == "" {
-		return text, nil
+		return TranslatorOutcome{Text: text}, nil
 	}
 
 	// Optional pre-flight: if the input already looks like the target
 	// language with high confidence, skip the translate roundtrip.
 	// LibreTranslate's confidence is reported as 0..100 in /detect — we
-	// normalise to 0..1 in detect() above.
+	// normalise to 0..1 in detect() above. Detect output also feeds the
+	// session-events audit row: source_lang_detected + confidence are
+	// populated for both the skip path AND the fall-through-to-translate
+	// path so the audit row records what the detector saw even when the
+	// translate failed.
+	var detectedLang string
+	var detectedConf float64
 	if t.skipIfTargetCfg > 0 {
 		lang, conf, err := t.detect(ctx, text)
-		if err == nil && lang == t.target && conf >= t.skipIfTargetCfg {
-			return text, nil
+		if err == nil {
+			detectedLang = lang
+			detectedConf = conf
+			if lang == t.target && conf >= t.skipIfTargetCfg {
+				return TranslatorOutcome{
+					Text:                 text,
+					SourceLangDetected:   lang,
+					SourceLangConfidence: conf,
+					SkippedTargetLang:    true,
+				}, nil
+			}
 		}
 		// On detect error we fall through to translate — fail-open: we'd
 		// rather pay the EN→EN roundtrip than silently lose the cross-lingual
-		// fix when the detector is having a bad minute.
+		// fix when the detector is having a bad minute. detectedLang stays
+		// "" / detectedConf stays 0 so the audit reflects "no detect signal".
 	}
 
 	body, err := json.Marshal(translateRequest{
@@ -200,42 +242,46 @@ func (t *libreTranslator) Translate(ctx context.Context, text string) (string, e
 		APIKey: t.apiKey,
 	})
 	if err != nil {
-		return text, fmt.Errorf("marshal request: %w", err)
+		return TranslatorOutcome{Text: text, SourceLangDetected: detectedLang, SourceLangConfidence: detectedConf}, fmt.Errorf("marshal request: %w", err)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, t.translateURL, bytes.NewReader(body))
 	if err != nil {
-		return text, fmt.Errorf("build request: %w", err)
+		return TranslatorOutcome{Text: text, SourceLangDetected: detectedLang, SourceLangConfidence: detectedConf}, fmt.Errorf("build request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
 
 	resp, err := t.client.Do(req)
 	if err != nil {
-		return text, fmt.Errorf("call %s: %w", t.translateURL, err)
+		return TranslatorOutcome{Text: text, SourceLangDetected: detectedLang, SourceLangConfidence: detectedConf}, fmt.Errorf("call %s: %w", t.translateURL, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	raw, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return text, fmt.Errorf("read response: %w", err)
+		return TranslatorOutcome{Text: text, SourceLangDetected: detectedLang, SourceLangConfidence: detectedConf}, fmt.Errorf("read response: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return text, fmt.Errorf("translator status %d: %s", resp.StatusCode, truncate(string(raw), 200))
+		return TranslatorOutcome{Text: text, SourceLangDetected: detectedLang, SourceLangConfidence: detectedConf}, fmt.Errorf("translator status %d: %s", resp.StatusCode, truncate(string(raw), 200))
 	}
 
 	var parsed translateResponse
 	if err := json.Unmarshal(raw, &parsed); err != nil {
-		return text, fmt.Errorf("parse response: %w", err)
+		return TranslatorOutcome{Text: text, SourceLangDetected: detectedLang, SourceLangConfidence: detectedConf}, fmt.Errorf("parse response: %w", err)
 	}
 	if parsed.Error != "" {
-		return text, fmt.Errorf("translator error: %s", parsed.Error)
+		return TranslatorOutcome{Text: text, SourceLangDetected: detectedLang, SourceLangConfidence: detectedConf}, fmt.Errorf("translator error: %s", parsed.Error)
 	}
 	out := strings.TrimSpace(parsed.TranslatedText)
 	if out == "" {
-		return text, fmt.Errorf("translator returned empty translatedText")
+		return TranslatorOutcome{Text: text, SourceLangDetected: detectedLang, SourceLangConfidence: detectedConf}, fmt.Errorf("translator returned empty translatedText")
 	}
-	return out, nil
+	return TranslatorOutcome{
+		Text:                 out,
+		SourceLangDetected:   detectedLang,
+		SourceLangConfidence: detectedConf,
+	}, nil
 }
 
 func truncate(s string, n int) string {
@@ -245,47 +291,100 @@ func truncate(s string, n int) string {
 	return s[:n] + "…"
 }
 
+// TranslatorEvent is the per-call metadata bubbled back to the
+// orchestrator so it can emit a `translation` session event. Field names
+// match the JSON wire shape the orchestrator decodes — see
+// PreparerTranslatorEvent in opentalon/internal/orchestrator/orchestrator.go
+// and opentalon/opentalon#256. Pointer-returning translateQuery yields
+// nil when the call was skipped_disabled or the input was empty (no
+// audit row worth emitting); other outcomes populate every field the
+// downstream emit helper needs.
+type TranslatorEvent struct {
+	Callsite             string  `json:"callsite"`
+	Outcome              string  `json:"outcome"`
+	SourceLangDetected   string  `json:"source_lang_detected,omitempty"`
+	SourceLangConfidence float64 `json:"source_lang_confidence,omitempty"`
+	TargetLang           string  `json:"target_lang"`
+	InputText            string  `json:"input_text,omitempty"`
+	OutputText           string  `json:"output_text,omitempty"`
+	DurationMS           int64   `json:"duration_ms,omitempty"`
+}
+
+// Outcome label vocabulary — wire-stable. Mirrors
+// events.TranslationOutcome* in opentalon-core.
+const (
+	translatorOutcomeTranslated       = "translated"
+	translatorOutcomeSkippedTargetLang = "skipped_target_lang"
+	translatorOutcomeFailed           = "failed"
+)
+
 // translateQuery wraps Translator.Translate with the fail-open contract
 // used by every search-side caller in handler.go: any error is logged and
 // the ORIGINAL text is returned so the search still runs (just without
 // the cross-lingual normalisation).
 //
-// Also records Prometheus metrics: a call counter labelled by callsite +
-// outcome and a duration histogram. The result label is one of
-// `translated`, `skipped_target_lang`, `skipped_disabled`, `failed`.
-func (h *WeaviateHandler) translateQuery(ctx context.Context, text, callsite string) string {
+// Records Prometheus metrics (translator_calls_total + duration) AND
+// returns a TranslatorEvent for callers that want to bubble the per-call
+// metadata back to the orchestrator (today: the `prepare` action — see
+// opentalon/opentalon#256). The event is nil for the "no audit signal"
+// paths (translator disabled, empty input) since those rows would carry
+// no useful information.
+func (h *WeaviateHandler) translateQuery(ctx context.Context, text, callsite string) (string, *TranslatorEvent) {
 	if h.translator == nil {
 		translatorCallsTotal.WithLabelValues(callsite, "skipped_disabled").Inc()
-		return text
+		return text, nil
 	}
 	if _, ok := h.translator.(noopTranslator); ok {
 		translatorCallsTotal.WithLabelValues(callsite, "skipped_disabled").Inc()
-		return text
+		return text, nil
 	}
 	if strings.TrimSpace(text) == "" {
-		return text
+		return text, nil
+	}
+
+	targetLang := ""
+	if lt, ok := h.translator.(*libreTranslator); ok {
+		targetLang = lt.target
 	}
 
 	start := time.Now()
-	out, err := h.translator.Translate(ctx, text)
-	elapsed := time.Since(start).Seconds()
+	outcome, err := h.translator.Translate(ctx, text)
+	elapsed := time.Since(start)
 
 	if err != nil {
 		translatorCallsTotal.WithLabelValues(callsite, "failed").Inc()
-		translatorDurationSeconds.WithLabelValues(callsite, "failed").Observe(elapsed)
+		translatorDurationSeconds.WithLabelValues(callsite, "failed").Observe(elapsed.Seconds())
 		log.Printf("weaviate-plugin: translator: %s: fail-open, using original: %v", callsite, err)
-		return text
+		return text, &TranslatorEvent{
+			Callsite:             callsite,
+			Outcome:              translatorOutcomeFailed,
+			SourceLangDetected:   outcome.SourceLangDetected,
+			SourceLangConfidence: outcome.SourceLangConfidence,
+			TargetLang:           targetLang,
+			InputText:            text,
+			DurationMS:           elapsed.Milliseconds(),
+		}
 	}
 
-	result := "translated"
-	if out == text {
-		result = "skipped_target_lang"
+	result := translatorOutcomeTranslated
+	if outcome.SkippedTargetLang || outcome.Text == text {
+		result = translatorOutcomeSkippedTargetLang
 	}
 	translatorCallsTotal.WithLabelValues(callsite, result).Inc()
-	translatorDurationSeconds.WithLabelValues(callsite, result).Observe(elapsed)
+	translatorDurationSeconds.WithLabelValues(callsite, result).Observe(elapsed.Seconds())
 
-	if out != text {
-		log.Printf("weaviate-plugin: translator: %s: %q -> %q", callsite, truncate(text, 80), truncate(out, 80))
+	if outcome.Text != text {
+		log.Printf("weaviate-plugin: translator: %s: %q -> %q", callsite, truncate(text, 80), truncate(outcome.Text, 80))
 	}
-	return out
+
+	return outcome.Text, &TranslatorEvent{
+		Callsite:             callsite,
+		Outcome:              result,
+		SourceLangDetected:   outcome.SourceLangDetected,
+		SourceLangConfidence: outcome.SourceLangConfidence,
+		TargetLang:           targetLang,
+		InputText:            text,
+		OutputText:           outcome.Text,
+		DurationMS:           elapsed.Milliseconds(),
+	}
 }

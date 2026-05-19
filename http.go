@@ -243,7 +243,7 @@ func (h *WeaviateHandler) handleDebugPrepare(w http.ResponseWriter, r *http.Requ
 	ctx := r.Context()
 
 	tStart := time.Now()
-	searchText := h.translateQuery(ctx, body.Text, "debug_prepare")
+	searchText, _ := h.translateQuery(ctx, body.Text, "debug_prepare")
 	translatorMs := float64(time.Since(tStart).Microseconds()) / 1000.0
 
 	knowledgeQuery := searchText
