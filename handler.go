@@ -504,7 +504,7 @@ func (h *WeaviateHandler) search(req plugin.Request) plugin.Response {
 
 	ctx := context.Background()
 	original := query
-	query = h.translateQuery(ctx, query, "search")
+	query, _ = h.translateQuery(ctx, query, "search")
 	if query != original {
 		log.Printf("weaviate-plugin: search: query=%q search_text=%q", original, query)
 	}
@@ -530,7 +530,7 @@ func (h *WeaviateHandler) hybridSearch(req plugin.Request) plugin.Response {
 
 	ctx := context.Background()
 	original := query
-	query = h.translateQuery(ctx, query, "hybrid_search")
+	query, _ = h.translateQuery(ctx, query, "hybrid_search")
 	if query != original {
 		log.Printf("weaviate-plugin: hybrid_search: query=%q search_text=%q", original, query)
 	}
@@ -575,6 +575,14 @@ type prepareResponse struct {
 	KnowledgeCandidates []KnowledgeCandidate `json:"knowledge_candidates,omitempty"`
 	GlossaryCandidates  []GlossaryCandidate  `json:"glossary_candidates,omitempty"`
 	ToolCandidates      []ToolCandidate      `json:"tool_candidates,omitempty"`
+
+	// TranslatorEvents bubbles per-translator-call metadata to the
+	// orchestrator so it can emit `translation` session_events parented
+	// to the user_message — see opentalon/opentalon#256. Nil/empty when
+	// the translator is disabled or skipped_disabled (no audit signal).
+	// Pre-#256 orchestrators ignore the unknown field; this stays
+	// back-compat by virtue of being additive + omitempty.
+	TranslatorEvents []TranslatorEvent `json:"translator_events,omitempty"`
 }
 
 // defaultMinPrepareScore is the default minimum hybrid-search score for a
@@ -622,8 +630,11 @@ func (h *WeaviateHandler) prepare(req plugin.Request) plugin.Response {
 	// it reaches Weaviate, so non-EN queries can BM25-match an EN-indexed
 	// corpus. Only the SEARCH side is translated — the original `text`
 	// stays in the Message we return so the LLM still sees the user's
-	// query in their original language.
-	searchText := h.translateQuery(ctx, text, "prepare")
+	// query in their original language. The returned event (nil when
+	// translator was disabled / input empty) is bubbled to the orchestrator
+	// in prepareResponse.TranslatorEvents — opentalon/opentalon#256.
+	searchText, translatorEvent := h.translateQuery(ctx, text, "prepare")
+	translatorEvents := translatorEventsOf(translatorEvent)
 
 	// Parse allowed_plugins filter if provided by the orchestrator.
 	var allowedPlugins []string
@@ -681,9 +692,10 @@ func (h *WeaviateHandler) prepare(req plugin.Request) plugin.Response {
 	// Fail-open: if all searches fail, pass through unchanged.
 	if knowledgeErr != nil && actionsErr != nil && glossaryErr != nil {
 		return marshalPrepareResponse(req.ID, prepareResponse{
-			SendToLLM:     true,
-			Message:       text,
-			RelevantTools: []string{},
+			SendToLLM:        true,
+			Message:          text,
+			RelevantTools:    []string{},
+			TranslatorEvents: translatorEvents,
 		})
 	}
 
@@ -754,7 +766,20 @@ func (h *WeaviateHandler) prepare(req plugin.Request) plugin.Response {
 		KnowledgeCandidates: knowledgeCandidates,
 		GlossaryCandidates:  glossaryCandidates,
 		ToolCandidates:      toolCandidates,
+		TranslatorEvents:    translatorEvents,
 	})
+}
+
+// translatorEventsOf is a small helper for the prepare response builder:
+// wraps a non-nil translator event into a single-element slice so the
+// JSON field omits cleanly (omitempty drops nil/empty slices alike).
+// Keeps the prepare handler readable — the two call sites stay one line
+// each rather than open-coded nil-checks.
+func translatorEventsOf(e *TranslatorEvent) []TranslatorEvent {
+	if e == nil {
+		return nil
+	}
+	return []TranslatorEvent{*e}
 }
 
 // searchCollection performs a hybrid search (alpha=0.5) on the given collection
@@ -901,7 +926,7 @@ func (h *WeaviateHandler) askKnowledge(req plugin.Request) plugin.Response {
 
 	ctx := context.Background()
 	original := query
-	query = h.translateQuery(ctx, query, "ask_knowledge")
+	query, _ = h.translateQuery(ctx, query, "ask_knowledge")
 	if query != original {
 		log.Printf("weaviate-plugin: ask_knowledge: query=%q search_text=%q", original, query)
 	}
@@ -989,7 +1014,7 @@ func (h *WeaviateHandler) searchInstructions(req plugin.Request) plugin.Response
 
 	ctx := context.Background()
 	original := query
-	query = h.translateQuery(ctx, query, "search_instructions")
+	query, _ = h.translateQuery(ctx, query, "search_instructions")
 	if query != original {
 		log.Printf("weaviate-plugin: search_instructions: query=%q search_text=%q", original, query)
 	}
