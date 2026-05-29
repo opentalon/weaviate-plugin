@@ -391,8 +391,12 @@ func (h *WeaviateHandler) Capabilities() plugin.CapabilitiesMsg {
 				Description: "RAG preparer: searches KnowledgeArticles and MCPActions with the user message and returns structured context with relevant tools.",
 				Parameters: []plugin.ParameterMsg{
 					{Name: "text", Description: "Raw user message (injected by the orchestrator)", Type: "string", Required: true},
-					{Name: "allowed_plugins", Description: "JSON array of allowed plugin names for filtering (injected by orchestrator)", Type: "string", Required: false},
 				},
+				// allowed_plugins is orchestrator-managed context, not an LLM-facing
+				// input. Declaring it via InjectContextArgs (instead of Parameters)
+				// routes it through the registered ContextArgProvider and keeps it
+				// out of the LLM-visible tool schema.
+				InjectContextArgs: []string{"allowed_plugins"},
 			},
 			{
 				Name:        "sync_actions",
@@ -426,8 +430,9 @@ func (h *WeaviateHandler) Capabilities() plugin.CapabilitiesMsg {
 					{Name: "plugin", Description: "Narrow results to a specific plugin (e.g. 'jira')", Type: "string", Required: false},
 					{Name: "source", Description: "Filter knowledge articles by source identifier (e.g. 'help-center')", Type: "string", Required: false},
 					{Name: "limit", Description: "Maximum results per collection (default 3)", Type: "integer", Required: false},
-					{Name: "allowed_plugins", Description: "JSON array of allowed plugin names (injected by orchestrator)", Type: "string", Required: false},
 				},
+				// allowed_plugins is orchestrator-managed context (see prepare above).
+				InjectContextArgs: []string{"allowed_plugins"},
 			},
 			{
 				Name:        "search_instructions",

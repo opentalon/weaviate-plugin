@@ -1812,6 +1812,43 @@ func TestCapabilities_includesAskKnowledge(t *testing.T) {
 	}
 }
 
+// TestCapabilities_injectContextArgs pins the declarative context-arg path:
+// `allowed_plugins` is orchestrator-managed and must be delivered via
+// InjectContextArgs, not via the LLM-visible Parameters list. This guards
+// against an accidental revert of the consolidation that routed the value
+// through the host's ContextArgProvider registry instead of an open
+// parameter on the tool schema.
+func TestCapabilities_injectContextArgs(t *testing.T) {
+	caps := (&WeaviateHandler{}).Capabilities()
+
+	byName := make(map[string]plugin.ActionMsg, len(caps.Actions))
+	for _, a := range caps.Actions {
+		byName[a.Name] = a
+	}
+
+	for _, name := range []string{"prepare", "ask_knowledge"} {
+		action, ok := byName[name]
+		if !ok {
+			t.Fatalf("action %q missing from capabilities", name)
+		}
+		found := false
+		for _, ica := range action.InjectContextArgs {
+			if ica == "allowed_plugins" {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("action %q: InjectContextArgs missing %q (got %v)", name, "allowed_plugins", action.InjectContextArgs)
+		}
+		for _, p := range action.Parameters {
+			if p.Name == "allowed_plugins" {
+				t.Errorf("action %q: %q is now an InjectContextArg and must not also appear in Parameters", name, "allowed_plugins")
+			}
+		}
+	}
+}
+
 func TestRefresh(t *testing.T) {
 	h := newHandler(t)
 	resp := h.Execute(plugin.Request{
