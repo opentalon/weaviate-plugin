@@ -1469,13 +1469,19 @@ func TestPrepare_returnsRelevantTools(t *testing.T) {
 	h := newHandler(t)
 
 	// Post fail-closed-default pivot, prepare REQUIRES an explicit
-	// allowed_tools palette injected by the orchestrator. The integration
-	// test simulates the orchestrator side by passing the full seed
-	// MCPActions superset (see seedRAGData) — any FQN actually retrieved
-	// above the score threshold will then pass the chokepoint.
+	// allowed_tools palette injected by the orchestrator. Earlier
+	// integration tests in this suite mutate MCPActions (sync_actions
+	// upserts, pre-deletions), so the seed jira/gitlab actions may
+	// have been replaced by the time this test runs. Sync the FQNs we
+	// will assert on directly so the test owns its data.
+	seedTestPluginActions(t, h, "prepare-test-plugin", []syncActionEntry{
+		{Name: "create_issue", Description: "Create a new issue in the Jira project tracker"},
+		{Name: "list_issues", Description: "List all open issues in a Jira project"},
+	})
+
 	allowedTools, _ := json.Marshal([]string{
-		"jira.create_issue", "jira.list_issues",
-		"gitlab.create_mr", "gitlab.list_pipelines",
+		"prepare-test-plugin.create_issue",
+		"prepare-test-plugin.list_issues",
 	})
 	resp := h.Execute(plugin.Request{
 		ID:     "prepare-tools",
@@ -1621,12 +1627,15 @@ func TestPrepare_structuredJSONFormat(t *testing.T) {
 func TestPrepare_knowledgeContextAndRelevantTools(t *testing.T) {
 	h := newHandler(t)
 
-	// See TestPrepare_returnsRelevantTools above for the rationale:
-	// fail-closed default requires explicit allowed_tools from the
-	// orchestrator, simulated here with the full seed superset.
+	// Self-seed for the same cross-test-pollution reason as
+	// TestPrepare_returnsRelevantTools above.
+	seedTestPluginActions(t, h, "prepare-blocks-plugin", []syncActionEntry{
+		{Name: "create_issue", Description: "Create a new issue in the Jira project tracker"},
+		{Name: "list_issues", Description: "List all open issues in a Jira project"},
+	})
 	allowedTools, _ := json.Marshal([]string{
-		"jira.create_issue", "jira.list_issues",
-		"gitlab.create_mr", "gitlab.list_pipelines",
+		"prepare-blocks-plugin.create_issue",
+		"prepare-blocks-plugin.list_issues",
 	})
 	resp := h.Execute(plugin.Request{
 		ID:     "prepare-blocks",
@@ -1655,6 +1664,25 @@ func TestPrepare_knowledgeContextAndRelevantTools(t *testing.T) {
 	if result.RelevantTools == nil {
 		t.Error("relevant_tools should not be nil")
 	}
+}
+
+// seedTestPluginActions syncs the given action descriptors under pluginName
+// and waits for the background sync worker to drain. Used by integration
+// tests that need MCPActions data that survives cross-test mutation by
+// earlier sync_actions tests in the suite.
+func seedTestPluginActions(t *testing.T, h *WeaviateHandler, pluginName string, actions []syncActionEntry) {
+	t.Helper()
+	payload, _ := json.Marshal(syncActionsPayload{PluginName: pluginName, Actions: actions})
+	resp := h.Execute(plugin.Request{
+		ID:     "seed-" + pluginName,
+		Action: "sync_actions",
+		Args:   map[string]string{"payload": string(payload)},
+	})
+	if resp.Error != "" {
+		t.Fatalf("seed sync for %s: %s", pluginName, resp.Error)
+	}
+	waitSyncDrain(t, h, 10*time.Second)
+	time.Sleep(300 * time.Millisecond)
 }
 
 // ---------------------------------------------------------------------------
