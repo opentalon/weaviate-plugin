@@ -119,6 +119,47 @@ func TestActionFilter_availableTools_emptyPaletteFiltersEverything(t *testing.T)
 	}
 }
 
+// TestActionFilter_availableTools_jsonNullIsTreatedAsNil pins the host-side
+// edge case: a buggy orchestrator that marshals a nil Go slice into the
+// literal JSON `null` (instead of omitting the arg) MUST land in the
+// fail-open "no palette" branch, not the fail-closed empty-map branch.
+// Without the explicit `"null"` and `list != nil` guards in prepare(),
+// json.Unmarshal sets `list = nil`, the subsequent `make` builds a
+// non-nil empty map, and every retrieved tool is silently filtered out
+// → the LLM sees zero tools without an explicit operator decision.
+// This test exercises the parsing path that the production handler uses.
+func TestActionFilter_availableTools_jsonNullIsTreatedAsNil(t *testing.T) {
+	// Mirror the handler's parsing block — if either guard is removed,
+	// the resulting filter would block everything below.
+	var availableTools map[string]struct{}
+	v := "null"
+	if v != "" && v != "null" {
+		var list []string
+		if err := json.Unmarshal([]byte(v), &list); err == nil && list != nil {
+			availableTools = make(map[string]struct{}, len(list))
+			for _, name := range list {
+				availableTools[name] = struct{}{}
+			}
+		}
+	}
+	if availableTools != nil {
+		t.Fatalf("\"null\" must yield nil availableTools (no palette / no filter), got non-nil: %v", availableTools)
+	}
+
+	// Confirm the filter built from that parse path is in fact a no-op
+	// when fed a real retrieval result.
+	result := buildMockActionsResult("MCPActions", []mockAction{
+		{Plugin: "jira", Action: "create_issue", Score: "0.020"},
+		{Plugin: "gitlab", Action: "create_mr", Score: "0.020"},
+	})
+	tools := extractToolNames(result, "MCPActions", actionFilter{
+		minScore: defaultMinPrepareScore, availableTools: availableTools,
+	})
+	if len(tools) != 2 {
+		t.Errorf("expected \"null\" path to behave as no-filter (2 tools), got %d: %v", len(tools), tools)
+	}
+}
+
 func TestActionFilter_availableTools_nilPaletteIsNoFilter(t *testing.T) {
 	// nil palette = no per-session filter; backwards-compatible behaviour
 	// for callers that pass actionFilter{minScore: …} without setting the

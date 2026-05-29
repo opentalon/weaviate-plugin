@@ -314,7 +314,13 @@ func (h *WeaviateHandler) handleDebugPrepare(w http.ResponseWriter, r *http.Requ
 			availableTools[name] = struct{}{}
 		}
 	}
-	filter := actionFilter{minScore: h.minPrepareScore, availableTools: availableTools}
+	// Use minPrepareScoreTools (the per-collection tools cutoff) to match
+	// production prepare(). The legacy h.minPrepareScore is the global
+	// fallback Configure leaves on minPrepareScoreTools when the operator
+	// has not split them, so reading the per-collection field stays
+	// equivalent on default configs and stays correct when an operator
+	// tightens just the tools threshold (the common case post-RFC #249).
+	filter := actionFilter{minScore: h.minPrepareScoreTools, availableTools: availableTools}
 	tools := extractToolNames(actionsResult, h.actionsCollection, filter)
 
 	// Surface what the palette rejected. Operators see "score said yes,
@@ -325,7 +331,7 @@ func (h *WeaviateHandler) handleDebugPrepare(w http.ResponseWriter, r *http.Requ
 		for _, t := range tools {
 			matched[t] = struct{}{}
 		}
-		scoreOnlyFilter := actionFilter{minScore: h.minPrepareScore}
+		scoreOnlyFilter := actionFilter{minScore: h.minPrepareScoreTools}
 		for _, fqn := range extractToolNames(actionsResult, h.actionsCollection, scoreOnlyFilter) {
 			if _, kept := matched[fqn]; !kept {
 				filteredOut = append(filteredOut, fqn)
@@ -338,7 +344,7 @@ func (h *WeaviateHandler) handleDebugPrepare(w http.ResponseWriter, r *http.Requ
 		SearchText:           searchText,
 		Translated:           searchText != body.Text,
 		TranslatorMs:         translatorMs,
-		MinPrepareScore:      h.minPrepareScore,
+		MinPrepareScore:      h.minPrepareScoreTools,
 		MatchedTools:         tools,
 		ActionsTop:           extractScoredActions(actionsResult, h.actionsCollection),
 		KnowledgeTop:         extractScoredKnowledge(knowledgeResult, h.knowledgeCollection),

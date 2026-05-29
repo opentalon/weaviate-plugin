@@ -149,9 +149,8 @@ func extractGlossaryCandidates(items []map[string]interface{}, minScore float64)
 //
 // New axes (e.g. recency, tier-aware boosts) get a field on this struct,
 // not a second parallel filter loop in each extractor. The zero value
-// {minScore: 0, availableTools: nil} accepts every well-formed item, which
-// is the right default for callers that don't care (e.g. http.go's debug
-// endpoint pre-PR-3).
+// {minScore: 0, availableTools: nil} accepts every well-formed item — the
+// right default for callers that don't care about either axis.
 type actionFilter struct {
 	minScore       float64
 	availableTools map[string]struct{}
@@ -188,10 +187,17 @@ func walkRetrievedActions(result interface{}, className string, filter actionFil
 	}
 }
 
+// Both extractors below funnel through walkRetrievedActions and return
+// non-nil empty slices on "filter ran, found nothing". Symmetric helper
+// surface — nil-vs-empty drift between the two would let downstream code
+// nil-check one and len-check the other, exactly the inconsistency the
+// chokepoint refactor exists to prevent. Callers that need a nil signal
+// (e.g. prepare's "no relevant tools active") normalize at the call site,
+// not in these helpers.
+
 // extractToolNames returns the "<plugin>.<action>" FQNs from an MCPActions
-// GraphQL result that pass the filter. Empty slice (not nil) on no matches —
-// callers downstream distinguish "filter ran, found nothing" (empty) from
-// "filter not active" (nil).
+// GraphQL result that pass the filter. Returns a non-nil empty slice when
+// no item matches.
 func extractToolNames(result interface{}, className string, filter actionFilter) []string {
 	tools := []string{}
 	walkRetrievedActions(result, className, filter, func(p, a string, _ map[string]interface{}) {
@@ -203,9 +209,10 @@ func extractToolNames(result interface{}, className string, filter actionFilter)
 // extractToolCandidatesFromResult walks the GraphQL response for the
 // MCPActions collection and produces ranked ToolCandidate entries through
 // the shared actionFilter chokepoint. PositionInResults is 1-indexed and
-// reflects the post-filter rank.
+// reflects the post-filter rank. Returns a non-nil empty slice when no
+// item matches (see the symmetry note above).
 func extractToolCandidatesFromResult(result interface{}, className string, filter actionFilter) []ToolCandidate {
-	var out []ToolCandidate
+	out := []ToolCandidate{}
 	walkRetrievedActions(result, className, filter, func(p, a string, item map[string]interface{}) {
 		out = append(out, ToolCandidate{
 			ToolName:          p + "." + a,
@@ -213,9 +220,6 @@ func extractToolCandidatesFromResult(result interface{}, className string, filte
 			PositionInResults: len(out) + 1,
 		})
 	})
-	if len(out) == 0 {
-		return nil
-	}
 	return out
 }
 

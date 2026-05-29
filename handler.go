@@ -652,14 +652,26 @@ func (h *WeaviateHandler) prepare(req plugin.Request) plugin.Response {
 	}
 
 	// Parse allowed_tools (per-session FQN palette, applied post-retrieval
-	// inside the actionFilter chokepoint). nil = no per-session restriction;
-	// non-nil empty set = "session can call zero tools" → every retrieved
-	// action is filtered out. Empty/malformed JSON falls back to nil (=
-	// fail-open) so a buggy host can't accidentally silence the LLM.
+	// inside the actionFilter chokepoint). Three host-side states map onto
+	// three filter behaviours:
+	//   - arg omitted ("" / missing) → no per-session palette known →
+	//     availableTools stays nil → palette filter is a no-op (fail-open;
+	//     the score filter alone applies)
+	//   - arg present as "[]" → fail-closed "session can call zero tools";
+	//     availableTools becomes a non-nil empty map and every retrieved
+	//     action is filtered out
+	//   - arg present as JSON array → strict subset enforcement
+	//
+	// "null" is treated as "no palette" (== omitted) — a buggy host that
+	// marshals a nil Go slice into "null" would otherwise silently fall
+	// into the empty-map fail-closed branch via Unmarshal's zero-value
+	// path, silencing the LLM. The `list != nil` guard catches the same
+	// shape if a future JSON variant slips through the "null" string check.
+	// Malformed JSON also falls back to nil for the same fail-open reason.
 	var availableTools map[string]struct{}
-	if v, ok := req.Args["allowed_tools"]; ok && v != "" {
+	if v, ok := req.Args["allowed_tools"]; ok && v != "" && v != "null" {
 		var list []string
-		if err := json.Unmarshal([]byte(v), &list); err == nil {
+		if err := json.Unmarshal([]byte(v), &list); err == nil && list != nil {
 			availableTools = make(map[string]struct{}, len(list))
 			for _, name := range list {
 				availableTools[name] = struct{}{}

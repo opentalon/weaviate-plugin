@@ -227,10 +227,18 @@ func TestExtractToolCandidatesFromResult_buildsPluginDotAction(t *testing.T) {
 	}
 }
 
-func TestExtractToolCandidatesFromResult_emptyClassReturnsNil(t *testing.T) {
+// TestExtractToolCandidatesFromResult_emptyClassReturnsNonNilEmpty pins the
+// sibling-symmetry convention with extractToolNames: both walkRetrievedActions
+// consumers return a non-nil empty slice on "filter ran, found nothing".
+// Callers that need a nil signal (e.g. prepare's "no relevant tools active")
+// normalize at the call site, not in these helpers.
+func TestExtractToolCandidatesFromResult_emptyClassReturnsNonNilEmpty(t *testing.T) {
 	got := extractToolCandidatesFromResult(fakeResult("MCPActions", nil), "MCPActions", actionFilter{})
-	if got != nil {
-		t.Errorf("empty class slice must yield nil, got %+v", got)
+	if got == nil {
+		t.Errorf("expected non-nil empty slice for sibling-symmetry with extractToolNames, got nil")
+	}
+	if len(got) != 0 {
+		t.Errorf("expected empty slice, got %d entries: %+v", len(got), got)
 	}
 }
 
