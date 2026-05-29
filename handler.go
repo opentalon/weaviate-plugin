@@ -19,6 +19,19 @@ import (
 	wmodels "github.com/weaviate/weaviate/entities/models"
 )
 
+// Orchestrator context-arg wire names. Declared as constants here so a
+// typo at any of the four call sites (Capability InjectContextArgs +
+// Execute-time req.Args reads) fails to compile rather than silently
+// drifting and leaving the arg unread. Canonical cross-repo source of
+// truth is opentalon/pkg/plugin/contextargs - kept as local consts here
+// to avoid pinning this plugin to an unreleased opentalon revision
+// while the matching PR is in flight. Bump in lock-step with that
+// package; both sides MUST agree on the wire name.
+const (
+	ctxArgAllowedPlugins = "allowed_plugins"
+	ctxArgAllowedTools   = "allowed_tools"
+)
+
 // Default collection names for the knowledge-augmented RAG system.
 const (
 	DefaultActionsCollection   = "MCPActions"
@@ -54,13 +67,13 @@ const MCPKnowledgeSourcePrefix = "mcp-knowledge:"
 
 // Config is the JSON config block passed via the Init RPC.
 type Config struct {
-	Host                string         `json:"host"`
-	Scheme              string         `json:"scheme"`
-	Collection          string         `json:"collection"`
-	ActionsCollection   string         `json:"actions_collection"`
-	KnowledgeCollection string         `json:"knowledge_collection"`
-	Fields              []string       `json:"fields"`
-	Limit               int            `json:"limit"`
+	Host                string   `json:"host"`
+	Scheme              string   `json:"scheme"`
+	Collection          string   `json:"collection"`
+	ActionsCollection   string   `json:"actions_collection"`
+	KnowledgeCollection string   `json:"knowledge_collection"`
+	Fields              []string `json:"fields"`
+	Limit               int      `json:"limit"`
 	// Per-collection ceilings for the `prepare` RAG fan-out. The orchestrator's
 	// downstream tier-budget (tier1_cap + tier2_cap) and per-turn knowledge cap
 	// can only fire when the upstream candidate pool exceeds them — when the
@@ -71,12 +84,12 @@ type Config struct {
 	PrepareKnowledgeLimit int            `json:"prepare_knowledge_limit"`
 	PrepareActionsLimit   int            `json:"prepare_actions_limit"`
 	PrepareGlossaryLimit  int            `json:"prepare_glossary_limit"`
-	AutoCreateSchema    *bool          `json:"auto_create_schema"`
-	HTTPAddr            string         `json:"http_addr"`
-	Token               string         `json:"token"`
-	Vectorizer          string         `json:"vectorizer"`
-	ModuleConfig        map[string]any `json:"module_config"`
-	MinPrepareScore     *float64       `json:"min_prepare_score"` // fallback applied when the per-collection knobs below are unset
+	AutoCreateSchema      *bool          `json:"auto_create_schema"`
+	HTTPAddr              string         `json:"http_addr"`
+	Token                 string         `json:"token"`
+	Vectorizer            string         `json:"vectorizer"`
+	ModuleConfig          map[string]any `json:"module_config"`
+	MinPrepareScore       *float64       `json:"min_prepare_score"` // fallback applied when the per-collection knobs below are unset
 	// Per-collection minimum-score gates for `prepare`. Tools, knowledge,
 	// and glossary often want different thresholds: the tools retriever
 	// can tolerate a permissive cut-off because the orchestrator ranks
@@ -89,8 +102,8 @@ type Config struct {
 	MinPrepareScoreTools     *float64 `json:"min_prepare_score_tools,omitempty"`
 	MinPrepareScoreKnowledge *float64 `json:"min_prepare_score_knowledge,omitempty"`
 	MinPrepareScoreGlossary  *float64 `json:"min_prepare_score_glossary,omitempty"`
-	Timeout             string         `json:"timeout"` // Weaviate HTTP client timeout as duration string (e.g. "2m", "90s"); default "2m"
-	GlossaryCollection string `json:"glossary_collection"`
+	Timeout                  string   `json:"timeout"` // Weaviate HTTP client timeout as duration string (e.g. "2m", "90s"); default "2m"
+	GlossaryCollection       string   `json:"glossary_collection"`
 	// Translator is the optional LibreTranslate-compatible query
 	// pre-processor. When enabled, non-target-language user queries are
 	// translated to TargetLang before they reach Weaviate, fixing
@@ -103,7 +116,7 @@ type Config struct {
 type syncJobKind int
 
 const (
-	syncJobActions  syncJobKind = iota
+	syncJobActions syncJobKind = iota
 	syncJobGlossary
 )
 
@@ -140,26 +153,26 @@ type syncStatusState struct {
 
 // WeaviateHandler implements plugin.Handler.
 type WeaviateHandler struct {
-	client              *weaviate.Client
-	collection          string
-	actionsCollection   string
-	knowledgeCollection string
-	glossaryCollection  string
-	fields              []string
-	limit               int
-	prepareKnowledgeLimit int
-	prepareActionsLimit   int
-	prepareGlossaryLimit  int
-	httpAddr            string
-	token               string
-	vectorizer          string
-	moduleConfig        map[string]any
+	client                   *weaviate.Client
+	collection               string
+	actionsCollection        string
+	knowledgeCollection      string
+	glossaryCollection       string
+	fields                   []string
+	limit                    int
+	prepareKnowledgeLimit    int
+	prepareActionsLimit      int
+	prepareGlossaryLimit     int
+	httpAddr                 string
+	token                    string
+	vectorizer               string
+	moduleConfig             map[string]any
 	minPrepareScore          float64
 	minPrepareScoreTools     float64
 	minPrepareScoreKnowledge float64
 	minPrepareScoreGlossary  float64
-	clientTimeout       time.Duration
-	translator          Translator
+	clientTimeout            time.Duration
+	translator               Translator
 
 	// Hash-based sync skip: avoid re-writing unchanged data to Weaviate.
 	actionHashes map[string]string // pluginName → last-seen hash from sync_actions
@@ -391,8 +404,15 @@ func (h *WeaviateHandler) Capabilities() plugin.CapabilitiesMsg {
 				Description: "RAG preparer: searches KnowledgeArticles and MCPActions with the user message and returns structured context with relevant tools.",
 				Parameters: []plugin.ParameterMsg{
 					{Name: "text", Description: "Raw user message (injected by the orchestrator)", Type: "string", Required: true},
-					{Name: "allowed_plugins", Description: "JSON array of allowed plugin names for filtering (injected by orchestrator)", Type: "string", Required: false},
 				},
+				// allowed_plugins (profile-level allowlist) and allowed_tools
+				// (per-session FQN palette) are orchestrator-managed context,
+				// not LLM-facing inputs. Both are delivered via the host's
+				// ContextArgProvider registry. allowed_tools enforces the
+				// invariant `knowledge_context.tools ⊆ session.tools_available`
+				// so RAG retrieval cannot inject a tool the current session
+				// has no permission to call.
+				InjectContextArgs: []string{ctxArgAllowedPlugins, ctxArgAllowedTools},
 			},
 			{
 				Name:        "sync_actions",
@@ -426,8 +446,9 @@ func (h *WeaviateHandler) Capabilities() plugin.CapabilitiesMsg {
 					{Name: "plugin", Description: "Narrow results to a specific plugin (e.g. 'jira')", Type: "string", Required: false},
 					{Name: "source", Description: "Filter knowledge articles by source identifier (e.g. 'help-center')", Type: "string", Required: false},
 					{Name: "limit", Description: "Maximum results per collection (default 3)", Type: "integer", Required: false},
-					{Name: "allowed_plugins", Description: "JSON array of allowed plugin names (injected by orchestrator)", Type: "string", Required: false},
 				},
+				// allowed_plugins is orchestrator-managed context (see prepare above).
+				InjectContextArgs: []string{ctxArgAllowedPlugins},
 			},
 			{
 				Name:        "search_instructions",
@@ -636,10 +657,45 @@ func (h *WeaviateHandler) prepare(req plugin.Request) plugin.Response {
 	searchText, translatorEvent := h.translateQuery(ctx, text, "prepare")
 	translatorEvents := translatorEventsOf(translatorEvent)
 
-	// Parse allowed_plugins filter if provided by the orchestrator.
+	// Parse allowed_plugins (profile-level allowlist, applied as the
+	// MCPActions GraphQL WHERE filter so search cost stays bounded).
 	var allowedPlugins []string
-	if v, ok := req.Args["allowed_plugins"]; ok && v != "" {
+	if v, ok := req.Args[ctxArgAllowedPlugins]; ok && v != "" {
 		_ = json.Unmarshal([]byte(v), &allowedPlugins)
+	}
+
+	// Parse allowed_tools into the per-session FQN palette applied
+	// post-retrieval inside the actionFilter chokepoint. Defense-safe
+	// default: when the host does NOT inject the arg — or injects an
+	// unparseable / null value — every retrieved action is dropped.
+	//
+	//   - arg omitted / "" / "null" / malformed → fail-closed empty map →
+	//     every retrieved action filtered out. The fail-open alternative
+	//     would silently degrade a restricted session to "no filter"
+	//     whenever the orchestrator forgot to inject the arg (deploy
+	//     ordering, missing provider, config drift) — re-opening the
+	//     defense-in-depth gap the palette exists to close.
+	//   - arg present as "[]" → fail-closed empty map (same outcome).
+	//   - arg present as JSON array → strict subset enforcement.
+	//
+	// Deploy contract: opentalon-core ≥ the commit that adds the
+	// allowed_tools ContextArgProvider MUST be paired with this plugin.
+	// An older Core without the provider will leave the arg absent and
+	// every prepare() call will return zero tools. This is intentional
+	// — failing closed beats silently dropping the gate.
+	availableTools := make(map[string]struct{})
+	if v, ok := req.Args[ctxArgAllowedTools]; ok && v != "" && v != "null" {
+		var list []string
+		if err := json.Unmarshal([]byte(v), &list); err == nil && list != nil {
+			availableTools = make(map[string]struct{}, len(list))
+			for _, name := range list {
+				availableTools[name] = struct{}{}
+			}
+		}
+	}
+	actionsFilter := actionFilter{
+		minScore:       h.minPrepareScoreTools,
+		availableTools: availableTools,
 	}
 
 	// Search KnowledgeArticles with plugin-boosted query. Limit is
@@ -699,9 +755,11 @@ func (h *WeaviateHandler) prepare(req plugin.Request) plugin.Response {
 		})
 	}
 
-	// Extract relevant tool names (above score threshold) for system prompt filtering.
-	// The orchestrator uses this list to decide which tools to show the LLM.
-	tools := extractToolNamesAboveScore(actionsResult, h.actionsCollection, h.minPrepareScoreTools)
+	// Extract relevant tool names (post-filter chokepoint) for system prompt
+	// filtering. The orchestrator uses this list to decide which tools to
+	// show the LLM. The same filter feeds toolCandidates below so both
+	// outputs honour the session's allowed_tools palette.
+	tools := extractToolNames(actionsResult, h.actionsCollection, actionsFilter)
 
 	// When no real tools matched, return nil so the orchestrator shows ALL
 	// tools (relevantToolsActive=false). Only activate filtering when we
@@ -756,7 +814,7 @@ func (h *WeaviateHandler) prepare(req plugin.Request) plugin.Response {
 	}
 	var toolCandidates []ToolCandidate
 	if actionsErr == nil {
-		toolCandidates = extractToolCandidatesFromResult(actionsResult, h.actionsCollection, h.minPrepareScoreTools)
+		toolCandidates = extractToolCandidatesFromResult(actionsResult, h.actionsCollection, actionsFilter)
 	}
 
 	return marshalPrepareResponse(req.ID, prepareResponse{
@@ -805,27 +863,8 @@ func (h *WeaviateHandler) searchCollection(
 	return builder.Do(ctx)
 }
 
-
-// extractToolNamesAboveScore extracts "pluginName.actionName" strings from an
-// MCPActions GraphQL response, filtering out results below the given score threshold.
-func extractToolNamesAboveScore(result interface{}, className string, minScore float64) []string {
-	items := extractItems(result, className)
-	if len(items) == 0 {
-		return []string{}
-	}
-	tools := make([]string, 0, len(items))
-	for _, obj := range items {
-		if !aboveScore(obj, minScore) {
-			continue
-		}
-		pluginName, _ := obj["pluginName"].(string)
-		actionName, _ := obj["actionName"].(string)
-		if pluginName != "" && actionName != "" {
-			tools = append(tools, pluginName+"."+actionName)
-		}
-	}
-	return tools
-}
+// MCPActions extractors (extractToolNames, extractToolCandidatesFromResult)
+// live in candidates.go and share the actionFilter chokepoint.
 
 // formatItemsCompact formats pre-extracted items above the score threshold as
 // compact text (title + content only). Returns "" when no items pass.
@@ -946,7 +985,7 @@ func (h *WeaviateHandler) askKnowledge(req plugin.Request) plugin.Response {
 			WithPath([]string{"pluginName"}).
 			WithOperator(filters.Equal).
 			WithValueText(p)
-	} else if v, ok := req.Args["allowed_plugins"]; ok && v != "" {
+	} else if v, ok := req.Args[ctxArgAllowedPlugins]; ok && v != "" {
 		var allowedPlugins []string
 		if err := json.Unmarshal([]byte(v), &allowedPlugins); err == nil && len(allowedPlugins) > 0 {
 			actionsWhere = filters.Where().

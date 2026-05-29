@@ -7,17 +7,17 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// Unit tests for extractToolNamesAboveScore
+// Unit tests for extractToolNames (score filter via actionFilter chokepoint)
 // ---------------------------------------------------------------------------
 
-func TestExtractToolNamesAboveScore_filtersLowScores(t *testing.T) {
+func TestExtractToolNames_filtersLowScores(t *testing.T) {
 	result := buildMockActionsResult("MCPActions", []mockAction{
 		{Plugin: "jira", Action: "create_issue", Score: "0.020"},
 		{Plugin: "jira", Action: "list_issues", Score: "0.005"}, // below threshold
 		{Plugin: "gitlab", Action: "create_mr", Score: "0.015"},
 	})
 
-	tools := extractToolNamesAboveScore(result, "MCPActions", defaultMinPrepareScore)
+	tools := extractToolNames(result, "MCPActions", actionFilter{minScore: defaultMinPrepareScore})
 
 	if len(tools) != 2 {
 		t.Fatalf("expected 2 tools, got %d: %v", len(tools), tools)
@@ -30,40 +30,216 @@ func TestExtractToolNamesAboveScore_filtersLowScores(t *testing.T) {
 	}
 }
 
-func TestExtractToolNamesAboveScore_emptyWhenAllBelowThreshold(t *testing.T) {
+func TestExtractToolNames_emptyWhenAllBelowThreshold(t *testing.T) {
 	result := buildMockActionsResult("MCPActions", []mockAction{
 		{Plugin: "jira", Action: "create_issue", Score: "0.005"},
 		{Plugin: "gitlab", Action: "create_mr", Score: "0.003"},
 	})
 
-	tools := extractToolNamesAboveScore(result, "MCPActions", defaultMinPrepareScore)
+	tools := extractToolNames(result, "MCPActions", actionFilter{minScore: defaultMinPrepareScore})
 
 	if len(tools) != 0 {
 		t.Errorf("expected 0 tools when all below threshold, got %d: %v", len(tools), tools)
 	}
 }
 
-func TestExtractToolNamesAboveScore_emptyOnNilResult(t *testing.T) {
-	tools := extractToolNamesAboveScore(nil, "MCPActions", 0.85)
+func TestExtractToolNames_emptyOnNilResult(t *testing.T) {
+	tools := extractToolNames(nil, "MCPActions", actionFilter{minScore: 0.85})
 
 	if len(tools) != 0 {
 		t.Errorf("expected 0 tools for nil result, got %d: %v", len(tools), tools)
 	}
 }
 
-func TestExtractToolNamesAboveScore_includesNoScoreByDefault(t *testing.T) {
+func TestExtractToolNames_includesNoScoreByDefault(t *testing.T) {
 	// When _additional.score is missing, aboveScore returns true.
 	result := buildMockActionsResult("MCPActions", []mockAction{
 		{Plugin: "jira", Action: "create_issue", Score: ""}, // no score
 	})
 
-	tools := extractToolNamesAboveScore(result, "MCPActions", 0.85)
+	tools := extractToolNames(result, "MCPActions", actionFilter{minScore: 0.85})
 
 	if len(tools) != 1 {
 		t.Fatalf("expected 1 tool (no score = include), got %d: %v", len(tools), tools)
 	}
 	if tools[0] != "jira.create_issue" {
 		t.Errorf("expected jira.create_issue, got %q", tools[0])
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests for actionFilter.availableTools (per-session palette enforcement)
+//
+// These pin the defense-in-depth invariant: even if Weaviate retrieves a
+// tool that scores above the threshold, the actionFilter must drop it
+// unless the caller's session is allowed to invoke it.
+// ---------------------------------------------------------------------------
+
+func TestActionFilter_availableTools_filtersOutOfPalette(t *testing.T) {
+	result := buildMockActionsResult("MCPActions", []mockAction{
+		{Plugin: "jira", Action: "create_issue", Score: "0.020"},
+		{Plugin: "gitlab", Action: "create_mr", Score: "0.020"},
+		{Plugin: "jira", Action: "admin_purge", Score: "0.030"}, // high score, NOT in palette
+	})
+
+	filter := actionFilter{
+		minScore: defaultMinPrepareScore,
+		availableTools: map[string]struct{}{
+			"jira.create_issue": {},
+			"gitlab.create_mr":  {},
+			// jira.admin_purge intentionally absent
+		},
+	}
+	tools := extractToolNames(result, "MCPActions", filter)
+
+	if len(tools) != 2 {
+		t.Fatalf("expected 2 tools (admin_purge filtered out by palette), got %d: %v", len(tools), tools)
+	}
+	for _, tool := range tools {
+		if tool == "jira.admin_purge" {
+			t.Errorf("jira.admin_purge leaked through actionFilter despite being absent from availableTools")
+		}
+	}
+}
+
+func TestActionFilter_availableTools_emptyPaletteFiltersEverything(t *testing.T) {
+	// Non-nil empty palette means "session can call zero tools" — every
+	// retrieved action must be filtered out. (This distinguishes empty from
+	// nil: nil = no per-session filter; empty set = "no tools available".)
+	result := buildMockActionsResult("MCPActions", []mockAction{
+		{Plugin: "jira", Action: "create_issue", Score: "0.020"},
+	})
+	filter := actionFilter{
+		minScore:       defaultMinPrepareScore,
+		availableTools: map[string]struct{}{},
+	}
+	tools := extractToolNames(result, "MCPActions", filter)
+	if len(tools) != 0 {
+		t.Errorf("expected 0 tools for empty palette, got %d: %v", len(tools), tools)
+	}
+}
+
+// parseAllowedTools mirrors the production handler's parsing block.
+// Kept as a small helper so the defense-safe edge-case tests below
+// exercise the exact same logic that handler.go's prepare() applies
+// without spinning up a full Execute() round-trip. Any change to the
+// production parse rule must mirror here (or vice versa).
+func parseAllowedTools(raw string, present bool) map[string]struct{} {
+	availableTools := make(map[string]struct{})
+	if present && raw != "" && raw != "null" {
+		var list []string
+		if err := json.Unmarshal([]byte(raw), &list); err == nil && list != nil {
+			availableTools = make(map[string]struct{}, len(list))
+			for _, name := range list {
+				availableTools[name] = struct{}{}
+			}
+		}
+	}
+	return availableTools
+}
+
+// TestActionFilter_failClosedDefaults pins the defense-safe contract on
+// the parsing path: every state that is NOT a well-formed JSON array of
+// FQNs collapses to a non-nil empty map → the filter blocks every
+// retrieved action. Without this, a missing/null/malformed allowed_tools
+// would silently degrade a restricted session to "no filter" the moment
+// the orchestrator forgot to inject the arg (deploy ordering, missing
+// provider, config drift).
+func TestActionFilter_failClosedDefaults(t *testing.T) {
+	result := buildMockActionsResult("MCPActions", []mockAction{
+		{Plugin: "jira", Action: "create_issue", Score: "0.020"},
+		{Plugin: "gitlab", Action: "create_mr", Score: "0.020"},
+	})
+
+	for _, tc := range []struct {
+		name    string
+		raw     string
+		present bool
+	}{
+		{"arg omitted from req.Args", "", false},
+		{"arg present but empty string", "", true},
+		{"arg present as literal \"null\"", "null", true},
+		{"arg present as malformed JSON", "{not-json", true},
+		{"arg present as JSON null literal via unmarshal", "null", true},
+		{"arg present as empty array []", "[]", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			availableTools := parseAllowedTools(tc.raw, tc.present)
+			if availableTools == nil {
+				t.Fatalf("parsing must yield non-nil empty map (fail-closed), got nil")
+			}
+			tools := extractToolNames(result, "MCPActions", actionFilter{
+				minScore: defaultMinPrepareScore, availableTools: availableTools,
+			})
+			if len(tools) != 0 {
+				t.Errorf("expected 0 tools (fail-closed), got %d: %v", len(tools), tools)
+			}
+		})
+	}
+}
+
+// TestActionFilter_explicitPaletteIsHonoured proves the only path that
+// opens the gate is an explicit JSON array of FQNs — the production
+// happy path. Anchors the fail-closed-by-default invariant by showing
+// the inverse: the gate opens exactly when the host sent a real palette.
+func TestActionFilter_explicitPaletteIsHonoured(t *testing.T) {
+	result := buildMockActionsResult("MCPActions", []mockAction{
+		{Plugin: "jira", Action: "create_issue", Score: "0.020"},
+		{Plugin: "gitlab", Action: "create_mr", Score: "0.020"},
+	})
+	availableTools := parseAllowedTools(`["jira.create_issue"]`, true)
+	tools := extractToolNames(result, "MCPActions", actionFilter{
+		minScore: defaultMinPrepareScore, availableTools: availableTools,
+	})
+	if len(tools) != 1 || tools[0] != "jira.create_issue" {
+		t.Errorf("explicit palette must be honoured strictly, got %v", tools)
+	}
+}
+
+func TestActionFilter_availableTools_nilPaletteIsNoFilter(t *testing.T) {
+	// nil palette = no per-session filter; backwards-compatible behaviour
+	// for callers that pass actionFilter{minScore: …} without setting the
+	// availableTools field.
+	result := buildMockActionsResult("MCPActions", []mockAction{
+		{Plugin: "jira", Action: "create_issue", Score: "0.020"},
+		{Plugin: "gitlab", Action: "create_mr", Score: "0.020"},
+	})
+	filter := actionFilter{
+		minScore:       defaultMinPrepareScore,
+		availableTools: nil,
+	}
+	tools := extractToolNames(result, "MCPActions", filter)
+	if len(tools) != 2 {
+		t.Errorf("expected nil palette to be no-filter (got %d): %v", len(tools), tools)
+	}
+}
+
+// TestActionFilter_invariant_chokepoint_applies_to_candidates pins the
+// "single chokepoint" property: extractToolCandidatesFromResult MUST honour
+// the same actionFilter as extractToolNames. A regression here would let
+// the structured slice carry tools the names slice has already filtered
+// out — exactly the kind of drift the chokepoint refactor eliminates.
+func TestActionFilter_invariant_chokepoint_applies_to_candidates(t *testing.T) {
+	result := buildMockActionsResult("MCPActions", []mockAction{
+		{Plugin: "jira", Action: "create_issue", Score: "0.020"},
+		{Plugin: "jira", Action: "admin_purge", Score: "0.030"},
+	})
+	filter := actionFilter{
+		minScore: defaultMinPrepareScore,
+		availableTools: map[string]struct{}{
+			"jira.create_issue": {},
+		},
+	}
+	names := extractToolNames(result, "MCPActions", filter)
+	candidates := extractToolCandidatesFromResult(result, "MCPActions", filter)
+
+	if len(names) != len(candidates) {
+		t.Fatalf("invariant violated: names=%d candidates=%d", len(names), len(candidates))
+	}
+	for i, n := range names {
+		if candidates[i].ToolName != n {
+			t.Errorf("position %d: names=%q candidates=%q", i, n, candidates[i].ToolName)
+		}
 	}
 }
 

@@ -192,9 +192,21 @@ func (h *WeaviateHandler) handleHealth(w http.ResponseWriter, _ *http.Request) {
 }
 
 // debugPrepareRequest is the body of POST /api/v1/debug/prepare.
+//
+// `allowed_tools` mirrors the per-session palette the orchestrator's
+// ContextArgProvider injects at runtime. Setting it here lets an operator
+// rehearse the post-retrieval chokepoint filter for an arbitrary FQN list
+// without standing up a full session — useful for "what would Claude Code
+// see if the session palette is X?" investigations.
+//
+// Defense-safe default: omitting the field fails CLOSED, exactly like
+// production. matched_tools will be empty; inspect actions_top in the
+// response to see the unfiltered score-passing retrieval, and pass an
+// explicit allowed_tools list to test the palette filter behaviour.
 type debugPrepareRequest struct {
 	Text           string   `json:"text"`
 	AllowedPlugins []string `json:"allowed_plugins,omitempty"`
+	AllowedTools   []string `json:"allowed_tools,omitempty"`
 }
 
 // debugPrepareResponse exposes the full pre/post-translator pipeline so
@@ -215,6 +227,12 @@ type debugPrepareResponse struct {
 	WeaviateMs       float64            `json:"weaviate_ms"`
 	KnowledgeQuery   string             `json:"knowledge_query"`
 	ActionsCollWhere string             `json:"actions_where,omitempty"`
+	// FilteredOutByPalette enumerates FQNs that passed the score threshold
+	// in the raw retrieval (visible under actions_top) but were rejected by
+	// the allowed_tools palette. Empty / omitted when no palette was set or
+	// nothing was filtered — populated only when the operator supplied
+	// allowed_tools, so this field doubles as proof the palette filter ran.
+	FilteredOutByPalette []string `json:"filtered_out_by_palette,omitempty"`
 }
 
 type debugScoredEntry struct {
@@ -281,21 +299,64 @@ func (h *WeaviateHandler) handleDebugPrepare(w http.ResponseWriter, r *http.Requ
 	glossaryResult, _ := h.searchCollection(ctx, h.glossaryCollection, glossaryFields, searchText, 5, nil)
 	weaviateMs := float64(time.Since(wStart).Microseconds()) / 1000.0
 
-	tools := extractToolNamesAboveScore(actionsResult, h.actionsCollection, h.minPrepareScore)
+	// Apply the same filter chokepoint as the production prepare(): minScore
+	// baseline + per-session allowed_tools palette, defense-safe default.
+	//
+	//   - field omitted (body.AllowedTools is nil) → fail-closed empty map →
+	//     every retrieved action filtered out. Mirrors the production rule
+	//     so operator rehearsals see the same outcome as a real session
+	//     where the orchestrator never injected the arg.
+	//   - field [] (non-nil empty) → fail-closed (same outcome).
+	//   - field [x, y] → strict subset.
+	//
+	// To inspect raw retrieval without palette filtering, read actions_top
+	// in the response — it carries the score-passing items independently of
+	// the palette result.
+	availableTools := make(map[string]struct{}, len(body.AllowedTools))
+	for _, name := range body.AllowedTools {
+		availableTools[name] = struct{}{}
+	}
+	// Use minPrepareScoreTools (the per-collection tools cutoff) to match
+	// production prepare(). The legacy h.minPrepareScore is the global
+	// fallback Configure leaves on minPrepareScoreTools when the operator
+	// has not split them, so reading the per-collection field stays
+	// equivalent on default configs and stays correct when an operator
+	// tightens just the tools threshold (the common case post-RFC #249).
+	filter := actionFilter{minScore: h.minPrepareScoreTools, availableTools: availableTools}
+	tools := extractToolNames(actionsResult, h.actionsCollection, filter)
+
+	// Surface what the palette rejected. Operators see "score said yes,
+	// palette said no" — the defense-in-depth audit trail in one field.
+	// availableTools is always non-nil after the defense-safe default;
+	// compute filtered_out unconditionally.
+	var filteredOut []string
+	{
+		matched := make(map[string]struct{}, len(tools))
+		for _, t := range tools {
+			matched[t] = struct{}{}
+		}
+		scoreOnlyFilter := actionFilter{minScore: h.minPrepareScoreTools}
+		for _, fqn := range extractToolNames(actionsResult, h.actionsCollection, scoreOnlyFilter) {
+			if _, kept := matched[fqn]; !kept {
+				filteredOut = append(filteredOut, fqn)
+			}
+		}
+	}
 
 	resp := debugPrepareResponse{
-		Original:         body.Text,
-		SearchText:       searchText,
-		Translated:       searchText != body.Text,
-		TranslatorMs:     translatorMs,
-		MinPrepareScore:  h.minPrepareScore,
-		MatchedTools:     tools,
-		ActionsTop:       extractScoredActions(actionsResult, h.actionsCollection),
-		KnowledgeTop:     extractScoredKnowledge(knowledgeResult, h.knowledgeCollection),
-		GlossaryTop:      extractScoredGlossary(glossaryResult, h.glossaryCollection),
-		WeaviateMs:       weaviateMs,
-		KnowledgeQuery:   knowledgeQuery,
-		ActionsCollWhere: whereLabel,
+		Original:             body.Text,
+		SearchText:           searchText,
+		Translated:           searchText != body.Text,
+		TranslatorMs:         translatorMs,
+		MinPrepareScore:      h.minPrepareScoreTools,
+		MatchedTools:         tools,
+		ActionsTop:           extractScoredActions(actionsResult, h.actionsCollection),
+		KnowledgeTop:         extractScoredKnowledge(knowledgeResult, h.knowledgeCollection),
+		GlossaryTop:          extractScoredGlossary(glossaryResult, h.glossaryCollection),
+		WeaviateMs:           weaviateMs,
+		KnowledgeQuery:       knowledgeQuery,
+		ActionsCollWhere:     whereLabel,
+		FilteredOutByPalette: filteredOut,
 	}
 
 	w.Header().Set("Content-Type", "application/json")

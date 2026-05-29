@@ -500,11 +500,11 @@ func TestConfigure_httpRequiresToken(t *testing.T) {
 func TestConfigure_customCollectionNames(t *testing.T) {
 	h := &WeaviateHandler{}
 	cfg, _ := json.Marshal(map[string]interface{}{
-		"host":                  weaviateHost(),
-		"collection":            testClass,
-		"actions_collection":    "CustomActions",
-		"knowledge_collection":  "CustomKnowledge",
-		"auto_create_schema":    false,
+		"host":                 weaviateHost(),
+		"collection":           testClass,
+		"actions_collection":   "CustomActions",
+		"knowledge_collection": "CustomKnowledge",
+		"auto_create_schema":   false,
 	})
 	if err := h.Configure(string(cfg)); err != nil {
 		t.Fatalf("Configure: %v", err)
@@ -663,12 +663,12 @@ func TestConfigure_autoCreateSchema(t *testing.T) {
 
 	h := &WeaviateHandler{}
 	cfg, _ := json.Marshal(map[string]interface{}{
-		"host":                  weaviateHost(),
-		"scheme":                "http",
-		"collection":            testClass,
-		"actions_collection":    tmpActions,
-		"knowledge_collection":  tmpKnowledge,
-		"auto_create_schema":    true,
+		"host":                 weaviateHost(),
+		"scheme":               "http",
+		"collection":           testClass,
+		"actions_collection":   tmpActions,
+		"knowledge_collection": tmpKnowledge,
+		"auto_create_schema":   true,
 	})
 	if err := h.Configure(string(cfg)); err != nil {
 		t.Fatalf("Configure: %v", err)
@@ -1468,10 +1468,28 @@ func TestPrepare_dualCollection(t *testing.T) {
 func TestPrepare_returnsRelevantTools(t *testing.T) {
 	h := newHandler(t)
 
+	// Post fail-closed-default pivot, prepare REQUIRES an explicit
+	// allowed_tools palette injected by the orchestrator. Earlier
+	// integration tests in this suite mutate MCPActions (sync_actions
+	// upserts, pre-deletions), so the seed jira/gitlab actions may
+	// have been replaced by the time this test runs. Sync the FQNs we
+	// will assert on directly so the test owns its data.
+	seedTestPluginActions(t, h, "prepare-test-plugin", []syncActionEntry{
+		{Name: "create_issue", Description: "Create a new issue in the Jira project tracker"},
+		{Name: "list_issues", Description: "List all open issues in a Jira project"},
+	})
+
+	allowedTools, _ := json.Marshal([]string{
+		"prepare-test-plugin.create_issue",
+		"prepare-test-plugin.list_issues",
+	})
 	resp := h.Execute(plugin.Request{
 		ID:     "prepare-tools",
 		Action: "prepare",
-		Args:   map[string]string{"text": "Create a new issue in the Jira project tracker list open issues"},
+		Args: map[string]string{
+			"text":          "Create a new issue in the Jira project tracker list open issues",
+			"allowed_tools": string(allowedTools),
+		},
 	})
 
 	if resp.Error != "" {
@@ -1609,10 +1627,23 @@ func TestPrepare_structuredJSONFormat(t *testing.T) {
 func TestPrepare_knowledgeContextAndRelevantTools(t *testing.T) {
 	h := newHandler(t)
 
+	// Self-seed for the same cross-test-pollution reason as
+	// TestPrepare_returnsRelevantTools above.
+	seedTestPluginActions(t, h, "prepare-blocks-plugin", []syncActionEntry{
+		{Name: "create_issue", Description: "Create a new issue in the Jira project tracker"},
+		{Name: "list_issues", Description: "List all open issues in a Jira project"},
+	})
+	allowedTools, _ := json.Marshal([]string{
+		"prepare-blocks-plugin.create_issue",
+		"prepare-blocks-plugin.list_issues",
+	})
 	resp := h.Execute(plugin.Request{
 		ID:     "prepare-blocks",
 		Action: "prepare",
-		Args:   map[string]string{"text": "jira issue workflow"},
+		Args: map[string]string{
+			"text":          "jira issue workflow",
+			"allowed_tools": string(allowedTools),
+		},
 	})
 
 	if resp.Error != "" {
@@ -1633,6 +1664,25 @@ func TestPrepare_knowledgeContextAndRelevantTools(t *testing.T) {
 	if result.RelevantTools == nil {
 		t.Error("relevant_tools should not be nil")
 	}
+}
+
+// seedTestPluginActions syncs the given action descriptors under pluginName
+// and waits for the background sync worker to drain. Used by integration
+// tests that need MCPActions data that survives cross-test mutation by
+// earlier sync_actions tests in the suite.
+func seedTestPluginActions(t *testing.T, h *WeaviateHandler, pluginName string, actions []syncActionEntry) {
+	t.Helper()
+	payload, _ := json.Marshal(syncActionsPayload{PluginName: pluginName, Actions: actions})
+	resp := h.Execute(plugin.Request{
+		ID:     "seed-" + pluginName,
+		Action: "sync_actions",
+		Args:   map[string]string{"payload": string(payload)},
+	})
+	if resp.Error != "" {
+		t.Fatalf("seed sync for %s: %s", pluginName, resp.Error)
+	}
+	waitSyncDrain(t, h, 10*time.Second)
+	time.Sleep(300 * time.Millisecond)
 }
 
 // ---------------------------------------------------------------------------
@@ -1743,8 +1793,8 @@ func TestAskKnowledge_allowedPlugins(t *testing.T) {
 		ID:     "ask-allowed",
 		Action: "ask_knowledge",
 		Args: map[string]string{
-			"query":            "create issue merge request pipelines",
-			"allowed_plugins":  string(allowed),
+			"query":           "create issue merge request pipelines",
+			"allowed_plugins": string(allowed),
 		},
 	})
 
@@ -1809,6 +1859,43 @@ func TestCapabilities_includesAskKnowledge(t *testing.T) {
 	}
 	if !actions["ask_knowledge"] {
 		t.Error("missing ask_knowledge action in capabilities")
+	}
+}
+
+// TestCapabilities_injectContextArgs pins the declarative context-arg path:
+// `allowed_plugins` is orchestrator-managed and must be delivered via
+// InjectContextArgs, not via the LLM-visible Parameters list. This guards
+// against an accidental revert of the consolidation that routed the value
+// through the host's ContextArgProvider registry instead of an open
+// parameter on the tool schema.
+func TestCapabilities_injectContextArgs(t *testing.T) {
+	caps := (&WeaviateHandler{}).Capabilities()
+
+	byName := make(map[string]plugin.ActionMsg, len(caps.Actions))
+	for _, a := range caps.Actions {
+		byName[a.Name] = a
+	}
+
+	for _, name := range []string{"prepare", "ask_knowledge"} {
+		action, ok := byName[name]
+		if !ok {
+			t.Fatalf("action %q missing from capabilities", name)
+		}
+		found := false
+		for _, ica := range action.InjectContextArgs {
+			if ica == "allowed_plugins" {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("action %q: InjectContextArgs missing %q (got %v)", name, "allowed_plugins", action.InjectContextArgs)
+		}
+		for _, p := range action.Parameters {
+			if p.Name == "allowed_plugins" {
+				t.Errorf("action %q: %q is now an InjectContextArg and must not also appear in Parameters", name, "allowed_plugins")
+			}
+		}
 	}
 }
 
