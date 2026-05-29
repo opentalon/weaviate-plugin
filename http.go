@@ -197,8 +197,12 @@ func (h *WeaviateHandler) handleHealth(w http.ResponseWriter, _ *http.Request) {
 // ContextArgProvider injects at runtime. Setting it here lets an operator
 // rehearse the post-retrieval chokepoint filter for an arbitrary FQN list
 // without standing up a full session — useful for "what would Claude Code
-// see if the session palette is X?" investigations. Omit the field to
-// disable the palette filter (legacy behaviour).
+// see if the session palette is X?" investigations.
+//
+// Defense-safe default: omitting the field fails CLOSED, exactly like
+// production. matched_tools will be empty; inspect actions_top in the
+// response to see the unfiltered score-passing retrieval, and pass an
+// explicit allowed_tools list to test the palette filter behaviour.
 type debugPrepareRequest struct {
 	Text           string   `json:"text"`
 	AllowedPlugins []string `json:"allowed_plugins,omitempty"`
@@ -295,19 +299,20 @@ func (h *WeaviateHandler) handleDebugPrepare(w http.ResponseWriter, r *http.Requ
 	glossaryResult, _ := h.searchCollection(ctx, h.glossaryCollection, glossaryFields, searchText, 5, nil)
 	weaviateMs := float64(time.Since(wStart).Microseconds()) / 1000.0
 
-	// Apply the same filter chokepoint the production prepare() runs:
-	// minScore baseline + (optional) per-session allowed_tools palette.
+	// Apply the same filter chokepoint as the production prepare(): minScore
+	// baseline + per-session allowed_tools palette, defense-safe default.
 	//
-	// JSON-decode semantics matter here and mirror production:
-	//   • field omitted     → body.AllowedTools is nil      → no palette filter
-	//   • field is []       → body.AllowedTools is non-nil  → empty palette,
-	//                                                          everything filtered
-	//   • field is [x, y]   → palette enforced as a strict subset
+	//   - field omitted (body.AllowedTools is nil) → fail-closed empty map →
+	//     every retrieved action filtered out. Mirrors the production rule
+	//     so operator rehearsals see the same outcome as a real session
+	//     where the orchestrator never injected the arg.
+	//   - field [] (non-nil empty) → fail-closed (same outcome).
+	//   - field [x, y] → strict subset.
 	//
-	// Checking len() > 0 (which would treat [] as "no filter") would diverge
-	// from production behaviour and silence the "session can call zero tools"
-	// negative test path.
-	var availableTools map[string]struct{}
+	// To inspect raw retrieval without palette filtering, read actions_top
+	// in the response — it carries the score-passing items independently of
+	// the palette result.
+	availableTools := make(map[string]struct{})
 	if body.AllowedTools != nil {
 		availableTools = make(map[string]struct{}, len(body.AllowedTools))
 		for _, name := range body.AllowedTools {

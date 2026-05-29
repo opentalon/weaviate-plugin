@@ -651,24 +651,26 @@ func (h *WeaviateHandler) prepare(req plugin.Request) plugin.Response {
 		_ = json.Unmarshal([]byte(v), &allowedPlugins)
 	}
 
-	// Parse allowed_tools (per-session FQN palette, applied post-retrieval
-	// inside the actionFilter chokepoint). Three host-side states map onto
-	// three filter behaviours:
-	//   - arg omitted ("" / missing) → no per-session palette known →
-	//     availableTools stays nil → palette filter is a no-op (fail-open;
-	//     the score filter alone applies)
-	//   - arg present as "[]" → fail-closed "session can call zero tools";
-	//     availableTools becomes a non-nil empty map and every retrieved
-	//     action is filtered out
-	//   - arg present as JSON array → strict subset enforcement
+	// Parse allowed_tools into the per-session FQN palette applied
+	// post-retrieval inside the actionFilter chokepoint. Defense-safe
+	// default: when the host does NOT inject the arg — or injects an
+	// unparseable / null value — every retrieved action is dropped.
 	//
-	// "null" is treated as "no palette" (== omitted) — a buggy host that
-	// marshals a nil Go slice into "null" would otherwise silently fall
-	// into the empty-map fail-closed branch via Unmarshal's zero-value
-	// path, silencing the LLM. The `list != nil` guard catches the same
-	// shape if a future JSON variant slips through the "null" string check.
-	// Malformed JSON also falls back to nil for the same fail-open reason.
-	var availableTools map[string]struct{}
+	//   - arg omitted / "" / "null" / malformed → fail-closed empty map →
+	//     every retrieved action filtered out. The fail-open alternative
+	//     would silently degrade a restricted session to "no filter"
+	//     whenever the orchestrator forgot to inject the arg (deploy
+	//     ordering, missing provider, config drift) — re-opening the
+	//     defense-in-depth gap the palette exists to close.
+	//   - arg present as "[]" → fail-closed empty map (same outcome).
+	//   - arg present as JSON array → strict subset enforcement.
+	//
+	// Deploy contract: opentalon-core ≥ the commit that adds the
+	// allowed_tools ContextArgProvider MUST be paired with this plugin.
+	// An older Core without the provider will leave the arg absent and
+	// every prepare() call will return zero tools. This is intentional
+	// — failing closed beats silently dropping the gate.
+	availableTools := make(map[string]struct{})
 	if v, ok := req.Args["allowed_tools"]; ok && v != "" && v != "null" {
 		var list []string
 		if err := json.Unmarshal([]byte(v), &list); err == nil && list != nil {

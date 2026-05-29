@@ -119,44 +119,80 @@ func TestActionFilter_availableTools_emptyPaletteFiltersEverything(t *testing.T)
 	}
 }
 
-// TestActionFilter_availableTools_jsonNullIsTreatedAsNil pins the host-side
-// edge case: a buggy orchestrator that marshals a nil Go slice into the
-// literal JSON `null` (instead of omitting the arg) MUST land in the
-// fail-open "no palette" branch, not the fail-closed empty-map branch.
-// Without the explicit `"null"` and `list != nil` guards in prepare(),
-// json.Unmarshal sets `list = nil`, the subsequent `make` builds a
-// non-nil empty map, and every retrieved tool is silently filtered out
-// → the LLM sees zero tools without an explicit operator decision.
-// This test exercises the parsing path that the production handler uses.
-func TestActionFilter_availableTools_jsonNullIsTreatedAsNil(t *testing.T) {
-	// Mirror the handler's parsing block — if either guard is removed,
-	// the resulting filter would block everything below.
-	var availableTools map[string]struct{}
-	v := "null"
-	if v != "" && v != "null" {
+// parseAllowedTools mirrors the production handler's parsing block.
+// Kept as a small helper so the defense-safe edge-case tests below
+// exercise the exact same logic that handler.go's prepare() applies
+// without spinning up a full Execute() round-trip. Any change to the
+// production parse rule must mirror here (or vice versa).
+func parseAllowedTools(raw string, present bool) map[string]struct{} {
+	availableTools := make(map[string]struct{})
+	if present && raw != "" && raw != "null" {
 		var list []string
-		if err := json.Unmarshal([]byte(v), &list); err == nil && list != nil {
+		if err := json.Unmarshal([]byte(raw), &list); err == nil && list != nil {
 			availableTools = make(map[string]struct{}, len(list))
 			for _, name := range list {
 				availableTools[name] = struct{}{}
 			}
 		}
 	}
-	if availableTools != nil {
-		t.Fatalf("\"null\" must yield nil availableTools (no palette / no filter), got non-nil: %v", availableTools)
-	}
+	return availableTools
+}
 
-	// Confirm the filter built from that parse path is in fact a no-op
-	// when fed a real retrieval result.
+// TestActionFilter_failClosedDefaults pins the defense-safe contract on
+// the parsing path: every state that is NOT a well-formed JSON array of
+// FQNs collapses to a non-nil empty map → the filter blocks every
+// retrieved action. Without this, a missing/null/malformed allowed_tools
+// would silently degrade a restricted session to "no filter" the moment
+// the orchestrator forgot to inject the arg (deploy ordering, missing
+// provider, config drift).
+func TestActionFilter_failClosedDefaults(t *testing.T) {
 	result := buildMockActionsResult("MCPActions", []mockAction{
 		{Plugin: "jira", Action: "create_issue", Score: "0.020"},
 		{Plugin: "gitlab", Action: "create_mr", Score: "0.020"},
 	})
+
+	for _, tc := range []struct {
+		name    string
+		raw     string
+		present bool
+	}{
+		{"arg omitted from req.Args", "", false},
+		{"arg present but empty string", "", true},
+		{"arg present as literal \"null\"", "null", true},
+		{"arg present as malformed JSON", "{not-json", true},
+		{"arg present as JSON null literal via unmarshal", "null", true},
+		{"arg present as empty array []", "[]", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			availableTools := parseAllowedTools(tc.raw, tc.present)
+			if availableTools == nil {
+				t.Fatalf("parsing must yield non-nil empty map (fail-closed), got nil")
+			}
+			tools := extractToolNames(result, "MCPActions", actionFilter{
+				minScore: defaultMinPrepareScore, availableTools: availableTools,
+			})
+			if len(tools) != 0 {
+				t.Errorf("expected 0 tools (fail-closed), got %d: %v", len(tools), tools)
+			}
+		})
+	}
+}
+
+// TestActionFilter_explicitPaletteIsHonoured proves the only path that
+// opens the gate is an explicit JSON array of FQNs — the production
+// happy path. Anchors the fail-closed-by-default invariant by showing
+// the inverse: the gate opens exactly when the host sent a real palette.
+func TestActionFilter_explicitPaletteIsHonoured(t *testing.T) {
+	result := buildMockActionsResult("MCPActions", []mockAction{
+		{Plugin: "jira", Action: "create_issue", Score: "0.020"},
+		{Plugin: "gitlab", Action: "create_mr", Score: "0.020"},
+	})
+	availableTools := parseAllowedTools(`["jira.create_issue"]`, true)
 	tools := extractToolNames(result, "MCPActions", actionFilter{
 		minScore: defaultMinPrepareScore, availableTools: availableTools,
 	})
-	if len(tools) != 2 {
-		t.Errorf("expected \"null\" path to behave as no-filter (2 tools), got %d: %v", len(tools), tools)
+	if len(tools) != 1 || tools[0] != "jira.create_issue" {
+		t.Errorf("explicit palette must be honoured strictly, got %v", tools)
 	}
 }
 
