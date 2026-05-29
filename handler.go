@@ -19,6 +19,19 @@ import (
 	wmodels "github.com/weaviate/weaviate/entities/models"
 )
 
+// Orchestrator context-arg wire names. Declared as constants here so a
+// typo at any of the four call sites (Capability InjectContextArgs +
+// Execute-time req.Args reads) fails to compile rather than silently
+// drifting and leaving the arg unread. Canonical cross-repo source of
+// truth is opentalon/pkg/plugin/contextargs - kept as local consts here
+// to avoid pinning this plugin to an unreleased opentalon revision
+// while the matching PR is in flight. Bump in lock-step with that
+// package; both sides MUST agree on the wire name.
+const (
+	ctxArgAllowedPlugins = "allowed_plugins"
+	ctxArgAllowedTools   = "allowed_tools"
+)
+
 // Default collection names for the knowledge-augmented RAG system.
 const (
 	DefaultActionsCollection   = "MCPActions"
@@ -399,7 +412,7 @@ func (h *WeaviateHandler) Capabilities() plugin.CapabilitiesMsg {
 				// invariant `knowledge_context.tools ⊆ session.tools_available`
 				// so RAG retrieval cannot inject a tool the current session
 				// has no permission to call.
-				InjectContextArgs: []string{"allowed_plugins", "allowed_tools"},
+				InjectContextArgs: []string{ctxArgAllowedPlugins, ctxArgAllowedTools},
 			},
 			{
 				Name:        "sync_actions",
@@ -435,7 +448,7 @@ func (h *WeaviateHandler) Capabilities() plugin.CapabilitiesMsg {
 					{Name: "limit", Description: "Maximum results per collection (default 3)", Type: "integer", Required: false},
 				},
 				// allowed_plugins is orchestrator-managed context (see prepare above).
-				InjectContextArgs: []string{"allowed_plugins"},
+				InjectContextArgs: []string{ctxArgAllowedPlugins},
 			},
 			{
 				Name:        "search_instructions",
@@ -647,7 +660,7 @@ func (h *WeaviateHandler) prepare(req plugin.Request) plugin.Response {
 	// Parse allowed_plugins (profile-level allowlist, applied as the
 	// MCPActions GraphQL WHERE filter so search cost stays bounded).
 	var allowedPlugins []string
-	if v, ok := req.Args["allowed_plugins"]; ok && v != "" {
+	if v, ok := req.Args[ctxArgAllowedPlugins]; ok && v != "" {
 		_ = json.Unmarshal([]byte(v), &allowedPlugins)
 	}
 
@@ -671,7 +684,7 @@ func (h *WeaviateHandler) prepare(req plugin.Request) plugin.Response {
 	// every prepare() call will return zero tools. This is intentional
 	// — failing closed beats silently dropping the gate.
 	availableTools := make(map[string]struct{})
-	if v, ok := req.Args["allowed_tools"]; ok && v != "" && v != "null" {
+	if v, ok := req.Args[ctxArgAllowedTools]; ok && v != "" && v != "null" {
 		var list []string
 		if err := json.Unmarshal([]byte(v), &list); err == nil && list != nil {
 			availableTools = make(map[string]struct{}, len(list))
@@ -973,7 +986,7 @@ func (h *WeaviateHandler) askKnowledge(req plugin.Request) plugin.Response {
 			WithPath([]string{"pluginName"}).
 			WithOperator(filters.Equal).
 			WithValueText(p)
-	} else if v, ok := req.Args["allowed_plugins"]; ok && v != "" {
+	} else if v, ok := req.Args[ctxArgAllowedPlugins]; ok && v != "" {
 		var allowedPlugins []string
 		if err := json.Unmarshal([]byte(v), &allowedPlugins); err == nil && len(allowedPlugins) > 0 {
 			actionsWhere = filters.Where().
