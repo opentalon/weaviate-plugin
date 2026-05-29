@@ -212,7 +212,7 @@ func TestExtractToolCandidatesFromResult_buildsPluginDotAction(t *testing.T) {
 		{"pluginName": "weaviate", "actionName": "ask_knowledge", "_additional": mkScore("0.10")}, // below
 		{"pluginName": "timly", "actionName": "show-item", "_additional": mkScore("0.60")},
 	}
-	got := extractToolCandidatesFromResult(fakeResult("MCPActions", items), "MCPActions", 0.25)
+	got := extractToolCandidatesFromResult(fakeResult("MCPActions", items), "MCPActions", actionFilter{minScore: 0.25})
 	if len(got) != 2 {
 		t.Fatalf("got %d tool candidates, want 2", len(got))
 	}
@@ -228,7 +228,7 @@ func TestExtractToolCandidatesFromResult_buildsPluginDotAction(t *testing.T) {
 }
 
 func TestExtractToolCandidatesFromResult_emptyClassReturnsNil(t *testing.T) {
-	got := extractToolCandidatesFromResult(fakeResult("MCPActions", nil), "MCPActions", 0.0)
+	got := extractToolCandidatesFromResult(fakeResult("MCPActions", nil), "MCPActions", actionFilter{})
 	if got != nil {
 		t.Errorf("empty class slice must yield nil, got %+v", got)
 	}
@@ -240,7 +240,7 @@ func TestExtractToolCandidatesFromResult_dropsItemWithoutPluginOrActionName(t *t
 		{"actionName": "list-items", "_additional": mkScore("0.9")}, // missing plugin
 		{"pluginName": "timly", "actionName": "show-item", "_additional": mkScore("0.9")},
 	}
-	got := extractToolCandidatesFromResult(fakeResult("MCPActions", items), "MCPActions", 0.0)
+	got := extractToolCandidatesFromResult(fakeResult("MCPActions", items), "MCPActions", actionFilter{})
 	if len(got) != 1 || got[0].ToolName != "timly.show-item" {
 		t.Errorf("tool candidates = %+v, want exactly one timly.show-item entry", got)
 	}

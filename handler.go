@@ -392,11 +392,14 @@ func (h *WeaviateHandler) Capabilities() plugin.CapabilitiesMsg {
 				Parameters: []plugin.ParameterMsg{
 					{Name: "text", Description: "Raw user message (injected by the orchestrator)", Type: "string", Required: true},
 				},
-				// allowed_plugins is orchestrator-managed context, not an LLM-facing
-				// input. Declaring it via InjectContextArgs (instead of Parameters)
-				// routes it through the registered ContextArgProvider and keeps it
-				// out of the LLM-visible tool schema.
-				InjectContextArgs: []string{"allowed_plugins"},
+				// allowed_plugins (profile-level allowlist) and allowed_tools
+				// (per-session FQN palette) are orchestrator-managed context,
+				// not LLM-facing inputs. Both are delivered via the host's
+				// ContextArgProvider registry. allowed_tools enforces the
+				// invariant `knowledge_context.tools ⊆ session.tools_available`
+				// so RAG retrieval cannot inject a tool the current session
+				// has no permission to call.
+				InjectContextArgs: []string{"allowed_plugins", "allowed_tools"},
 			},
 			{
 				Name:        "sync_actions",
@@ -641,10 +644,31 @@ func (h *WeaviateHandler) prepare(req plugin.Request) plugin.Response {
 	searchText, translatorEvent := h.translateQuery(ctx, text, "prepare")
 	translatorEvents := translatorEventsOf(translatorEvent)
 
-	// Parse allowed_plugins filter if provided by the orchestrator.
+	// Parse allowed_plugins (profile-level allowlist, applied as the
+	// MCPActions GraphQL WHERE filter so search cost stays bounded).
 	var allowedPlugins []string
 	if v, ok := req.Args["allowed_plugins"]; ok && v != "" {
 		_ = json.Unmarshal([]byte(v), &allowedPlugins)
+	}
+
+	// Parse allowed_tools (per-session FQN palette, applied post-retrieval
+	// inside the actionFilter chokepoint). nil = no per-session restriction;
+	// non-nil empty set = "session can call zero tools" → every retrieved
+	// action is filtered out. Empty/malformed JSON falls back to nil (=
+	// fail-open) so a buggy host can't accidentally silence the LLM.
+	var availableTools map[string]struct{}
+	if v, ok := req.Args["allowed_tools"]; ok && v != "" {
+		var list []string
+		if err := json.Unmarshal([]byte(v), &list); err == nil {
+			availableTools = make(map[string]struct{}, len(list))
+			for _, name := range list {
+				availableTools[name] = struct{}{}
+			}
+		}
+	}
+	actionsFilter := actionFilter{
+		minScore:       h.minPrepareScoreTools,
+		availableTools: availableTools,
 	}
 
 	// Search KnowledgeArticles with plugin-boosted query. Limit is
@@ -704,9 +728,11 @@ func (h *WeaviateHandler) prepare(req plugin.Request) plugin.Response {
 		})
 	}
 
-	// Extract relevant tool names (above score threshold) for system prompt filtering.
-	// The orchestrator uses this list to decide which tools to show the LLM.
-	tools := extractToolNamesAboveScore(actionsResult, h.actionsCollection, h.minPrepareScoreTools)
+	// Extract relevant tool names (post-filter chokepoint) for system prompt
+	// filtering. The orchestrator uses this list to decide which tools to
+	// show the LLM. The same filter feeds toolCandidates below so both
+	// outputs honour the session's allowed_tools palette.
+	tools := extractToolNames(actionsResult, h.actionsCollection, actionsFilter)
 
 	// When no real tools matched, return nil so the orchestrator shows ALL
 	// tools (relevantToolsActive=false). Only activate filtering when we
@@ -761,7 +787,7 @@ func (h *WeaviateHandler) prepare(req plugin.Request) plugin.Response {
 	}
 	var toolCandidates []ToolCandidate
 	if actionsErr == nil {
-		toolCandidates = extractToolCandidatesFromResult(actionsResult, h.actionsCollection, h.minPrepareScoreTools)
+		toolCandidates = extractToolCandidatesFromResult(actionsResult, h.actionsCollection, actionsFilter)
 	}
 
 	return marshalPrepareResponse(req.ID, prepareResponse{
@@ -811,26 +837,8 @@ func (h *WeaviateHandler) searchCollection(
 }
 
 
-// extractToolNamesAboveScore extracts "pluginName.actionName" strings from an
-// MCPActions GraphQL response, filtering out results below the given score threshold.
-func extractToolNamesAboveScore(result interface{}, className string, minScore float64) []string {
-	items := extractItems(result, className)
-	if len(items) == 0 {
-		return []string{}
-	}
-	tools := make([]string, 0, len(items))
-	for _, obj := range items {
-		if !aboveScore(obj, minScore) {
-			continue
-		}
-		pluginName, _ := obj["pluginName"].(string)
-		actionName, _ := obj["actionName"].(string)
-		if pluginName != "" && actionName != "" {
-			tools = append(tools, pluginName+"."+actionName)
-		}
-	}
-	return tools
-}
+// MCPActions extractors (extractToolNames, extractToolCandidatesFromResult)
+// live in candidates.go and share the actionFilter chokepoint.
 
 // formatItemsCompact formats pre-extracted items above the score threshold as
 // compact text (title + content only). Returns "" when no items pass.

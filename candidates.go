@@ -137,32 +137,82 @@ func extractGlossaryCandidates(items []map[string]interface{}, minScore float64)
 	return out
 }
 
-// extractToolCandidatesFromResult walks the GraphQL response for the
-// MCPActions collection and produces ranked ToolCandidate entries.
-// Items below minScore are dropped (matches extractToolNamesAboveScore)
-// so the orchestrator sees the same population the legacy
-// relevant_tools slice did, just with scores attached.
-func extractToolCandidatesFromResult(result interface{}, className string, minScore float64) []ToolCandidate {
-	items := extractItems(result, className)
-	if len(items) == 0 {
-		return nil
+// actionFilter is the single chokepoint for MCPActions retrieval filtering.
+// Every filter axis the prepare pipeline applies to a GraphQL result item
+// lives here:
+//
+//   - minScore         per-collection cutoff (configurable via
+//                      min_prepare_score_tools, defaulting to legacy)
+//   - availableTools   per-session tool palette (the host injects an
+//                      `allowed_tools` JSON array via the ContextArgProvider
+//                      registry; nil here means "no per-session filter")
+//
+// New axes (e.g. recency, tier-aware boosts) get a field on this struct,
+// not a second parallel filter loop in each extractor. The zero value
+// {minScore: 0, availableTools: nil} accepts every well-formed item, which
+// is the right default for callers that don't care (e.g. http.go's debug
+// endpoint pre-PR-3).
+type actionFilter struct {
+	minScore       float64
+	availableTools map[string]struct{}
+}
+
+func (f actionFilter) accept(pluginName, actionName string, item map[string]interface{}) bool {
+	if !aboveScore(item, f.minScore) {
+		return false
 	}
-	out := make([]ToolCandidate, 0, len(items))
-	for _, item := range items {
-		if !aboveScore(item, minScore) {
-			continue
+	if f.availableTools != nil {
+		fqn := pluginName + "." + actionName
+		if _, ok := f.availableTools[fqn]; !ok {
+			return false
 		}
+	}
+	return true
+}
+
+// walkRetrievedActions iterates the MCPActions GraphQL response and calls fn
+// for each item whose (plugin, action, score, palette) tuple passes the
+// filter. Single iteration point used by both name- and candidate-extractors
+// so a new filter axis lives in actionFilter, not in two parallel loops.
+func walkRetrievedActions(result interface{}, className string, filter actionFilter, fn func(pluginName, actionName string, item map[string]interface{})) {
+	for _, item := range extractItems(result, className) {
 		pluginName, _ := item["pluginName"].(string)
 		actionName, _ := item["actionName"].(string)
 		if pluginName == "" || actionName == "" {
 			continue
 		}
+		if !filter.accept(pluginName, actionName, item) {
+			continue
+		}
+		fn(pluginName, actionName, item)
+	}
+}
+
+// extractToolNames returns the "<plugin>.<action>" FQNs from an MCPActions
+// GraphQL result that pass the filter. Empty slice (not nil) on no matches —
+// callers downstream distinguish "filter ran, found nothing" (empty) from
+// "filter not active" (nil).
+func extractToolNames(result interface{}, className string, filter actionFilter) []string {
+	tools := []string{}
+	walkRetrievedActions(result, className, filter, func(p, a string, _ map[string]interface{}) {
+		tools = append(tools, p+"."+a)
+	})
+	return tools
+}
+
+// extractToolCandidatesFromResult walks the GraphQL response for the
+// MCPActions collection and produces ranked ToolCandidate entries through
+// the shared actionFilter chokepoint. PositionInResults is 1-indexed and
+// reflects the post-filter rank.
+func extractToolCandidatesFromResult(result interface{}, className string, filter actionFilter) []ToolCandidate {
+	var out []ToolCandidate
+	walkRetrievedActions(result, className, filter, func(p, a string, item map[string]interface{}) {
 		out = append(out, ToolCandidate{
-			ToolName:          pluginName + "." + actionName,
+			ToolName:          p + "." + a,
 			Score:             scoreOf(item),
 			PositionInResults: len(out) + 1,
 		})
-	}
+	})
 	if len(out) == 0 {
 		return nil
 	}
