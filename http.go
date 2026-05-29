@@ -312,12 +312,9 @@ func (h *WeaviateHandler) handleDebugPrepare(w http.ResponseWriter, r *http.Requ
 	// To inspect raw retrieval without palette filtering, read actions_top
 	// in the response — it carries the score-passing items independently of
 	// the palette result.
-	availableTools := make(map[string]struct{})
-	if body.AllowedTools != nil {
-		availableTools = make(map[string]struct{}, len(body.AllowedTools))
-		for _, name := range body.AllowedTools {
-			availableTools[name] = struct{}{}
-		}
+	availableTools := make(map[string]struct{}, len(body.AllowedTools))
+	for _, name := range body.AllowedTools {
+		availableTools[name] = struct{}{}
 	}
 	// Use minPrepareScoreTools (the per-collection tools cutoff) to match
 	// production prepare(). The legacy h.minPrepareScore is the global
@@ -330,8 +327,10 @@ func (h *WeaviateHandler) handleDebugPrepare(w http.ResponseWriter, r *http.Requ
 
 	// Surface what the palette rejected. Operators see "score said yes,
 	// palette said no" — the defense-in-depth audit trail in one field.
+	// availableTools is always non-nil after the defense-safe default;
+	// compute filtered_out unconditionally.
 	var filteredOut []string
-	if availableTools != nil {
+	{
 		matched := make(map[string]struct{}, len(tools))
 		for _, t := range tools {
 			matched[t] = struct{}{}

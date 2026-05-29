@@ -500,11 +500,11 @@ func TestConfigure_httpRequiresToken(t *testing.T) {
 func TestConfigure_customCollectionNames(t *testing.T) {
 	h := &WeaviateHandler{}
 	cfg, _ := json.Marshal(map[string]interface{}{
-		"host":                  weaviateHost(),
-		"collection":            testClass,
-		"actions_collection":    "CustomActions",
-		"knowledge_collection":  "CustomKnowledge",
-		"auto_create_schema":    false,
+		"host":                 weaviateHost(),
+		"collection":           testClass,
+		"actions_collection":   "CustomActions",
+		"knowledge_collection": "CustomKnowledge",
+		"auto_create_schema":   false,
 	})
 	if err := h.Configure(string(cfg)); err != nil {
 		t.Fatalf("Configure: %v", err)
@@ -663,12 +663,12 @@ func TestConfigure_autoCreateSchema(t *testing.T) {
 
 	h := &WeaviateHandler{}
 	cfg, _ := json.Marshal(map[string]interface{}{
-		"host":                  weaviateHost(),
-		"scheme":                "http",
-		"collection":            testClass,
-		"actions_collection":    tmpActions,
-		"knowledge_collection":  tmpKnowledge,
-		"auto_create_schema":    true,
+		"host":                 weaviateHost(),
+		"scheme":               "http",
+		"collection":           testClass,
+		"actions_collection":   tmpActions,
+		"knowledge_collection": tmpKnowledge,
+		"auto_create_schema":   true,
 	})
 	if err := h.Configure(string(cfg)); err != nil {
 		t.Fatalf("Configure: %v", err)
@@ -1468,10 +1468,22 @@ func TestPrepare_dualCollection(t *testing.T) {
 func TestPrepare_returnsRelevantTools(t *testing.T) {
 	h := newHandler(t)
 
+	// Post fail-closed-default pivot, prepare REQUIRES an explicit
+	// allowed_tools palette injected by the orchestrator. The integration
+	// test simulates the orchestrator side by passing the full seed
+	// MCPActions superset (see seedRAGData) — any FQN actually retrieved
+	// above the score threshold will then pass the chokepoint.
+	allowedTools, _ := json.Marshal([]string{
+		"jira.create_issue", "jira.list_issues",
+		"gitlab.create_mr", "gitlab.list_pipelines",
+	})
 	resp := h.Execute(plugin.Request{
 		ID:     "prepare-tools",
 		Action: "prepare",
-		Args:   map[string]string{"text": "Create a new issue in the Jira project tracker list open issues"},
+		Args: map[string]string{
+			"text":          "Create a new issue in the Jira project tracker list open issues",
+			"allowed_tools": string(allowedTools),
+		},
 	})
 
 	if resp.Error != "" {
@@ -1609,10 +1621,20 @@ func TestPrepare_structuredJSONFormat(t *testing.T) {
 func TestPrepare_knowledgeContextAndRelevantTools(t *testing.T) {
 	h := newHandler(t)
 
+	// See TestPrepare_returnsRelevantTools above for the rationale:
+	// fail-closed default requires explicit allowed_tools from the
+	// orchestrator, simulated here with the full seed superset.
+	allowedTools, _ := json.Marshal([]string{
+		"jira.create_issue", "jira.list_issues",
+		"gitlab.create_mr", "gitlab.list_pipelines",
+	})
 	resp := h.Execute(plugin.Request{
 		ID:     "prepare-blocks",
 		Action: "prepare",
-		Args:   map[string]string{"text": "jira issue workflow"},
+		Args: map[string]string{
+			"text":          "jira issue workflow",
+			"allowed_tools": string(allowedTools),
+		},
 	})
 
 	if resp.Error != "" {
@@ -1743,8 +1765,8 @@ func TestAskKnowledge_allowedPlugins(t *testing.T) {
 		ID:     "ask-allowed",
 		Action: "ask_knowledge",
 		Args: map[string]string{
-			"query":            "create issue merge request pipelines",
-			"allowed_plugins":  string(allowed),
+			"query":           "create issue merge request pipelines",
+			"allowed_plugins": string(allowed),
 		},
 	})
 

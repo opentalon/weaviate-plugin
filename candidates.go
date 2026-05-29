@@ -142,10 +142,10 @@ func extractGlossaryCandidates(items []map[string]interface{}, minScore float64)
 // lives here:
 //
 //   - minScore         per-collection cutoff (configurable via
-//                      min_prepare_score_tools, defaulting to legacy)
+//     min_prepare_score_tools, defaulting to legacy)
 //   - availableTools   per-session tool palette (the host injects an
-//                      `allowed_tools` JSON array via the ContextArgProvider
-//                      registry; nil here means "no per-session filter")
+//     `allowed_tools` JSON array via the ContextArgProvider
+//     registry; nil here means "no per-session filter")
 //
 // New axes (e.g. recency, tier-aware boosts) get a field on this struct,
 // not a second parallel filter loop in each extractor. The zero value

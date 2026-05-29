@@ -67,13 +67,13 @@ const MCPKnowledgeSourcePrefix = "mcp-knowledge:"
 
 // Config is the JSON config block passed via the Init RPC.
 type Config struct {
-	Host                string         `json:"host"`
-	Scheme              string         `json:"scheme"`
-	Collection          string         `json:"collection"`
-	ActionsCollection   string         `json:"actions_collection"`
-	KnowledgeCollection string         `json:"knowledge_collection"`
-	Fields              []string       `json:"fields"`
-	Limit               int            `json:"limit"`
+	Host                string   `json:"host"`
+	Scheme              string   `json:"scheme"`
+	Collection          string   `json:"collection"`
+	ActionsCollection   string   `json:"actions_collection"`
+	KnowledgeCollection string   `json:"knowledge_collection"`
+	Fields              []string `json:"fields"`
+	Limit               int      `json:"limit"`
 	// Per-collection ceilings for the `prepare` RAG fan-out. The orchestrator's
 	// downstream tier-budget (tier1_cap + tier2_cap) and per-turn knowledge cap
 	// can only fire when the upstream candidate pool exceeds them — when the
@@ -84,12 +84,12 @@ type Config struct {
 	PrepareKnowledgeLimit int            `json:"prepare_knowledge_limit"`
 	PrepareActionsLimit   int            `json:"prepare_actions_limit"`
 	PrepareGlossaryLimit  int            `json:"prepare_glossary_limit"`
-	AutoCreateSchema    *bool          `json:"auto_create_schema"`
-	HTTPAddr            string         `json:"http_addr"`
-	Token               string         `json:"token"`
-	Vectorizer          string         `json:"vectorizer"`
-	ModuleConfig        map[string]any `json:"module_config"`
-	MinPrepareScore     *float64       `json:"min_prepare_score"` // fallback applied when the per-collection knobs below are unset
+	AutoCreateSchema      *bool          `json:"auto_create_schema"`
+	HTTPAddr              string         `json:"http_addr"`
+	Token                 string         `json:"token"`
+	Vectorizer            string         `json:"vectorizer"`
+	ModuleConfig          map[string]any `json:"module_config"`
+	MinPrepareScore       *float64       `json:"min_prepare_score"` // fallback applied when the per-collection knobs below are unset
 	// Per-collection minimum-score gates for `prepare`. Tools, knowledge,
 	// and glossary often want different thresholds: the tools retriever
 	// can tolerate a permissive cut-off because the orchestrator ranks
@@ -102,8 +102,8 @@ type Config struct {
 	MinPrepareScoreTools     *float64 `json:"min_prepare_score_tools,omitempty"`
 	MinPrepareScoreKnowledge *float64 `json:"min_prepare_score_knowledge,omitempty"`
 	MinPrepareScoreGlossary  *float64 `json:"min_prepare_score_glossary,omitempty"`
-	Timeout             string         `json:"timeout"` // Weaviate HTTP client timeout as duration string (e.g. "2m", "90s"); default "2m"
-	GlossaryCollection string `json:"glossary_collection"`
+	Timeout                  string   `json:"timeout"` // Weaviate HTTP client timeout as duration string (e.g. "2m", "90s"); default "2m"
+	GlossaryCollection       string   `json:"glossary_collection"`
 	// Translator is the optional LibreTranslate-compatible query
 	// pre-processor. When enabled, non-target-language user queries are
 	// translated to TargetLang before they reach Weaviate, fixing
@@ -116,7 +116,7 @@ type Config struct {
 type syncJobKind int
 
 const (
-	syncJobActions  syncJobKind = iota
+	syncJobActions syncJobKind = iota
 	syncJobGlossary
 )
 
@@ -153,26 +153,26 @@ type syncStatusState struct {
 
 // WeaviateHandler implements plugin.Handler.
 type WeaviateHandler struct {
-	client              *weaviate.Client
-	collection          string
-	actionsCollection   string
-	knowledgeCollection string
-	glossaryCollection  string
-	fields              []string
-	limit               int
-	prepareKnowledgeLimit int
-	prepareActionsLimit   int
-	prepareGlossaryLimit  int
-	httpAddr            string
-	token               string
-	vectorizer          string
-	moduleConfig        map[string]any
+	client                   *weaviate.Client
+	collection               string
+	actionsCollection        string
+	knowledgeCollection      string
+	glossaryCollection       string
+	fields                   []string
+	limit                    int
+	prepareKnowledgeLimit    int
+	prepareActionsLimit      int
+	prepareGlossaryLimit     int
+	httpAddr                 string
+	token                    string
+	vectorizer               string
+	moduleConfig             map[string]any
 	minPrepareScore          float64
 	minPrepareScoreTools     float64
 	minPrepareScoreKnowledge float64
 	minPrepareScoreGlossary  float64
-	clientTimeout       time.Duration
-	translator          Translator
+	clientTimeout            time.Duration
+	translator               Translator
 
 	// Hash-based sync skip: avoid re-writing unchanged data to Weaviate.
 	actionHashes map[string]string // pluginName → last-seen hash from sync_actions
@@ -862,7 +862,6 @@ func (h *WeaviateHandler) searchCollection(
 
 	return builder.Do(ctx)
 }
-
 
 // MCPActions extractors (extractToolNames, extractToolCandidatesFromResult)
 // live in candidates.go and share the actionFilter chokepoint.
