@@ -388,6 +388,7 @@ func (h *WeaviateHandler) Capabilities() plugin.CapabilitiesMsg {
 					{Name: "limit", Description: "Maximum number of results (overrides config default)", Type: "integer", Required: false},
 					{Name: "fields", Description: "Comma-separated list of fields to return (overrides config default)", Type: "string", Required: false},
 				},
+				ReadOnly: true, // pure search — no state mutation
 			},
 			{
 				Name:        "hybrid_search",
@@ -398,6 +399,7 @@ func (h *WeaviateHandler) Capabilities() plugin.CapabilitiesMsg {
 					{Name: "limit", Description: "Maximum number of results (overrides config default)", Type: "integer", Required: false},
 					{Name: "fields", Description: "Comma-separated list of fields to return (overrides config default)", Type: "string", Required: false},
 				},
+				ReadOnly: true, // pure search — no state mutation
 			},
 			{
 				Name:        "prepare",
@@ -449,6 +451,12 @@ func (h *WeaviateHandler) Capabilities() plugin.CapabilitiesMsg {
 				},
 				// allowed_plugins is orchestrator-managed context (see prepare above).
 				InjectContextArgs: []string{ctxArgAllowedPlugins},
+				// Pure knowledge search — no state mutation → skip the confirmation gate.
+				ReadOnly: true,
+				// Pin to Tier 0 so the LLM can always call ask_knowledge directly
+				// (1-step, no get_tool_details promotion). This is the knowledge-pull
+				// lever, mirroring the always-on get_tool_details tool-pull lever.
+				AlwaysInclude: true,
 			},
 			{
 				Name:        "search_instructions",
@@ -458,6 +466,7 @@ func (h *WeaviateHandler) Capabilities() plugin.CapabilitiesMsg {
 					{Name: "plugin", Description: "Narrow results to a specific plugin (e.g. 'timly')", Type: "string", Required: false},
 					{Name: "limit", Description: "Maximum results (default 5)", Type: "integer", Required: false},
 				},
+				ReadOnly: true, // pure search — no state mutation
 			},
 			{
 				Name:        "sync_glossary",
@@ -470,6 +479,7 @@ func (h *WeaviateHandler) Capabilities() plugin.CapabilitiesMsg {
 				Name:        "sync_status",
 				Description: "Returns the current background sync worker status: queued, completed, and failed job counts.",
 				Parameters:  []plugin.ParameterMsg{},
+				ReadOnly:    true, // read-only status query
 			},
 			{
 				Name:        "refresh",
