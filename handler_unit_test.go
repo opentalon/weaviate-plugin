@@ -24,7 +24,7 @@ func TestCapabilities_readOnlyAndPinClassification(t *testing.T) {
 		byName[a.Name] = a
 	}
 
-	reads := []string{"search", "hybrid_search", "ask_knowledge", "search_instructions", "sync_status"}
+	reads := []string{"search", "hybrid_search", "ask_knowledge", "list_knowledge_titles", "search_instructions", "sync_status"}
 	writes := []string{"sync_actions", "ingest", "ingest_batch", "sync_glossary", "refresh"}
 
 	for _, name := range reads {
@@ -48,5 +48,42 @@ func TestCapabilities_readOnlyAndPinClassification(t *testing.T) {
 
 	if !byName["ask_knowledge"].AlwaysInclude {
 		t.Error("ask_knowledge must be AlwaysInclude (pinned to Tier 0 as the knowledge-pull lever)")
+	}
+}
+
+// TestCapabilities_knowledgeSlugAndCatalog pins the knowledge-access primitive's
+// surface: ask_knowledge exposes an exact-fetch `slug` param (and `query` is no
+// longer mandatory, since either alone is valid), and list_knowledge_titles is
+// declared so the orchestrator can render the always-on title catalog.
+// Pure in-memory assertion over Capabilities() — no Weaviate, runs every build.
+func TestCapabilities_knowledgeSlugAndCatalog(t *testing.T) {
+	caps := (&WeaviateHandler{}).Capabilities()
+
+	byName := make(map[string]plugin.ActionMsg, len(caps.Actions))
+	for _, a := range caps.Actions {
+		byName[a.Name] = a
+	}
+
+	// list_knowledge_titles exists (the catalog source the core renders).
+	if _, ok := byName["list_knowledge_titles"]; !ok {
+		t.Fatal("list_knowledge_titles action missing from capabilities")
+	}
+
+	// ask_knowledge: slug param present, query present but no longer required.
+	ask, ok := byName["ask_knowledge"]
+	if !ok {
+		t.Fatal("ask_knowledge action missing from capabilities")
+	}
+	params := make(map[string]plugin.ParameterMsg, len(ask.Parameters))
+	for _, p := range ask.Parameters {
+		params[p.Name] = p
+	}
+	if _, ok := params["slug"]; !ok {
+		t.Error("ask_knowledge must expose a `slug` param for exact-article fetch")
+	}
+	if q, ok := params["query"]; !ok {
+		t.Error("ask_knowledge must still expose a `query` param")
+	} else if q.Required {
+		t.Error("ask_knowledge `query` must be optional now that `slug` is an alternative")
 	}
 }

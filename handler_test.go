@@ -281,7 +281,7 @@ func TestCapabilities(t *testing.T) {
 	for _, a := range caps.Actions {
 		actions[a.Name] = true
 	}
-	for _, want := range []string{"search", "hybrid_search", "prepare", "sync_actions", "ingest", "ingest_batch", "sync_status", "refresh"} {
+	for _, want := range []string{"search", "hybrid_search", "prepare", "sync_actions", "ingest", "ingest_batch", "list_knowledge_titles", "sync_status", "refresh"} {
 		if !actions[want] {
 			t.Errorf("missing action %q", want)
 		}
@@ -1850,6 +1850,115 @@ func TestAskKnowledge_noResults(t *testing.T) {
 	}
 }
 
+func TestListKnowledgeTitles(t *testing.T) {
+	h := newHandler(t)
+
+	// Seed two slug-bearing articles plus a server-instructions blob (no slug).
+	// No KeepPlugins → no orphan prune, so other tests' data is untouched.
+	payload, _ := json.Marshal(syncActionsPayload{
+		PluginName:         "catalog-test",
+		ServerInstructions: "server-level blurb that has no slug and must not appear in the catalog",
+		KnowledgeArticles: []knowledgeArticleEntry{
+			{ID: "zebra-topic", Title: "Zebra topic", Content: "z"},
+			{ID: "alpha-topic", Title: "Alpha topic", Content: "a"},
+		},
+	})
+	resp := h.Execute(plugin.Request{ID: "sync-cat", Action: "sync_actions", Args: map[string]string{"payload": string(payload)}})
+	if resp.Error != "" {
+		t.Fatalf("sync error: %s", resp.Error)
+	}
+	waitSyncDrain(t, h, 10*time.Second)
+	time.Sleep(300 * time.Millisecond)
+
+	resp = h.Execute(plugin.Request{ID: "cat", Action: "list_knowledge_titles"})
+	if resp.Error != "" {
+		t.Fatalf("list_knowledge_titles error: %s", resp.Error)
+	}
+	var entries []catalogEntry
+	if err := json.Unmarshal([]byte(resp.Content), &entries); err != nil {
+		t.Fatalf("parse catalog: %v (content=%s)", err, resp.Content)
+	}
+
+	// Every entry must carry a slug (server-instruction blobs are excluded).
+	var seededInOrder []string
+	got := map[string]string{}
+	for _, e := range entries {
+		if e.Slug == "" {
+			t.Errorf("catalog entry with empty slug: %+v", e)
+		}
+		if strings.Contains(e.Title, "server instructions") {
+			t.Errorf("server-instruction blob leaked into catalog: %q", e.Title)
+		}
+		if e.Slug == "alpha-topic" || e.Slug == "zebra-topic" {
+			got[e.Slug] = e.Title
+			seededInOrder = append(seededInOrder, e.Slug)
+		}
+	}
+	if got["alpha-topic"] != "Alpha topic" || got["zebra-topic"] != "Zebra topic" {
+		t.Errorf("catalog missing seeded entries: got %v", got)
+	}
+	// Catalog is sorted by title → "Alpha topic" appears before "Zebra topic".
+	if len(seededInOrder) == 2 && seededInOrder[0] != "alpha-topic" {
+		t.Errorf("catalog not sorted by title: %v", seededInOrder)
+	}
+}
+
+func TestAskKnowledge_slugExactFetch(t *testing.T) {
+	h := newHandler(t)
+
+	// Unique slugs (namespaced for this test) to avoid cross-test collisions.
+	payload, _ := json.Marshal(syncActionsPayload{
+		PluginName: "slug-test",
+		KnowledgeArticles: []knowledgeArticleEntry{
+			{ID: "slugfetch-categories", Title: "Categories (slug test)", Content: "Categories form an n-level tree."},
+			{ID: "slugfetch-tickets", Title: "Tickets (slug test)", Content: "Tickets live at list-tickets."},
+		},
+	})
+	resp := h.Execute(plugin.Request{ID: "sync-slug", Action: "sync_actions", Args: map[string]string{"payload": string(payload)}})
+	if resp.Error != "" {
+		t.Fatalf("sync error: %s", resp.Error)
+	}
+	waitSyncDrain(t, h, 10*time.Second)
+	time.Sleep(300 * time.Millisecond)
+
+	// Exact slug → exactly that article's body, deterministically (no hybrid).
+	resp = h.Execute(plugin.Request{ID: "slug-hit", Action: "ask_knowledge", Args: map[string]string{"slug": "slugfetch-categories"}})
+	if resp.Error != "" {
+		t.Fatalf("slug fetch error: %s", resp.Error)
+	}
+	if !strings.Contains(resp.Content, "Categories form an n-level tree.") {
+		t.Errorf("expected the Categories body, got: %s", resp.Content)
+	}
+	if strings.Contains(resp.Content, "Tickets live at") {
+		t.Errorf("slug fetch leaked a different article: %s", resp.Content)
+	}
+
+	// Unknown slug → explicit not-found, no silent fuzzy fallback.
+	resp = h.Execute(plugin.Request{ID: "slug-miss", Action: "ask_knowledge", Args: map[string]string{"slug": "does-not-exist-xyz"}})
+	if resp.Error != "" {
+		t.Fatalf("slug miss error: %s", resp.Error)
+	}
+	if !strings.Contains(resp.Content, "No knowledge article with slug") {
+		t.Errorf("expected explicit not-found message, got: %s", resp.Content)
+	}
+
+	// Empty slug is ignored: it must fall through to the query path, not error
+	// out as a missing slug. A query that matches the seeded body returns it.
+	resp = h.Execute(plugin.Request{ID: "slug-empty", Action: "ask_knowledge", Args: map[string]string{"slug": "", "query": "n-level tree"}})
+	if resp.Error != "" {
+		t.Fatalf("empty-slug+query error: %s", resp.Error)
+	}
+	if !strings.Contains(resp.Content, "Categories form an n-level tree.") {
+		t.Errorf("empty slug should fall through to query search, got: %s", resp.Content)
+	}
+
+	// Neither slug nor query → the combined "query or slug is required" error.
+	resp = h.Execute(plugin.Request{ID: "slug-none", Action: "ask_knowledge", Args: map[string]string{"slug": ""}})
+	if !strings.Contains(resp.Error, "query or slug is required") {
+		t.Errorf("expected 'query or slug is required', got error=%q content=%q", resp.Error, resp.Content)
+	}
+}
+
 func TestCapabilities_includesAskKnowledge(t *testing.T) {
 	caps := (&WeaviateHandler{}).Capabilities()
 
@@ -1959,6 +2068,10 @@ func TestSyncActions_knowledgeArticles(t *testing.T) {
 		}
 		if src, _ := props["source"].(string); src != c.source {
 			t.Errorf("article %s: source = %q, want %q", c.articleID, src, c.source)
+		}
+		// slug is stored from the article id (the exact-fetch + catalog key).
+		if slug, _ := props["slug"].(string); slug != c.articleID {
+			t.Errorf("article %s: slug = %q, want %q", c.articleID, slug, c.articleID)
 		}
 		tags, _ := props["tags"].([]interface{})
 		found := false
