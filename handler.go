@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -182,6 +183,14 @@ type WeaviateHandler struct {
 	syncJobCh  chan syncJob
 	syncMu     sync.RWMutex
 	syncStatus syncStatusState
+
+	// schemaMu serializes ensureSchemas so the schema reconcile (read live
+	// schema, then add any missing property) can't interleave across the two
+	// callers — Configure at startup and the refresh action at any time. Without
+	// it, two concurrent runs could both see a property missing and both try to
+	// add it, and the loser fails with "property already exists". Schema setup is
+	// not on a hot path, so a plain mutex is the simplest correct guard.
+	schemaMu sync.Mutex
 }
 
 // Configure is called by the SDK during the Init RPC with the JSON config block.
@@ -328,6 +337,11 @@ func (h *WeaviateHandler) Configure(configJSON string) error {
 
 // ensureSchemas creates the MCPActions, KnowledgeArticles, and Glossary collections if they don't exist.
 func (h *WeaviateHandler) ensureSchemas(ctx context.Context) error {
+	// Serialize against a concurrent caller (startup vs. refresh) so the
+	// read-then-add-missing-property reconcile in ensureClass is atomic.
+	h.schemaMu.Lock()
+	defer h.schemaMu.Unlock()
+
 	if err := h.ensureClass(ctx, h.actionsCollection, []*wmodels.Property{
 		{Name: "pluginName", DataType: []string{"text"}},
 		{Name: "actionName", DataType: []string{"text"}},
@@ -338,6 +352,10 @@ func (h *WeaviateHandler) ensureSchemas(ctx context.Context) error {
 	}
 	if err := h.ensureClass(ctx, h.knowledgeCollection, []*wmodels.Property{
 		{Name: "title", DataType: []string{"text"}},
+		// slug is the stable per-article identifier (the MCP server's article
+		// id). Field-tokenized so a WHERE Equal matches the whole hyphenated
+		// value exactly — the key behind ask_knowledge(slug=…) and the catalog.
+		{Name: "slug", DataType: []string{"text"}, Tokenization: "field"},
 		{Name: "content", DataType: []string{"text"}},
 		{Name: "source", DataType: []string{"text"}},
 		{Name: "tags", DataType: []string{"text[]"}},
@@ -359,7 +377,10 @@ func (h *WeaviateHandler) ensureClass(ctx context.Context, name string, props []
 		return fmt.Errorf("check class %s: %w", name, err)
 	}
 	if exists {
-		return nil
+		// Reconcile properties on an already-existing class so a newly added
+		// field (e.g. slug) lands on a live deployment without a manual
+		// migration or a destructive recreate.
+		return h.ensureProperties(ctx, name, props)
 	}
 	class := &wmodels.Class{
 		Class:      name,
@@ -372,6 +393,33 @@ func (h *WeaviateHandler) ensureClass(ctx context.Context, name string, props []
 		}
 	}
 	return h.client.Schema().ClassCreator().WithClass(class).Do(ctx)
+}
+
+// ensureProperties adds any of the desired properties missing from an
+// already-existing class. Weaviate has no "add column if not exists", so we
+// read the live schema and create only the gaps. Idempotent: a property that
+// already exists is skipped. Objects upserted after a property is added carry
+// the value; pre-existing rows read empty until the next sync re-upserts them
+// (the deterministic-UUID upsert backfills in place).
+func (h *WeaviateHandler) ensureProperties(ctx context.Context, name string, want []*wmodels.Property) error {
+	class, err := h.client.Schema().ClassGetter().WithClassName(name).Do(ctx)
+	if err != nil {
+		return fmt.Errorf("get class %s: %w", name, err)
+	}
+	have := make(map[string]bool, len(class.Properties))
+	for _, p := range class.Properties {
+		have[p.Name] = true
+	}
+	for _, p := range want {
+		if have[p.Name] {
+			continue
+		}
+		if err := h.client.Schema().PropertyCreator().WithClassName(name).WithProperty(p).Do(ctx); err != nil {
+			return fmt.Errorf("add property %s.%s: %w", name, p.Name, err)
+		}
+		log.Printf("weaviate-plugin: ensureClass: added missing property %s.%s", name, p.Name)
+	}
+	return nil
 }
 
 // Capabilities declares this plugin's name, description, and actions to the host.
@@ -442,9 +490,10 @@ func (h *WeaviateHandler) Capabilities() plugin.CapabilitiesMsg {
 			},
 			{
 				Name:        "ask_knowledge",
-				Description: "Search the knowledge base for product docs, how-to guides, and tool descriptions. Use BEFORE asking the user when you need more context.",
+				Description: "Search the knowledge base for product docs, how-to guides, and tool descriptions. Use BEFORE asking the user when you need more context. Pass `slug` to fetch one specific article exactly (slugs come from the knowledge catalog); pass `query` for a semantic search.",
 				Parameters: []plugin.ParameterMsg{
-					{Name: "query", Description: "Natural language question for knowledge base search", Type: "string", Required: true},
+					{Name: "query", Description: "Natural language question for knowledge base search. Required unless `slug` is given.", Type: "string", Required: false},
+					{Name: "slug", Description: "Exact knowledge-article slug (from the catalog) to fetch its full body deterministically. Takes precedence over query.", Type: "string", Required: false},
 					{Name: "plugin", Description: "Narrow results to a specific plugin (e.g. 'jira')", Type: "string", Required: false},
 					{Name: "source", Description: "Filter knowledge articles by source identifier (e.g. 'help-center')", Type: "string", Required: false},
 					{Name: "limit", Description: "Maximum results per collection (default 3)", Type: "integer", Required: false},
@@ -457,6 +506,12 @@ func (h *WeaviateHandler) Capabilities() plugin.CapabilitiesMsg {
 				// (1-step, no get_tool_details promotion). This is the knowledge-pull
 				// lever, mirroring the always-on get_tool_details tool-pull lever.
 				AlwaysInclude: true,
+			},
+			{
+				Name:        "list_knowledge_titles",
+				Description: "List the slug + title of every available knowledge article. The orchestrator renders this as an always-on catalog so the model knows what it can pull; an article body is then fetched exactly via ask_knowledge(slug=…).",
+				Parameters:  []plugin.ParameterMsg{},
+				ReadOnly:    true, // pure listing — no state mutation
 			},
 			{
 				Name:        "search_instructions",
@@ -510,6 +565,8 @@ func (h *WeaviateHandler) Execute(req plugin.Request) plugin.Response {
 		return h.ingestBatch(req)
 	case "ask_knowledge":
 		return h.askKnowledge(req)
+	case "list_knowledge_titles":
+		return h.listKnowledgeTitles(req)
 	case "search_instructions":
 		return h.searchInstructions(req)
 	case "sync_glossary":
@@ -873,6 +930,29 @@ func (h *WeaviateHandler) searchCollection(
 	return builder.Do(ctx)
 }
 
+// fetchObjects runs a plain Get (no hybrid / vector search) with an optional
+// WHERE filter — for exact-key lookups and full-collection listings where
+// relevance ranking is meaningless. Mirrors searchCollection minus WithHybrid,
+// so an empty query never silently degrades into a "match everything" search.
+func (h *WeaviateHandler) fetchObjects(
+	ctx context.Context,
+	className string,
+	fields []graphql.Field,
+	limit int,
+	where *filters.WhereBuilder,
+) (interface{}, error) {
+	builder := h.client.GraphQL().Get().
+		WithClassName(className).
+		WithFields(fields...).
+		WithLimit(limit)
+
+	if where != nil {
+		builder = builder.WithWhere(where)
+	}
+
+	return builder.Do(ctx)
+}
+
 // MCPActions extractors (extractToolNames, extractToolCandidatesFromResult)
 // live in candidates.go and share the actionFilter chokepoint.
 
@@ -968,9 +1048,15 @@ func marshalPrepareResponse(callID string, resp prepareResponse) plugin.Response
 // ---------------------------------------------------------------------------
 
 func (h *WeaviateHandler) askKnowledge(req plugin.Request) plugin.Response {
+	// Exact-slug fetch takes precedence: deterministic single-article lookup
+	// (no hybrid ranking) for a slug the model copied from the always-on catalog.
+	if slug := req.Args["slug"]; slug != "" {
+		return h.fetchKnowledgeBySlug(req, slug)
+	}
+
 	query, ok := req.Args["query"]
 	if !ok || query == "" {
-		return plugin.Response{CallID: req.ID, Error: "query is required"}
+		return plugin.Response{CallID: req.ID, Error: "query or slug is required"}
 	}
 
 	ctx := context.Background()
@@ -1050,6 +1136,82 @@ func (h *WeaviateHandler) askKnowledge(req plugin.Request) plugin.Response {
 	}
 
 	return plugin.Response{CallID: req.ID, Content: strings.Join(sections, "\n\n")}
+}
+
+// fetchKnowledgeBySlug returns the single knowledge article whose slug matches
+// exactly. Deterministic — a WHERE Equal on the field-tokenized slug, no hybrid
+// ranking — so a model that knows the slug (from list_knowledge_titles) gets
+// that article's body with full precision. On no match it says so explicitly
+// rather than silently degrading to a fuzzy search, so the model can tell a
+// wrong slug apart from genuinely-absent knowledge. The limit-1 fetch relies on
+// a slug invariant: the sync path prefixes every article id with its source
+// plugin name (e.g. "<plugin>__categories"), so slugs are unique across servers
+// even when several MCP servers share this collection. A future source that
+// synced unprefixed slugs would need this filter scoped by source as well.
+func (h *WeaviateHandler) fetchKnowledgeBySlug(req plugin.Request, slug string) plugin.Response {
+	where := filters.Where().
+		WithPath([]string{"slug"}).
+		WithOperator(filters.Equal).
+		WithValueText(slug)
+	fields := []graphql.Field{
+		{Name: "title"}, {Name: "slug"}, {Name: "content"}, {Name: "source"},
+	}
+	result, err := h.fetchObjects(context.Background(), h.knowledgeCollection, fields, 1, where)
+	if err != nil {
+		return plugin.Response{CallID: req.ID, Error: fmt.Sprintf("ask_knowledge slug lookup failed: %v", err)}
+	}
+	if text := formatKnowledgeResults(result, h.knowledgeCollection); text != "" {
+		return plugin.Response{CallID: req.ID, Content: text}
+	}
+	return plugin.Response{
+		CallID:  req.ID,
+		Content: fmt.Sprintf("No knowledge article with slug %q. Call list_knowledge_titles for the available slugs, or pass query= for a semantic search.", slug),
+	}
+}
+
+// knowledgeCatalogLimit bounds the title listing. The knowledge corpus is a
+// curated per-product set (tens to low hundreds of articles), far under this
+// ceiling; the cap only guards against an unbounded fetch if the corpus ever
+// grows unexpectedly large.
+const knowledgeCatalogLimit = 10000
+
+// catalogEntry is one row of the knowledge-title catalog the orchestrator
+// renders as an always-on system-prompt section.
+type catalogEntry struct {
+	Slug  string `json:"slug"`
+	Title string `json:"title"`
+}
+
+// listKnowledgeTitles returns every slug-bearing knowledge article as
+// {slug,title} pairs, sorted by title for a stable, reproducible catalog. Only
+// MCP-synced section articles carry a slug, so server-instruction blobs and
+// manually-ingested articles (no slug) are excluded — exactly the set that is
+// slug-addressable via ask_knowledge(slug=…).
+func (h *WeaviateHandler) listKnowledgeTitles(req plugin.Request) plugin.Response {
+	fields := []graphql.Field{{Name: "title"}, {Name: "slug"}}
+	result, err := h.fetchObjects(context.Background(), h.knowledgeCollection, fields, knowledgeCatalogLimit, nil)
+	if err != nil {
+		return plugin.Response{CallID: req.ID, Error: fmt.Sprintf("list_knowledge_titles: %v", err)}
+	}
+	items := extractItems(result, h.knowledgeCollection)
+	if len(items) >= knowledgeCatalogLimit {
+		// At the ceiling the listing may be truncated, so the rendered catalog
+		// would be incomplete and the model couldn't see the omitted articles.
+		// Log it so the limit gets raised before that ever happens silently.
+		log.Printf("weaviate-plugin: list_knowledge_titles hit the %d-article cap — catalog may be truncated", knowledgeCatalogLimit)
+	}
+	entries := make([]catalogEntry, 0, len(items))
+	for _, item := range items {
+		slug, _ := item["slug"].(string)
+		title, _ := item["title"].(string)
+		if slug == "" || title == "" {
+			continue
+		}
+		entries = append(entries, catalogEntry{Slug: slug, Title: title})
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Title < entries[j].Title })
+	body, _ := json.Marshal(entries)
+	return plugin.Response{CallID: req.ID, Content: string(body)}
 }
 
 // searchInstructions searches the KnowledgeArticles collection for MCP server
@@ -1399,6 +1561,7 @@ func (h *WeaviateHandler) syncActionsWork(reqID string, raw string) error {
 			ID:    strfmt.UUID(knowledgeArticleUUID(payload.PluginName, ka.ID)),
 			Properties: map[string]interface{}{
 				"title":   ka.Title,
+				"slug":    ka.ID,
 				"content": ka.Content,
 				"source":  MCPKnowledgeSourcePrefix + payload.PluginName + ":" + ka.ID,
 				"tags":    tags,
