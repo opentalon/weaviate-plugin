@@ -183,9 +183,9 @@ type WeaviateHandler struct {
 	clientTimeout            time.Duration
 	translator               Translator
 
-	// Hash-based sync skip: avoid re-writing unchanged data to Weaviate.
-	actionHashes map[string]string // pluginName → last-seen hash from sync_actions
-	glossaryHash string            // last-seen hash from sync_glossary
+	// glossaryHash skips re-writing an unchanged glossary (sync_glossary path).
+	// sync_actions skips per-doc via the contentHash property — see filterUnchangedDocs.
+	glossaryHash string // last-seen hash from sync_glossary
 
 	// Background sync worker.
 	syncJobCh  chan syncJob
@@ -274,8 +274,6 @@ func (h *WeaviateHandler) Configure(configJSON string) error {
 		h.glossaryCollection = DefaultGlossaryCollection
 	}
 
-	h.actionHashes = make(map[string]string)
-
 	h.httpAddr = cfg.HTTPAddr
 	h.token = cfg.Token
 
@@ -363,6 +361,7 @@ func (h *WeaviateHandler) ensureSchemas(ctx context.Context) error {
 		{Name: "actionName", DataType: []string{"text"}},
 		{Name: "description", DataType: []string{"text"}},
 		{Name: "parameters", DataType: []string{"text"}},
+		h.contentHashProperty(),
 	}); err != nil {
 		return err
 	}
@@ -375,6 +374,7 @@ func (h *WeaviateHandler) ensureSchemas(ctx context.Context) error {
 		{Name: "content", DataType: []string{"text"}},
 		{Name: "source", DataType: []string{"text"}},
 		{Name: "tags", DataType: []string{"text[]"}},
+		h.contentHashProperty(),
 	}); err != nil {
 		return err
 	}
@@ -387,7 +387,27 @@ func (h *WeaviateHandler) ensureSchemas(ctx context.Context) error {
 	})
 }
 
+// contentHashProperty is the per-doc change-detection digest stored on every
+// corpus record (actions and knowledge alike). It is excluded from the embedding
+// (skip): it's an opaque hex digest, not semantic content, so vectorizing it
+// would only add noise to retrieval.
+func (h *WeaviateHandler) contentHashProperty() *wmodels.Property {
+	return &wmodels.Property{
+		Name:     "contentHash",
+		DataType: []string{"text"},
+		ModuleConfig: map[string]interface{}{
+			h.vectorizer: map[string]interface{}{"skip": true, "vectorizePropertyName": false},
+		},
+	}
+}
+
 func (h *WeaviateHandler) ensureClass(ctx context.Context, name string, props []*wmodels.Property) error {
+	return h.ensureClassVec(ctx, name, h.vectorizer, props)
+}
+
+// ensureClassVec is ensureClass with an explicit vectorizer, so metadata
+// collections can opt out of embedding with vectorizer "none".
+func (h *WeaviateHandler) ensureClassVec(ctx context.Context, name, vectorizer string, props []*wmodels.Property) error {
 	exists, err := h.client.Schema().ClassExistenceChecker().WithClassName(name).Do(ctx)
 	if err != nil {
 		return fmt.Errorf("check class %s: %w", name, err)
@@ -400,12 +420,14 @@ func (h *WeaviateHandler) ensureClass(ctx context.Context, name string, props []
 	}
 	class := &wmodels.Class{
 		Class:      name,
-		Vectorizer: h.vectorizer,
+		Vectorizer: vectorizer,
 		Properties: props,
 	}
-	if h.moduleConfig != nil {
+	// Only vectorized classes carry the embedding module config; a "none"
+	// vectorizer (metadata) has no vectors and needs no module config.
+	if vectorizer != "none" && h.moduleConfig != nil {
 		class.ModuleConfig = map[string]interface{}{
-			h.vectorizer: h.moduleConfig,
+			vectorizer: h.moduleConfig,
 		}
 	}
 	return h.client.Schema().ClassCreator().WithClass(class).Do(ctx)
@@ -991,7 +1013,18 @@ func (h *WeaviateHandler) fetchObjects(
 		builder = builder.WithWhere(where)
 	}
 
-	return builder.Do(ctx)
+	result, err := builder.Do(ctx)
+	if err != nil {
+		return nil, err
+	}
+	// A GraphQL-level failure (e.g. an unknown field) returns a nil transport
+	// error but a populated Errors list and no data. Surface it as an error so
+	// callers don't silently treat a failed query as "no results" — the same
+	// check distinctValues makes on its own Get.
+	if result != nil && len(result.Errors) > 0 {
+		return nil, fmt.Errorf("%s", result.Errors[0].Message)
+	}
+	return result, nil
 }
 
 // MCPActions extractors (extractToolNames, extractToolCandidatesFromResult)
@@ -1421,12 +1454,6 @@ type syncActionsPayload struct {
 	// orchestrators that omit the field keep the legacy single-blob shape.
 	KnowledgeArticles []knowledgeArticleEntry `json:"knowledge_articles,omitempty"`
 	KeepPlugins       []string                `json:"keep_plugins,omitempty"`
-	// Hash is an opaque string computed by the orchestrator over the combined
-	// actions + server_instructions + knowledge_articles for this plugin. When
-	// present and matching the last-seen hash, the plugin skips the upsert
-	// (but still runs orphan prune). Older orchestrators that omit it get the
-	// legacy always-sync.
-	Hash string `json:"hash,omitempty"`
 	// IsContinuationBatch is set by the orchestrator on batches 1..N of a
 	// chunked plugin sync so the plugin skips the per-plugin pre-delete that
 	// would otherwise wipe the previous batches' inserts. Batch 0 (default
@@ -1501,27 +1528,6 @@ func (h *WeaviateHandler) syncActionsWork(reqID string, raw string) error {
 
 	ctx := context.Background()
 
-	// Hash-based skip: when the orchestrator sends a hash and it matches the
-	// last-seen value for this plugin, skip the expensive upsert cycle. Orphan
-	// prune via keep_plugins still runs — it's cheap and keeps the index clean
-	// across plugin additions/removals. Continuation batches skip the hash
-	// check (the decision was made on batch 0).
-	h.syncMu.RLock()
-	hashMatch := !payload.IsContinuationBatch && payload.Hash != "" && payload.Hash == h.actionHashes[payload.PluginName]
-	h.syncMu.RUnlock()
-
-	if hashMatch {
-		log.Printf("weaviate-plugin: sync_actions: hash match for %s (%s), skipping upsert", payload.PluginName, payload.Hash)
-		if len(payload.KeepPlugins) > 0 {
-			if n, err := h.pruneOrphans(ctx, payload.KeepPlugins); err != nil {
-				log.Printf("weaviate-plugin: prune_orphans failed: %v", err)
-			} else if n > 0 {
-				log.Printf("weaviate-plugin: sync_actions: pruned %d orphans", n)
-			}
-		}
-		return nil
-	}
-
 	// Remove the plugin's removed/renamed actions before re-upserting so they
 	// don't linger as stale entries. Two strategies, chosen by whether the
 	// orchestrator sent the authoritative action list (keep_actions):
@@ -1534,15 +1540,17 @@ func (h *WeaviateHandler) syncActionsWork(reqID string, raw string) error {
 	//     pod always sees a complete tool set during a resync.
 	//
 	//   - Blanket pre-delete (keep_actions absent — older orchestrator, or a
-	//     plugin with zero actions): delete everything for the plugin, then the
-	//     upsert below re-creates the current set. This is the legacy behaviour
-	//     (brief window where the actions are gone); kept for back-compat.
+	//     plugin with zero actions): delete everything for the plugin; the per-doc
+	//     pass below then re-writes the current set from scratch (every doc reads
+	//     as new). Legacy behaviour with a brief actions-absent window; kept for
+	//     back-compat.
 	//
 	// Both run only on batch 0 (IsContinuationBatch=false): batch 0 carries the
 	// authoritative keep_actions, and the diff is order-independent, so later
-	// batches only need to upsert their chunk. KnowledgeArticles records keyed
-	// by deterministic UUID are overwritten by upsert below; their stale-section
-	// cleanup is handled separately further down.
+	// batches only need to send their chunk. KnowledgeArticles records keyed by
+	// deterministic UUID are re-written only when their contentHash changed (the
+	// per-doc skip below); their stale-section cleanup is handled separately
+	// further down.
 	if !payload.IsContinuationBatch {
 		if payload.KeepActions != nil {
 			if err := h.pruneStaleActions(ctx, payload.PluginName, payload.KeepActions); err != nil {
@@ -1562,13 +1570,16 @@ func (h *WeaviateHandler) syncActionsWork(reqID string, raw string) error {
 		}
 	}
 
-	objects := make([]*wmodels.Object, 0, len(payload.Actions))
+	// Build candidate docs (actions + server instructions + knowledge), each
+	// tagged with a contentHash over its own canonical content. The per-doc skip
+	// below re-vectorizes only the docs whose content actually changed.
+	actionObjs := make([]*wmodels.Object, 0, len(payload.Actions))
 	for _, a := range payload.Actions {
 		params := ""
 		if len(a.Parameters) > 0 {
 			params = string(a.Parameters)
 		}
-		objects = append(objects, &wmodels.Object{
+		actionObjs = append(actionObjs, &wmodels.Object{
 			Class: h.actionsCollection,
 			ID:    strfmt.UUID(actionUUID(payload.PluginName, a.Name)),
 			Properties: map[string]interface{}{
@@ -1576,39 +1587,39 @@ func (h *WeaviateHandler) syncActionsWork(reqID string, raw string) error {
 				"actionName":  a.Name,
 				"description": a.Description,
 				"parameters":  params,
+				"contentHash": contentSHA256(a.Name + "\x00" + a.Description + "\x00" + params),
 			},
 		})
 	}
 
-	// Upsert one KnowledgeArticles record carrying the plugin's server-level
-	// instructions text (e.g. an MCP server's `initialize.instructions`) when
-	// the orchestrator forwarded it. Keyed by deterministic UUID so re-runs are
-	// idempotent and a removed plugin's record is overwritten cleanly on the
-	// next sync (or pruned via keep_plugins below).
+	knowledgeObjs := make([]*wmodels.Object, 0, len(payload.KnowledgeArticles)+1)
+
+	// The plugin's server-level instructions text (e.g. an MCP server's
+	// `initialize.instructions`) rides as one KnowledgeArticles record — handled
+	// uniformly with every other doc (own contentHash, own skip). Keyed by
+	// deterministic UUID so re-runs are idempotent.
 	hasInstructions := false
 	if payload.ServerInstructions != "" {
-		log.Printf("weaviate-plugin: sync_actions: storing server instructions for %s (%d bytes)", payload.PluginName, len(payload.ServerInstructions))
 		hasInstructions = true
-		objects = append(objects, &wmodels.Object{
+		title := payload.PluginName + " MCP server instructions"
+		tags := []string{"opentalon", "mcp", "server-instructions", payload.PluginName}
+		knowledgeObjs = append(knowledgeObjs, &wmodels.Object{
 			Class: h.knowledgeCollection,
 			ID:    strfmt.UUID(serverInstructionsUUID(payload.PluginName)),
 			Properties: map[string]interface{}{
-				"title":   payload.PluginName + " MCP server instructions",
-				"content": payload.ServerInstructions,
-				"source":  MCPSourcePrefix + payload.PluginName,
-				"tags":    []string{"opentalon", "mcp", "server-instructions", payload.PluginName},
+				"title":       title,
+				"content":     payload.ServerInstructions,
+				"source":      MCPSourcePrefix + payload.PluginName,
+				"tags":        tags,
+				"contentHash": contentSHA256(title + "\x00" + payload.ServerInstructions + "\x00" + strings.Join(tags, ",")),
 			},
 		})
 	}
 
-	// Remove knowledge sections the plugin dropped/renamed between syncs. The
-	// full section set always arrives together on batch 0 (knowledge is not
-	// chunked), so we diff in place: delete only the stored "mcp-knowledge:
-	// <plugin>:<slug>" records whose slug is no longer in this payload, instead
-	// of wiping all sections and re-inserting (which left a brief window where
-	// the plugin's knowledge was absent). Sections still present are overwritten
-	// in place by the deterministic-UUID upsert below. Skipped on continuation
-	// batches and when no sections are sent (matches the legacy guard).
+	// Remove knowledge sections the plugin dropped/renamed between syncs. The full
+	// section set always arrives together on batch 0 (knowledge is not chunked),
+	// so we diff against the authoritative slug set: delete only the stored
+	// "mcp-knowledge:<plugin>:<slug>" records whose slug is no longer present.
 	if !payload.IsContinuationBatch && len(payload.KnowledgeArticles) > 0 {
 		keepSlugs := make([]string, 0, len(payload.KnowledgeArticles))
 		for _, ka := range payload.KnowledgeArticles {
@@ -1619,28 +1630,37 @@ func (h *WeaviateHandler) syncActionsWork(reqID string, raw string) error {
 		}
 	}
 
-	knowledgeCount := 0
 	for _, ka := range payload.KnowledgeArticles {
 		if ka.ID == "" || ka.Title == "" || ka.Content == "" {
 			log.Printf("weaviate-plugin: sync_actions: skipping invalid knowledge article for %s (id=%q title=%q)", payload.PluginName, ka.ID, ka.Title)
 			continue
 		}
 		tags := append([]string{"opentalon", "mcp", "knowledge", payload.PluginName}, ka.Tags...)
-		objects = append(objects, &wmodels.Object{
+		knowledgeObjs = append(knowledgeObjs, &wmodels.Object{
 			Class: h.knowledgeCollection,
 			ID:    strfmt.UUID(knowledgeArticleUUID(payload.PluginName, ka.ID)),
 			Properties: map[string]interface{}{
-				"title":   ka.Title,
-				"slug":    ka.ID,
-				"content": ka.Content,
-				"source":  MCPKnowledgeSourcePrefix + payload.PluginName + ":" + ka.ID,
-				"tags":    tags,
+				"title":       ka.Title,
+				"slug":        ka.ID,
+				"content":     ka.Content,
+				"source":      MCPKnowledgeSourcePrefix + payload.PluginName + ":" + ka.ID,
+				"tags":        tags,
+				"contentHash": contentSHA256(ka.Title + "\x00" + ka.Content + "\x00" + strings.Join(tags, ",")),
 			},
 		})
-		knowledgeCount++
 	}
 
-	syncedActions := len(payload.Actions)
+	// Per-doc skip: re-vectorize only the docs whose contentHash differs from
+	// what's stored. This single mechanism covers every case uniformly — new doc
+	// (absent → written), changed doc (hash differs → rewritten), unchanged doc
+	// (hash equal → skipped) — and makes an unchanged restart a no-op, because the
+	// hashes live in Weaviate and survive a process restart. Stale docs (no longer
+	// in the source) are removed by the prunes above (actions/knowledge) and below
+	// (whole plugins).
+	changedActions, skippedActions := h.filterUnchangedDocs(ctx, h.actionsCollection, actionObjs)
+	changedKnowledge, skippedKnowledge := h.filterUnchangedDocs(ctx, h.knowledgeCollection, knowledgeObjs)
+
+	objects := append(changedActions, changedKnowledge...)
 	if len(objects) > 0 {
 		results, err := h.client.Batch().ObjectsBatcher().WithObjects(objects...).Do(ctx)
 		if err != nil {
@@ -1651,7 +1671,7 @@ func (h *WeaviateHandler) syncActionsWork(reqID string, raw string) error {
 		}
 	}
 
-	// Inter-plugin orphan prune.
+	// Inter-plugin orphan prune (whole plugins removed since the last sync).
 	pruned := 0
 	if len(payload.KeepPlugins) > 0 {
 		n, err := h.pruneOrphans(ctx, payload.KeepPlugins)
@@ -1661,16 +1681,58 @@ func (h *WeaviateHandler) syncActionsWork(reqID string, raw string) error {
 		pruned = n
 	}
 
-	// Store hash on successful sync so next call with the same hash can skip.
-	if payload.Hash != "" {
-		h.syncMu.Lock()
-		h.actionHashes[payload.PluginName] = payload.Hash
-		h.syncMu.Unlock()
-	}
-
-	log.Printf("weaviate-plugin: sync_actions: completed for %s (req=%s synced=%d instructions=%v knowledge=%d pruned=%d)",
-		payload.PluginName, reqID, syncedActions, hasInstructions, knowledgeCount, pruned)
+	log.Printf("weaviate-plugin: sync_actions: completed for %s (req=%s actions_written=%d/%d knowledge_written=%d/%d instructions=%v skipped=%d pruned=%d)",
+		payload.PluginName, reqID, len(changedActions), len(actionObjs), len(changedKnowledge), len(knowledgeObjs), hasInstructions, skippedActions+skippedKnowledge, pruned)
 	return nil
+}
+
+// filterUnchangedDocs returns the candidates whose contentHash differs from
+// what's already stored (and the count skipped). Each candidate's deterministic
+// UUID is both the read filter (id ContainsAny) and the join key, so the lookup
+// works uniformly for any collection without a separate per-collection key. On a
+// read error every candidate is treated as changed — safe (re-vectorize) rather
+// than silently dropping an update.
+func (h *WeaviateHandler) filterUnchangedDocs(ctx context.Context, className string, candidates []*wmodels.Object) (changed []*wmodels.Object, skipped int) {
+	if len(candidates) == 0 {
+		return nil, 0
+	}
+	ids := make([]string, len(candidates))
+	for i, o := range candidates {
+		ids[i] = string(o.ID)
+	}
+	stored := make(map[string]string, len(ids))
+	where := filters.Where().WithPath([]string{"id"}).WithOperator(filters.ContainsAny).WithValueText(ids...)
+	fields := []graphql.Field{{Name: "_additional", Fields: []graphql.Field{{Name: "id"}}}, {Name: "contentHash"}}
+	if result, err := h.fetchObjects(ctx, className, fields, len(ids), where); err != nil {
+		log.Printf("weaviate-plugin: sync_actions: read stored hashes for %s failed (treating all as changed): %v", className, err)
+	} else {
+		for _, it := range extractItems(result, className) {
+			if id := additionalID(it); id != "" {
+				ch, _ := it["contentHash"].(string)
+				stored[id] = ch
+			}
+		}
+	}
+	return splitChangedDocs(candidates, stored)
+}
+
+// splitChangedDocs partitions candidates by whether their contentHash matches
+// the stored hash for the same id: a candidate with no stored entry (new doc) or
+// a differing hash (changed doc) goes to changed; an exact match is skipped. Kept
+// pure (no Weaviate dependency) so the skip decision is unit-tested directly — an
+// empty stored map is exactly filterUnchangedDocs's read-error fallback (treat
+// every candidate as changed).
+func splitChangedDocs(candidates []*wmodels.Object, stored map[string]string) (changed []*wmodels.Object, skipped int) {
+	for _, o := range candidates {
+		props, _ := o.Properties.(map[string]interface{})
+		ch, _ := props["contentHash"].(string)
+		if prev, ok := stored[string(o.ID)]; ok && prev == ch {
+			skipped++
+			continue
+		}
+		changed = append(changed, o)
+	}
+	return changed, skipped
 }
 
 // ---------------------------------------------------------------------------
