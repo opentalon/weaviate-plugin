@@ -110,8 +110,8 @@ type Config struct {
 	// to be noise-prone (a few generic tools become magnets for unrelated queries).
 	// Applied only to the tools search in prepare; knowledge/glossary keep the default.
 	PrepareActionsAlpha *float64 `json:"prepare_actions_alpha,omitempty"`
-	Timeout                  string   `json:"timeout"` // Weaviate HTTP client timeout as duration string (e.g. "2m", "90s"); default "2m"
-	GlossaryCollection       string   `json:"glossary_collection"`
+	Timeout             string   `json:"timeout"` // Weaviate HTTP client timeout as duration string (e.g. "2m", "90s"); default "2m"
+	GlossaryCollection  string   `json:"glossary_collection"`
 	// Translator is the optional LibreTranslate-compatible query
 	// pre-processor. When enabled, non-target-language user queries are
 	// translated to TargetLang before they reach Weaviate, fixing
@@ -1433,6 +1433,17 @@ type syncActionsPayload struct {
 	// false) keeps the orphan-prune semantic. Older orchestrators omit the
 	// field entirely — default false matches the legacy single-batch behaviour.
 	IsContinuationBatch bool `json:"is_continuation_batch,omitempty"`
+	// KeepActions is the authoritative full list of the plugin's current action
+	// names. The action set is chunked across batches, so no single call sees
+	// every action — the orchestrator therefore sends the complete list on
+	// batch 0. When present, the pre-sync cleanup deletes only stored actions
+	// NOT in this list (an in-place diff) instead of the legacy
+	// delete-all-then-reinsert. A still-valid action that has not been
+	// re-upserted yet (it arrives in a later batch) is matched by name and left
+	// in place, so a reader on a peer pod never sees the plugin's tools briefly
+	// vanish during a resync. Older orchestrators omit it — the plugin then
+	// falls back to the blanket pre-delete (correct, but with the old window).
+	KeepActions []string `json:"keep_actions,omitempty"`
 }
 
 type syncActionEntry struct {
@@ -1511,25 +1522,43 @@ func (h *WeaviateHandler) syncActionsWork(reqID string, raw string) error {
 		return nil
 	}
 
-	// Delete all existing actions for this plugin before re-syncing so that
-	// removed/renamed actions don't linger as stale entries (intra-plugin
-	// orphan prune from #16). KnowledgeArticles records keyed by deterministic
-	// UUID are overwritten by upsert below, so they don't need a pre-delete.
+	// Remove the plugin's removed/renamed actions before re-upserting so they
+	// don't linger as stale entries. Two strategies, chosen by whether the
+	// orchestrator sent the authoritative action list (keep_actions):
 	//
-	// Skip on continuation batches (1..N of a chunked sync) — otherwise each
-	// batch would wipe the previous batches' inserts, leaving only the last
-	// batch's contents persisted. Batch 0 (IsContinuationBatch=false) carries
-	// the orphan-prune semantic for the entire plugin.
+	//   - Diff prune (keep_actions present): delete only the stored actions that
+	//     are no longer in the current set. Actions that still exist — including
+	//     ones that have not been re-upserted yet because they arrive in a later
+	//     continuation batch — are matched by name and left untouched. There is
+	//     no moment where the plugin's actions are absent, so a reader on a peer
+	//     pod always sees a complete tool set during a resync.
+	//
+	//   - Blanket pre-delete (keep_actions absent — older orchestrator, or a
+	//     plugin with zero actions): delete everything for the plugin, then the
+	//     upsert below re-creates the current set. This is the legacy behaviour
+	//     (brief window where the actions are gone); kept for back-compat.
+	//
+	// Both run only on batch 0 (IsContinuationBatch=false): batch 0 carries the
+	// authoritative keep_actions, and the diff is order-independent, so later
+	// batches only need to upsert their chunk. KnowledgeArticles records keyed
+	// by deterministic UUID are overwritten by upsert below; their stale-section
+	// cleanup is handled separately further down.
 	if !payload.IsContinuationBatch {
-		_, delErr := h.client.Batch().ObjectsBatchDeleter().
-			WithClassName(h.actionsCollection).
-			WithWhere(filters.Where().
-				WithPath([]string{"pluginName"}).
-				WithOperator(filters.Equal).
-				WithValueText(payload.PluginName)).
-			Do(ctx)
-		if delErr != nil {
-			log.Printf("weaviate-plugin: sync_actions: failed to delete old actions for %s: %v", payload.PluginName, delErr)
+		if payload.KeepActions != nil {
+			if err := h.pruneStaleActions(ctx, payload.PluginName, payload.KeepActions); err != nil {
+				log.Printf("weaviate-plugin: sync_actions: prune stale actions for %s failed: %v", payload.PluginName, err)
+			}
+		} else {
+			_, delErr := h.client.Batch().ObjectsBatchDeleter().
+				WithClassName(h.actionsCollection).
+				WithWhere(filters.Where().
+					WithPath([]string{"pluginName"}).
+					WithOperator(filters.Equal).
+					WithValueText(payload.PluginName)).
+				Do(ctx)
+			if delErr != nil {
+				log.Printf("weaviate-plugin: sync_actions: failed to delete old actions for %s: %v", payload.PluginName, delErr)
+			}
 		}
 	}
 
@@ -1572,21 +1601,21 @@ func (h *WeaviateHandler) syncActionsWork(reqID string, raw string) error {
 		})
 	}
 
-	// Pre-delete all "mcp-knowledge:<plugin>:*" records on batch 0 so sections
-	// that the plugin removed or renamed between syncs vanish from the index
-	// (deterministic-UUID upsert overwrites in place but cannot delete a row
-	// no longer in payload). Mirrors the per-plugin actions pre-delete above.
-	// Skipped on continuation batches — those would wipe earlier batches' inserts.
+	// Remove knowledge sections the plugin dropped/renamed between syncs. The
+	// full section set always arrives together on batch 0 (knowledge is not
+	// chunked), so we diff in place: delete only the stored "mcp-knowledge:
+	// <plugin>:<slug>" records whose slug is no longer in this payload, instead
+	// of wiping all sections and re-inserting (which left a brief window where
+	// the plugin's knowledge was absent). Sections still present are overwritten
+	// in place by the deterministic-UUID upsert below. Skipped on continuation
+	// batches and when no sections are sent (matches the legacy guard).
 	if !payload.IsContinuationBatch && len(payload.KnowledgeArticles) > 0 {
-		_, delErr := h.client.Batch().ObjectsBatchDeleter().
-			WithClassName(h.knowledgeCollection).
-			WithWhere(filters.Where().
-				WithPath([]string{"source"}).
-				WithOperator(filters.Like).
-				WithValueText(MCPKnowledgeSourcePrefix + payload.PluginName + ":*")).
-			Do(ctx)
-		if delErr != nil {
-			log.Printf("weaviate-plugin: sync_actions: failed to delete old knowledge articles for %s: %v", payload.PluginName, delErr)
+		keepSlugs := make([]string, 0, len(payload.KnowledgeArticles))
+		for _, ka := range payload.KnowledgeArticles {
+			keepSlugs = append(keepSlugs, ka.ID)
+		}
+		if err := h.pruneStaleKnowledgeSections(ctx, payload.PluginName, keepSlugs); err != nil {
+			log.Printf("weaviate-plugin: sync_actions: prune stale knowledge for %s failed: %v", payload.PluginName, err)
 		}
 	}
 
@@ -2163,6 +2192,91 @@ func splitCSV(s string) []string {
 		}
 	}
 	return out
+}
+
+// diffNotIn returns the elements of a that are not present in b, preserving a's
+// order. Used to compute which stored records are stale: present locally but no
+// longer in the orchestrator's authoritative set.
+func diffNotIn(a, b []string) []string {
+	keep := make(map[string]struct{}, len(b))
+	for _, v := range b {
+		keep[v] = struct{}{}
+	}
+	var out []string
+	for _, v := range a {
+		if _, ok := keep[v]; !ok {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+// pruneStaleActions deletes the plugin's MCPActions whose actionName is not in
+// keep (the authoritative current set sent as sync_actions keep_actions). It
+// lists the stored action names for the plugin, diffs them against keep, and
+// deletes only the difference by deterministic UUID — leaving every still-valid
+// action in place so there is no delete-all window during a resync.
+func (h *WeaviateHandler) pruneStaleActions(ctx context.Context, pluginName string, keep []string) error {
+	pluginScope := filters.Where().
+		WithPath([]string{"pluginName"}).
+		WithOperator(filters.Equal).
+		WithValueText(pluginName)
+	existing, err := h.distinctValues(ctx, h.actionsCollection, "actionName", pluginScope)
+	if err != nil {
+		return fmt.Errorf("list existing actions: %w", err)
+	}
+	stale := diffNotIn(existing, keep)
+	for _, name := range stale {
+		if err := h.client.Data().Deleter().
+			WithClassName(h.actionsCollection).
+			WithID(actionUUID(pluginName, name)).
+			Do(ctx); err != nil {
+			return fmt.Errorf("delete stale action %q: %w", name, err)
+		}
+	}
+	if len(stale) > 0 {
+		log.Printf("weaviate-plugin: sync_actions: pruned %d stale action(s) for %s", len(stale), pluginName)
+	}
+	return nil
+}
+
+// pruneStaleKnowledgeSections deletes the plugin's knowledge sections whose slug
+// is no longer in keepSlugs. Sources are "mcp-knowledge:<plugin>:<slug>". Like
+// pruneOrphans it gates on the exact-string prefix: Weaviate's Like operator
+// matches per token, so "mcp-knowledge:foo:*" can over-match (e.g. a "foobar"
+// plugin); the HasPrefix check on the full "<plugin>:" prefix filters those out.
+func (h *WeaviateHandler) pruneStaleKnowledgeSections(ctx context.Context, pluginName string, keepSlugs []string) error {
+	prefix := MCPKnowledgeSourcePrefix + pluginName + ":"
+	scope := filters.Where().
+		WithPath([]string{"source"}).
+		WithOperator(filters.Like).
+		WithValueText(prefix + "*")
+	sources, err := h.distinctValues(ctx, h.knowledgeCollection, "source", scope)
+	if err != nil {
+		return fmt.Errorf("list existing knowledge sections: %w", err)
+	}
+	keep := make(map[string]struct{}, len(keepSlugs))
+	for _, slug := range keepSlugs {
+		keep[prefix+slug] = struct{}{}
+	}
+	pruned := 0
+	for _, src := range sources {
+		if !strings.HasPrefix(src, prefix) {
+			continue // Like over-match guard
+		}
+		if _, ok := keep[src]; ok {
+			continue
+		}
+		n, err := h.batchDeleteEqual(ctx, h.knowledgeCollection, "source", src)
+		if err != nil {
+			return fmt.Errorf("delete stale knowledge %q: %w", src, err)
+		}
+		pruned += n
+	}
+	if pruned > 0 {
+		log.Printf("weaviate-plugin: sync_actions: pruned %d stale knowledge section(s) for %s", pruned, pluginName)
+	}
+	return nil
 }
 
 func actionUUID(pluginName, actionName string) string {
