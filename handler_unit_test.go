@@ -4,7 +4,9 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/go-openapi/strfmt"
 	"github.com/opentalon/opentalon/pkg/plugin"
+	wmodels "github.com/weaviate/weaviate/entities/models"
 )
 
 // TestCapabilities_readOnlyAndPinClassification pins the confirmation-gate and
@@ -163,5 +165,54 @@ func TestDiffNotIn(t *testing.T) {
 				t.Errorf("diffNotIn(%v, %v) = %v, want %v", tt.existing, tt.keep, got, tt.want)
 			}
 		})
+	}
+}
+
+// TestSplitChangedDocs pins the per-doc skip decision that drives re-vectorization:
+// a doc is re-written only when its contentHash is absent from or differs from
+// what's stored, and skipped when it matches exactly. This is the efficiency
+// guarantee of the per-document hashing — an unchanged sync must write nothing.
+// Pure function, no Weaviate, runs in the unit suite.
+func TestSplitChangedDocs(t *testing.T) {
+	doc := func(id, hash string) *wmodels.Object {
+		return &wmodels.Object{
+			ID:         strfmt.UUID(id),
+			Properties: map[string]interface{}{"contentHash": hash},
+		}
+	}
+	const (
+		idNew       = "11111111-1111-1111-1111-111111111111"
+		idChanged   = "22222222-2222-2222-2222-222222222222"
+		idUnchanged = "33333333-3333-3333-3333-333333333333"
+	)
+	candidates := []*wmodels.Object{
+		doc(idNew, "hash-new"),         // absent from stored → changed (new doc)
+		doc(idChanged, "hash-current"), // stored hash differs → changed
+		doc(idUnchanged, "hash-same"),  // stored hash equal → skipped
+	}
+	stored := map[string]string{
+		idChanged:   "hash-OLD",
+		idUnchanged: "hash-same",
+	}
+
+	changed, skipped := splitChangedDocs(candidates, stored)
+	if skipped != 1 {
+		t.Errorf("skipped = %d, want 1 (only the unchanged doc)", skipped)
+	}
+	gotChanged := map[string]bool{}
+	for _, o := range changed {
+		gotChanged[string(o.ID)] = true
+	}
+	if len(changed) != 2 || !gotChanged[idNew] || !gotChanged[idChanged] {
+		t.Errorf("changed ids = %v, want exactly {new, changed}", gotChanged)
+	}
+
+	// Read-error fallback: filterUnchangedDocs leaves stored empty when the hash
+	// read fails, so every candidate must be treated as changed (re-vectorize,
+	// never silently skip an update).
+	allChanged, noneSkipped := splitChangedDocs(candidates, map[string]string{})
+	if len(allChanged) != len(candidates) || noneSkipped != 0 {
+		t.Errorf("empty stored: changed=%d skipped=%d, want changed=%d skipped=0",
+			len(allChanged), noneSkipped, len(candidates))
 	}
 }

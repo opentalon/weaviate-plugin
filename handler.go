@@ -1013,7 +1013,18 @@ func (h *WeaviateHandler) fetchObjects(
 		builder = builder.WithWhere(where)
 	}
 
-	return builder.Do(ctx)
+	result, err := builder.Do(ctx)
+	if err != nil {
+		return nil, err
+	}
+	// A GraphQL-level failure (e.g. an unknown field) returns a nil transport
+	// error but a populated Errors list and no data. Surface it as an error so
+	// callers don't silently treat a failed query as "no results" — the same
+	// check distinctValues makes on its own Get.
+	if result != nil && len(result.Errors) > 0 {
+		return nil, fmt.Errorf("%s", result.Errors[0].Message)
+	}
+	return result, nil
 }
 
 // MCPActions extractors (extractToolNames, extractToolCandidatesFromResult)
@@ -1646,8 +1657,8 @@ func (h *WeaviateHandler) syncActionsWork(reqID string, raw string) error {
 	// hashes live in Weaviate and survive a process restart. Stale docs (no longer
 	// in the source) are removed by the prunes above (actions/knowledge) and below
 	// (whole plugins).
-	changedActions, skippedActions := h.filterUnchangedDocs(ctx, h.actionsCollection, "actionName", actionObjs)
-	changedKnowledge, skippedKnowledge := h.filterUnchangedDocs(ctx, h.knowledgeCollection, "source", knowledgeObjs)
+	changedActions, skippedActions := h.filterUnchangedDocs(ctx, h.actionsCollection, actionObjs)
+	changedKnowledge, skippedKnowledge := h.filterUnchangedDocs(ctx, h.knowledgeCollection, knowledgeObjs)
 
 	objects := append(changedActions, changedKnowledge...)
 	if len(objects) > 0 {
@@ -1676,13 +1687,12 @@ func (h *WeaviateHandler) syncActionsWork(reqID string, raw string) error {
 }
 
 // filterUnchangedDocs returns the candidates whose contentHash differs from
-// what's already stored (and the count skipped). Stored hashes are looked up by
-// the candidates' deterministic UUIDs, so this works uniformly for any
-// collection; keyField (actionName / source) is a per-candidate-unique field
-// used to map a query row back to its candidate. On a read error every candidate
-// is treated as changed — safe (re-vectorize) rather than silently dropping an
-// update.
-func (h *WeaviateHandler) filterUnchangedDocs(ctx context.Context, className, keyField string, candidates []*wmodels.Object) (changed []*wmodels.Object, skipped int) {
+// what's already stored (and the count skipped). Each candidate's deterministic
+// UUID is both the read filter (id ContainsAny) and the join key, so the lookup
+// works uniformly for any collection without a separate per-collection key. On a
+// read error every candidate is treated as changed — safe (re-vectorize) rather
+// than silently dropping an update.
+func (h *WeaviateHandler) filterUnchangedDocs(ctx context.Context, className string, candidates []*wmodels.Object) (changed []*wmodels.Object, skipped int) {
 	if len(candidates) == 0 {
 		return nil, 0
 	}
@@ -1692,22 +1702,31 @@ func (h *WeaviateHandler) filterUnchangedDocs(ctx context.Context, className, ke
 	}
 	stored := make(map[string]string, len(ids))
 	where := filters.Where().WithPath([]string{"id"}).WithOperator(filters.ContainsAny).WithValueText(ids...)
-	if result, err := h.fetchObjects(ctx, className, []graphql.Field{{Name: keyField}, {Name: "contentHash"}}, len(ids), where); err != nil {
+	fields := []graphql.Field{{Name: "_additional", Fields: []graphql.Field{{Name: "id"}}}, {Name: "contentHash"}}
+	if result, err := h.fetchObjects(ctx, className, fields, len(ids), where); err != nil {
 		log.Printf("weaviate-plugin: sync_actions: read stored hashes for %s failed (treating all as changed): %v", className, err)
 	} else {
 		for _, it := range extractItems(result, className) {
-			k, _ := it[keyField].(string)
-			ch, _ := it["contentHash"].(string)
-			if k != "" {
-				stored[k] = ch
+			if id := additionalID(it); id != "" {
+				ch, _ := it["contentHash"].(string)
+				stored[id] = ch
 			}
 		}
 	}
+	return splitChangedDocs(candidates, stored)
+}
+
+// splitChangedDocs partitions candidates by whether their contentHash matches
+// the stored hash for the same id: a candidate with no stored entry (new doc) or
+// a differing hash (changed doc) goes to changed; an exact match is skipped. Kept
+// pure (no Weaviate dependency) so the skip decision is unit-tested directly — an
+// empty stored map is exactly filterUnchangedDocs's read-error fallback (treat
+// every candidate as changed).
+func splitChangedDocs(candidates []*wmodels.Object, stored map[string]string) (changed []*wmodels.Object, skipped int) {
 	for _, o := range candidates {
 		props, _ := o.Properties.(map[string]interface{})
-		key, _ := props[keyField].(string)
 		ch, _ := props["contentHash"].(string)
-		if prev, ok := stored[key]; ok && prev == ch {
+		if prev, ok := stored[string(o.ID)]; ok && prev == ch {
 			skipped++
 			continue
 		}
