@@ -2226,18 +2226,27 @@ func (h *WeaviateHandler) pruneStaleActions(ctx context.Context, pluginName stri
 		return fmt.Errorf("list existing actions: %w", err)
 	}
 	stale := diffNotIn(existing, keep)
+	// Best-effort, matching pruneOrphans: keep deleting the rest even if one
+	// delete fails, so a single un-deletable record can't permanently block the
+	// cleanup of every record after it. Surface the first error to the caller.
+	pruned := 0
+	var firstErr error
 	for _, name := range stale {
 		if err := h.client.Data().Deleter().
 			WithClassName(h.actionsCollection).
 			WithID(actionUUID(pluginName, name)).
 			Do(ctx); err != nil {
-			return fmt.Errorf("delete stale action %q: %w", name, err)
+			if firstErr == nil {
+				firstErr = fmt.Errorf("delete stale action %q: %w", name, err)
+			}
+			continue
 		}
+		pruned++
 	}
-	if len(stale) > 0 {
-		log.Printf("weaviate-plugin: sync_actions: pruned %d stale action(s) for %s", len(stale), pluginName)
+	if pruned > 0 {
+		log.Printf("weaviate-plugin: sync_actions: pruned %d stale action(s) for %s", pruned, pluginName)
 	}
-	return nil
+	return firstErr
 }
 
 // pruneStaleKnowledgeSections deletes the plugin's knowledge sections whose slug
@@ -2259,7 +2268,10 @@ func (h *WeaviateHandler) pruneStaleKnowledgeSections(ctx context.Context, plugi
 	for _, slug := range keepSlugs {
 		keep[prefix+slug] = struct{}{}
 	}
+	// Best-effort, matching pruneOrphans: a single failed delete must not skip
+	// the remaining stale sections. Surface the first error to the caller.
 	pruned := 0
+	var firstErr error
 	for _, src := range sources {
 		if !strings.HasPrefix(src, prefix) {
 			continue // Like over-match guard
@@ -2269,14 +2281,17 @@ func (h *WeaviateHandler) pruneStaleKnowledgeSections(ctx context.Context, plugi
 		}
 		n, err := h.batchDeleteEqual(ctx, h.knowledgeCollection, "source", src)
 		if err != nil {
-			return fmt.Errorf("delete stale knowledge %q: %w", src, err)
+			if firstErr == nil {
+				firstErr = fmt.Errorf("delete stale knowledge %q: %w", src, err)
+			}
+			continue
 		}
 		pruned += n
 	}
 	if pruned > 0 {
 		log.Printf("weaviate-plugin: sync_actions: pruned %d stale knowledge section(s) for %s", pruned, pluginName)
 	}
-	return nil
+	return firstErr
 }
 
 func actionUUID(pluginName, actionName string) string {
