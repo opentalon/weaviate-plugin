@@ -881,6 +881,137 @@ func TestSyncActions_deletesStaleActions(t *testing.T) {
 	}
 }
 
+// mustSyncActions runs one sync_actions call and waits for the worker to drain.
+func mustSyncActions(t *testing.T, h *WeaviateHandler, id string, payload syncActionsPayload) {
+	t.Helper()
+	b, _ := json.Marshal(payload)
+	resp := h.Execute(plugin.Request{ID: id, Action: "sync_actions", Args: map[string]string{"payload": string(b)}})
+	if resp.Error != "" {
+		t.Fatalf("sync %s: %s", id, resp.Error)
+	}
+	waitSyncDrain(t, h, 10*time.Second)
+	time.Sleep(300 * time.Millisecond)
+}
+
+// actionRecordExists reports whether the plugin's action is stored in Weaviate.
+func actionRecordExists(t *testing.T, pluginName, actionName string) bool {
+	t.Helper()
+	objs, err := rawClient.Data().ObjectsGetter().
+		WithClassName(DefaultActionsCollection).
+		WithID(actionUUID(pluginName, actionName)).
+		Do(context.Background())
+	return err == nil && len(objs) > 0
+}
+
+// TestSyncActions_keepActionsPreservesUnsentValidActions is the definitive
+// gap-free test: it re-syncs only ONE of three actions but declares all three
+// still valid via keep_actions. The diff prune must keep the two that were not
+// re-upserted in this call — the legacy blanket pre-delete would have wiped
+// them. This is the property that makes a rolling restart's resync invisible to
+// a reader on a peer pod.
+func TestSyncActions_keepActionsPreservesUnsentValidActions(t *testing.T) {
+	h := newHandler(t)
+	const p = "keep-preserve-plugin"
+
+	seedTestPluginActions(t, h, p, []syncActionEntry{
+		{Name: "alpha", Description: "a"},
+		{Name: "bravo", Description: "b"},
+		{Name: "charlie", Description: "c"},
+	})
+
+	mustSyncActions(t, h, "kp-resync", syncActionsPayload{
+		PluginName:  p,
+		Actions:     []syncActionEntry{{Name: "alpha", Description: "a-updated"}},
+		KeepActions: []string{"alpha", "bravo", "charlie"},
+	})
+
+	for _, name := range []string{"alpha", "bravo", "charlie"} {
+		if !actionRecordExists(t, p, name) {
+			t.Errorf("%s should still exist: keep_actions listed it as valid, the diff prune must not delete it", name)
+		}
+	}
+}
+
+// TestSyncActions_keepActionsDeletesStale verifies the diff path still removes a
+// genuinely removed action (present locally, absent from keep_actions).
+func TestSyncActions_keepActionsDeletesStale(t *testing.T) {
+	h := newHandler(t)
+	const p = "keep-stale-plugin"
+
+	seedTestPluginActions(t, h, p, []syncActionEntry{
+		{Name: "alpha", Description: "a"},
+		{Name: "bravo", Description: "b"},
+		{Name: "charlie", Description: "c"},
+	})
+
+	// charlie is dropped from the current set.
+	mustSyncActions(t, h, "ks-resync", syncActionsPayload{
+		PluginName:  p,
+		Actions:     []syncActionEntry{{Name: "alpha", Description: "a"}, {Name: "bravo", Description: "b"}},
+		KeepActions: []string{"alpha", "bravo"},
+	})
+
+	if actionRecordExists(t, p, "charlie") {
+		t.Error("charlie should have been pruned (not in keep_actions)")
+	}
+	for _, name := range []string{"alpha", "bravo"} {
+		if !actionRecordExists(t, p, name) {
+			t.Errorf("%s should still exist after diff sync", name)
+		}
+	}
+}
+
+// TestSyncActions_keepActionsChunked exercises the real chunked flow: batch 0
+// carries the full keep_actions set plus the first chunk; a continuation batch
+// adds the rest. A pre-existing stale action ("zulu", not in keep_actions) must
+// be pruned, and every action in keep_actions must survive — including ones that
+// only arrive in the continuation batch and the batch-0 ones whose peers are
+// still pending when the prune runs.
+func TestSyncActions_keepActionsChunked(t *testing.T) {
+	h := newHandler(t)
+	const p = "keep-chunked-plugin"
+
+	seedTestPluginActions(t, h, p, []syncActionEntry{
+		{Name: "alpha", Description: "a"},
+		{Name: "bravo", Description: "b"},
+		{Name: "charlie", Description: "c"},
+		{Name: "zulu", Description: "stale, dropped this sync"},
+	})
+
+	full := []string{"alpha", "bravo", "charlie", "delta", "echo", "foxtrot"}
+
+	// Batch 0: first chunk + authoritative keep_actions (the full set).
+	mustSyncActions(t, h, "kc-batch0", syncActionsPayload{
+		PluginName: p,
+		Actions: []syncActionEntry{
+			{Name: "alpha", Description: "a"},
+			{Name: "bravo", Description: "b"},
+			{Name: "charlie", Description: "c"},
+		},
+		KeepActions: full,
+	})
+
+	// Continuation batch: remaining chunk, no pre-delete.
+	mustSyncActions(t, h, "kc-batch1", syncActionsPayload{
+		PluginName: p,
+		Actions: []syncActionEntry{
+			{Name: "delta", Description: "d"},
+			{Name: "echo", Description: "e"},
+			{Name: "foxtrot", Description: "f"},
+		},
+		IsContinuationBatch: true,
+	})
+
+	for _, name := range full {
+		if !actionRecordExists(t, p, name) {
+			t.Errorf("%s should be present after chunked diff sync", name)
+		}
+	}
+	if actionRecordExists(t, p, "zulu") {
+		t.Error("zulu should have been pruned by the batch-0 diff (not in keep_actions)")
+	}
+}
+
 // TestSyncActions_continuationBatchSkipsPreDelete verifies the fix for the
 // multi-batch sync truncation bug: when the orchestrator chunks a plugin's
 // actions across multiple sync_actions calls, batches 1..N must NOT pre-delete
