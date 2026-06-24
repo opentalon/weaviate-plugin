@@ -294,9 +294,10 @@ func (h *WeaviateHandler) handleDebugPrepare(w http.ResponseWriter, r *http.Requ
 	}
 
 	wStart := time.Now()
-	knowledgeResult, _ := h.searchCollection(ctx, h.knowledgeCollection, knowledgeFields, knowledgeQuery, 5, nil)
-	actionsResult, _ := h.searchCollection(ctx, h.actionsCollection, actionFields, searchText, 10, actionsWhere)
-	glossaryResult, _ := h.searchCollection(ctx, h.glossaryCollection, glossaryFields, searchText, 5, nil)
+	knowledgeResult, _ := h.searchCollection(ctx, h.knowledgeCollection, knowledgeFields, knowledgeQuery, 5, nil, nil)
+	// Mirror production prepare(): the tools search uses the configured alpha.
+	actionsResult, _ := h.searchCollection(ctx, h.actionsCollection, actionFields, searchText, 10, actionsWhere, &h.prepareActionsAlpha)
+	glossaryResult, _ := h.searchCollection(ctx, h.glossaryCollection, glossaryFields, searchText, 5, nil, nil)
 	weaviateMs := float64(time.Since(wStart).Microseconds()) / 1000.0
 
 	// Apply the same filter chokepoint as the production prepare(): minScore
