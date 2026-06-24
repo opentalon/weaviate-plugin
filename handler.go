@@ -103,6 +103,13 @@ type Config struct {
 	MinPrepareScoreTools     *float64 `json:"min_prepare_score_tools,omitempty"`
 	MinPrepareScoreKnowledge *float64 `json:"min_prepare_score_knowledge,omitempty"`
 	MinPrepareScoreGlossary  *float64 `json:"min_prepare_score_glossary,omitempty"`
+	// PrepareActionsAlpha sets the hybrid BM25<->vector blend for the `prepare`
+	// MCPActions (tool) retrieval: 0 = pure BM25 keyword, 1 = pure vector. When
+	// unset it defaults to defaultPrepareActionsAlpha (0.5) — keyword-leaning vs
+	// Weaviate's own 0.75 default, because on a tool corpus the vector half tends
+	// to be noise-prone (a few generic tools become magnets for unrelated queries).
+	// Applied only to the tools search in prepare; knowledge/glossary keep the default.
+	PrepareActionsAlpha *float64 `json:"prepare_actions_alpha,omitempty"`
 	Timeout                  string   `json:"timeout"` // Weaviate HTTP client timeout as duration string (e.g. "2m", "90s"); default "2m"
 	GlossaryCollection       string   `json:"glossary_collection"`
 	// Translator is the optional LibreTranslate-compatible query
@@ -172,6 +179,7 @@ type WeaviateHandler struct {
 	minPrepareScoreTools     float64
 	minPrepareScoreKnowledge float64
 	minPrepareScoreGlossary  float64
+	prepareActionsAlpha      float64
 	clientTimeout            time.Duration
 	translator               Translator
 
@@ -290,6 +298,14 @@ func (h *WeaviateHandler) Configure(configJSON string) error {
 	h.minPrepareScoreTools = pickPositive(cfg.MinPrepareScoreTools, h.minPrepareScore)
 	h.minPrepareScoreKnowledge = pickPositive(cfg.MinPrepareScoreKnowledge, h.minPrepareScore)
 	h.minPrepareScoreGlossary = pickPositive(cfg.MinPrepareScoreGlossary, h.minPrepareScore)
+
+	// Hybrid blend for prepare's tool retrieval. Cannot use pickPositive: 0.0 is
+	// a valid alpha (pure BM25), so an explicit 0 must be honoured, not treated
+	// as "unset". Pointer-nil → the 0.5 default.
+	h.prepareActionsAlpha = defaultPrepareActionsAlpha
+	if cfg.PrepareActionsAlpha != nil {
+		h.prepareActionsAlpha = clampUnit(*cfg.PrepareActionsAlpha)
+	}
 
 	h.translator = newTranslator(cfg.Translator)
 
@@ -680,6 +696,23 @@ type prepareResponse struct {
 // this for one collection at a time.
 const defaultMinPrepareScore = 0.012
 
+// defaultPrepareActionsAlpha is the hybrid BM25<->vector blend for prepare's
+// tool retrieval (0 = keyword only, 1 = vector only). 0.5 — keyword-leaning vs
+// Weaviate's 0.75 default — measured best on the MCPActions corpus, where the
+// vector half is magnet-prone. Override via config.prepare_actions_alpha.
+const defaultPrepareActionsAlpha = 0.5
+
+// clampUnit bounds a value to the [0, 1] interval (for alpha-style blends).
+func clampUnit(v float64) float64 {
+	if v < 0 {
+		return 0
+	}
+	if v > 1 {
+		return 1
+	}
+	return v
+}
+
 // pickPositive returns *override if it points at a positive float,
 // otherwise the supplied fallback. Used for per-collection score
 // thresholds: a deployment that only sets the umbrella
@@ -780,7 +813,7 @@ func (h *WeaviateHandler) prepare(req plugin.Request) plugin.Response {
 	if len(allowedPlugins) > 0 {
 		knowledgeQuery = searchText + " " + strings.Join(allowedPlugins, " ")
 	}
-	knowledgeResult, knowledgeErr := h.searchCollection(ctx, h.knowledgeCollection, knowledgeFields, knowledgeQuery, h.prepareKnowledgeLimit, nil)
+	knowledgeResult, knowledgeErr := h.searchCollection(ctx, h.knowledgeCollection, knowledgeFields, knowledgeQuery, h.prepareKnowledgeLimit, nil, nil)
 
 	// Search MCPActions with optional plugin filter. Limit is
 	// h.prepareActionsLimit (default 25) — needs to exceed
@@ -800,7 +833,7 @@ func (h *WeaviateHandler) prepare(req plugin.Request) plugin.Response {
 			WithOperator(filters.ContainsAny).
 			WithValueText(allowedPlugins...)
 	}
-	actionsResult, actionsErr := h.searchCollection(ctx, h.actionsCollection, actionFields, searchText, h.prepareActionsLimit, actionsWhere)
+	actionsResult, actionsErr := h.searchCollection(ctx, h.actionsCollection, actionFields, searchText, h.prepareActionsLimit, actionsWhere, &h.prepareActionsAlpha)
 
 	// Search Glossary for matching terms/definitions. Limit is
 	// h.prepareGlossaryLimit (default 10). `_additional.id` is requested for
@@ -810,7 +843,7 @@ func (h *WeaviateHandler) prepare(req plugin.Request) plugin.Response {
 		{Name: "term"}, {Name: "definition"},
 		{Name: "_additional", Fields: []graphql.Field{{Name: "id"}, {Name: "score"}}},
 	}
-	glossaryResult, glossaryErr := h.searchCollection(ctx, h.glossaryCollection, glossaryFields, searchText, h.prepareGlossaryLimit, nil)
+	glossaryResult, glossaryErr := h.searchCollection(ctx, h.glossaryCollection, glossaryFields, searchText, h.prepareGlossaryLimit, nil, nil)
 
 	// Fail-open: if all searches fail, pass through unchanged.
 	if knowledgeErr != nil && actionsErr != nil && glossaryErr != nil {
@@ -907,8 +940,11 @@ func translatorEventsOf(e *TranslatorEvent) []TranslatorEvent {
 	return []TranslatorEvent{*e}
 }
 
-// searchCollection performs a hybrid search (alpha=0.5) on the given collection
-// with an optional where filter.
+// searchCollection performs a hybrid (BM25 + vector) search on the given
+// collection with an optional where filter. When alpha is non-nil it sets the
+// blend explicitly (0 = keyword only, 1 = vector only); when nil, Weaviate's own
+// default (0.75) applies. Callers that care about the blend (the prepare tool
+// retrieval) pass a value; others pass nil to keep the default.
 func (h *WeaviateHandler) searchCollection(
 	ctx context.Context,
 	className string,
@@ -916,11 +952,16 @@ func (h *WeaviateHandler) searchCollection(
 	query string,
 	limit int,
 	where *filters.WhereBuilder,
+	alpha *float64,
 ) (interface{}, error) {
+	hybrid := h.client.GraphQL().HybridArgumentBuilder().WithQuery(query)
+	if alpha != nil {
+		hybrid = hybrid.WithAlpha(float32(*alpha))
+	}
 	builder := h.client.GraphQL().Get().
 		WithClassName(className).
 		WithFields(fields...).
-		WithHybrid(h.client.GraphQL().HybridArgumentBuilder().WithQuery(query)).
+		WithHybrid(hybrid).
 		WithLimit(limit)
 
 	if where != nil {
@@ -1105,13 +1146,13 @@ func (h *WeaviateHandler) askKnowledge(req plugin.Request) plugin.Response {
 		{Name: "title"}, {Name: "content"}, {Name: "source"},
 		{Name: "_additional", Fields: []graphql.Field{{Name: "score"}}},
 	}
-	knowledgeResult, knowledgeErr := h.searchCollection(ctx, h.knowledgeCollection, knowledgeFields, query, limit, knowledgeWhere)
+	knowledgeResult, knowledgeErr := h.searchCollection(ctx, h.knowledgeCollection, knowledgeFields, query, limit, knowledgeWhere, nil)
 
 	actionFields := []graphql.Field{
 		{Name: "pluginName"}, {Name: "actionName"}, {Name: "description"}, {Name: "parameters"},
 		{Name: "_additional", Fields: []graphql.Field{{Name: "score"}}},
 	}
-	actionsResult, actionsErr := h.searchCollection(ctx, h.actionsCollection, actionFields, query, limit, actionsWhere)
+	actionsResult, actionsErr := h.searchCollection(ctx, h.actionsCollection, actionFields, query, limit, actionsWhere, nil)
 
 	if knowledgeErr != nil && actionsErr != nil {
 		return plugin.Response{CallID: req.ID, Error: fmt.Sprintf("knowledge search failed: %v; actions search failed: %v", knowledgeErr, actionsErr)}
@@ -1256,7 +1297,7 @@ func (h *WeaviateHandler) searchInstructions(req plugin.Request) plugin.Response
 		{Name: "_additional", Fields: []graphql.Field{{Name: "score"}}},
 	}
 
-	result, err := h.searchCollection(ctx, h.knowledgeCollection, fields, query, limit, where)
+	result, err := h.searchCollection(ctx, h.knowledgeCollection, fields, query, limit, where, nil)
 	if err != nil {
 		return plugin.Response{CallID: req.ID, Error: fmt.Sprintf("search instructions: %v", err)}
 	}
