@@ -2,50 +2,24 @@
 
 [![CI](https://github.com/opentalon/weaviate-plugin/actions/workflows/ci.yml/badge.svg)](https://github.com/opentalon/weaviate-plugin/actions/workflows/ci.yml)
 
-An [OpenTalon](https://github.com/opentalon/opentalon) plugin that performs semantic and hybrid search over a [Weaviate](https://github.com/weaviate/weaviate) vector database collection. Use it as a retrieval step (RAG) to fetch relevant context before the LLM generates a response, manage MCP action indexing, and ingest knowledge articles.
+An [OpenTalon](https://github.com/opentalon/opentalon) plugin that serves a [Weaviate](https://github.com/weaviate/weaviate)-backed knowledge base. It lets the LLM pull knowledge articles on demand and ingests a plugin's MCP server instructions and knowledge articles into the knowledge collection.
 
 ## Actions
 
 | Action | Mode | Description |
 |---|---|---|
-| `weaviate.search` | LLM tool | nearText semantic search — the LLM calls this when it decides retrieval is needed |
-| `weaviate.hybrid_search` | LLM tool | Hybrid BM25 + vector. `alpha`: `0` = keyword only, `1` = vector only (default `0.5`) |
-| `weaviate.prepare` | **preparer** | Automatic RAG: runs before every LLM call, enriches the user message with retrieved context |
-| `weaviate.sync_actions` | orchestrator | Upserts plugin action definitions into the `MCPActions` collection for retrieval-based tool filtering. Supports hash-based skip |
-| `weaviate.sync_glossary` | orchestrator | Syncs glossary term/definition pairs into the `Glossary` collection for automatic context injection. Supports hash-based skip and continuation batches |
+| `weaviate.ask_knowledge` | LLM tool | Search the knowledge base by `query`, or fetch one article exactly by `slug` |
+| `weaviate.list_knowledge_titles` | LLM tool | List the slug + title of every knowledge article (the always-on catalog) |
+| `weaviate.search_instructions` | LLM tool | Search synced MCP server-instruction articles |
+| `weaviate.sync_actions` | orchestrator | Syncs a plugin's MCP server instructions + knowledge articles into the `KnowledgeArticles` collection. Per-doc hash skip + orphan prune |
+| `weaviate.sync_status` | orchestrator | Background sync worker counters |
 | `weaviate.ingest` | LLM tool / API | Insert a single knowledge article into the `KnowledgeArticles` collection |
 | `weaviate.ingest_batch` | LLM tool / API | Batch insert multiple knowledge articles |
+| `weaviate.refresh` | orchestrator | Re-create the `KnowledgeArticles` collection if deleted externally |
 
-`search` and `hybrid_search` accept `limit` and `fields` per-call overrides.
-
-### Tool mode vs. preparer mode
-
-**Tool mode** (default) — the LLM decides when to retrieve:
-```
-user -> LLM decides to call weaviate.search -> results -> LLM -> answer
-```
-
-**Preparer mode** — retrieval is automatic, invisible to the LLM as a tool choice:
-```
-user message -> weaviate.prepare(text=message) -> [retrieved_context]...message -> LLM -> answer
-```
-
-Use preparer mode when you always want retrieved context in the prompt (RAG-by-default). Use tool mode when retrieval should be conditional.
-
-**Glossary injection** — when glossary entries have been synced via `sync_glossary`, `prepare` also searches the Glossary collection and injects matching term definitions:
-
-```
-[glossary_context]
-- **SLA**: Service Level Agreement — contractual response time for support tickets
-- **P1 Incident**: Production-critical outage affecting >50% of users, 15min response required
-[/glossary_context]
-
-[knowledge_context]
-...matching knowledge articles...
-[/knowledge_context]
-
-What's the SLA for P1 incidents?
-```
+> Tool retrieval lives in the orchestrator's tool registry; this plugin serves
+> knowledge only. There is no preparer / RAG pre-pass action and no generic
+> search over an arbitrary collection.
 
 ## Configuration
 
@@ -59,138 +33,32 @@ plugins:
     config:
       host: "localhost:8080"       # Weaviate address
       scheme: "http"               # "http" or "https"
-      collection: "Article"        # Weaviate class for search/hybrid_search/prepare
-      fields:                      # fields to return in search results
-        - title
-        - body
-        - url
-      limit: 5                     # default result count
 
       # Vectorizer (default: "text2vec-transformers")
       vectorizer: "text2vec-transformers"
       # module_config: {}          # optional per-module config (see Vectorizer Options below)
 
-      # Knowledge-augmented RAG (Phase 1)
-      actions_collection: "MCPActions"           # collection for indexed plugin capabilities (default)
+      # Knowledge base
       knowledge_collection: "KnowledgeArticles"  # collection for knowledge articles (default)
-      glossary_collection: "Glossary"            # collection for glossary term/definition pairs (default)
-      auto_create_schema: true                   # auto-create MCPActions, KnowledgeArticles & Glossary on startup (default true)
+      auto_create_schema: true                   # auto-create KnowledgeArticles on startup (default true)
 
       # Client timeout
       timeout: "2m"                # Weaviate HTTP client timeout (default 2m); increase for large batch syncs
 
-      # Prepare-phase filtering
-      min_prepare_score: 0.012     # minimum hybrid-search score for prepare results (default 0.012)
-
       # HTTP ingestion server (optional)
       http_addr: ":8081"           # address for the HTTP ingestion API
       token: "my-secret-token"     # Bearer token — required when http_addr is set
-
-      # Optional cross-lingual query pre-processor (off by default)
-      translator:
-        enabled: false                                              # opt-in
-        url: "http://libretranslate.libretranslate.svc:5000"        # LibreTranslate-compatible endpoint
-        target_lang: "en"                                           # default "en"
-        source_lang: "auto"                                         # default "auto" (let translator detect)
-        timeout: "3s"                                               # per-request timeout (default 3s)
-        skip_if_target_confidence: 0.7                              # /detect first; skip /translate when source==target with at least this confidence (default 0.7, 0 disables)
-        api_key: ""                                                 # only if the translator requires LT_API_KEYS
 ```
 
-### Translator observability
+All config fields have defaults (`host: localhost:8080`, `scheme: http`, `knowledge_collection: KnowledgeArticles`, `vectorizer: text2vec-transformers`).
 
-When `http_addr` is configured, the plugin exposes:
+### Observability
 
-| Endpoint | Auth | Purpose |
-|---|---|---|
-| `GET /metrics` | open (network-restricted) | Prometheus exposition with translator + plugin metrics |
-| `POST /api/v1/debug/prepare` | bearer token | Run a query through the full prepare pipeline and return a structured trace |
+When `http_addr` is configured, the plugin exposes `GET /metrics` (open, network-restricted) with Prometheus metrics for the background sync worker:
 
-Translator metrics:
-
-* `weaviate_plugin_translator_calls_total{callsite,result}` — `result` is `translated` / `skipped_target_lang` / `skipped_disabled` / `failed`. The `callsite` label tells you whether a translate happened in `prepare`, `search`, `hybrid_search`, `ask_knowledge`, `search_instructions`, or `debug_prepare`.
-* `weaviate_plugin_translator_duration_seconds{callsite,result}` — wall-time of the full translator step (detect + translate, or just detect for the skip case). 1ms..2s buckets.
-* `weaviate_plugin_translator_detected_lang_total{lang}` — source-language distribution from the `/detect` short-circuit.
-
-Debug trace (sample):
-
-```bash
-curl -s -H "Authorization: Bearer $TOKEN" \
-     -H "Content-Type: application/json" \
-     -d '{"text":"Wieviele Lagerartikel habe ich?"}' \
-     http://weaviate-plugin:8082/api/v1/debug/prepare
-```
-
-```json
-{
-  "original": "Wieviele Lagerartikel habe ich?",
-  "search_text": "How many storage items do I have?",
-  "translated": true,
-  "translator_ms": 84.2,
-  "min_prepare_score": 0.45,
-  "matched_tools": ["timly.list-items", "weaviate.ask_knowledge"],
-  "actions_top": [
-    {"score": 0.81, "plugin_name": "timly", "action_name": "list-items"},
-    {"score": 0.42, "plugin_name": "timly", "action_name": "list-locations"}
-  ],
-  "knowledge_top": [
-    {"score": 0.31, "title": "timly MCP server instructions", "source": "mcp:timly"}
-  ],
-  "weaviate_ms": 38.1,
-  "knowledge_query": "How many storage items do I have?"
-}
-```
-
-The debug endpoint runs through the same code path as `prepare` (translator,
-hybrid search, score-threshold filter), so it's a faithful reproduction of
-what the orchestrator sees — minus the LLM-bound message envelope.
-
-### Translator (cross-lingual query pre-processor)
-
-When the corpus is indexed in one language (typically English) but users ask
-questions in another (DE / FR / ES / …), BM25 contributes ~0 to the hybrid
-score because the foreign-language tokens never appear in the corpus. With
-`alpha=0.5` the resulting score is roughly halved, often dropping good hits
-below `min_prepare_score`.
-
-The translator addresses this end-to-end without re-indexing: every query
-that reaches `prepare`, `search`, `hybrid_search`, `ask_knowledge`, or
-`search_instructions` is translated to `target_lang` (default `en`) before
-the lookup runs. The original-language `text` is still echoed back into the
-`prepare` response message so the LLM sees the user's query in their own
-language and replies in kind.
-
-Behaviour at a glance:
-
-* `enabled: false` (default) → no-op, zero overhead.
-* `enabled: true` with no `url` → silently downgrades to no-op (logged).
-* Detect-first short-circuit: if `/detect` says the input is already in
-  `target_lang` with ≥ `skip_if_target_confidence`, the `/translate` call is
-  skipped (~30 ms `/detect` only).
-* Any error (network, non-2xx, empty response) → fail-open: the original
-  text is returned and the search runs untranslated.
-
-
-The `collection` field is required. All others have defaults (`host: localhost:8080`, `scheme: http`, `limit: 5`, `vectorizer: text2vec-transformers`).
-
-### `min_prepare_score`
-
-During the `prepare` phase the plugin runs a hybrid search against the actions and knowledge collections. Each result comes back with a relevance score. Results scoring below `min_prepare_score` are discarded.
-
-| Setting | Value |
-|---|---|
-| Config key | `min_prepare_score` |
-| Type | float |
-| Default | `0.012` |
-
-- **Higher values** (e.g. `0.30`) return only high-confidence matches, reducing noise but potentially dropping relevant results.
-- **Lower values** surface more results at the cost of relevance.
-- **`0` or omitted** falls back to the default (`0.012`).
-
-Tuning tips:
-- Start with the default and check plugin logs (`min_score=... matched_tools=...`) to see what scores your data produces.
-- If the plugin returns too many irrelevant tools, raise the threshold incrementally.
-- If relevant tools are being filtered out, lower it.
+* `weaviate_plugin_sync_jobs_enqueued_total{type}` — sync jobs enqueued.
+* `weaviate_plugin_sync_job_duration_seconds{type,status}` — wall-time per sync job.
+* `weaviate_plugin_sync_queue_depth` — pending sync jobs in the queue.
 
 ### Vectorizer options
 
@@ -242,19 +110,17 @@ Weaviate's legacy English-only word-embedding vectorizer. Not recommended for Ge
 
 ### Auto-schema creation
 
-When `auto_create_schema` is `true` (the default), the plugin creates three Weaviate collections on startup if they don't already exist:
+When `auto_create_schema` is `true` (the default), the plugin creates the knowledge collection on startup if it doesn't already exist:
 
 | Collection | Properties | Purpose |
 |---|---|---|
-| `MCPActions` | `pluginName`, `actionName`, `description`, `parameters` | Indexed plugin capabilities for retrieval-based tool filtering |
-| `KnowledgeArticles` | `title`, `content`, `source`, `tags` | Domain knowledge and how-to guides |
-| `Glossary` | `term`, `definition`, `category`, `tags`, `synonyms` | Domain terminology definitions, auto-injected via prepare |
+| `KnowledgeArticles` | `title`, `slug`, `content`, `source`, `tags`, `contentHash` | Domain knowledge, how-to guides, and synced MCP server instructions |
 
-Collections are created with the configured `vectorizer` and `module_config`. Set `auto_create_schema: false` to manage schemas manually.
+The collection is created with the configured `vectorizer` and `module_config`. Set `auto_create_schema: false` to manage the schema manually.
 
 ## HTTP Ingestion API
 
-When `http_addr` is configured, the plugin starts a token-protected HTTP server for external article and action ingestion. A `token` must be set — the plugin refuses to start without one.
+When `http_addr` is configured, the plugin starts a token-protected HTTP server for external article and knowledge-sync ingestion. A `token` must be set — the plugin refuses to start without one.
 
 All endpoints require the header `Authorization: Bearer <token>`.
 
@@ -289,7 +155,7 @@ Response: `{"ingested":2}`
 
 ### POST /api/v1/actions/sync
 
-Sync plugin action definitions into the MCPActions collection. Uses deterministic UUIDs so repeated syncs upsert rather than duplicate.
+Sync a plugin's MCP server instructions and knowledge articles into the KnowledgeArticles collection. Uses deterministic UUIDs so repeated syncs upsert rather than duplicate.
 
 ```bash
 curl -X POST http://localhost:8081/api/v1/actions/sync \
@@ -297,52 +163,17 @@ curl -X POST http://localhost:8081/api/v1/actions/sync \
   -H "Content-Type: application/json" \
   -d '{
     "plugin_name": "jira",
-    "actions": [
-      {"name": "create_issue", "description": "Create a Jira issue", "parameters": [{"name":"project","type":"string"}]},
-      {"name": "list_issues", "description": "List open issues"}
-    ]
-  }'
-```
-
-Response: `{"synced":2}`
-
-### POST /api/v1/glossary/sync
-
-Sync glossary term/definition pairs into the Glossary collection. Uses deterministic UUIDs (keyed on term) and supports hash-based skip + continuation batches.
-
-```bash
-curl -X POST http://localhost:8081/api/v1/glossary/sync \
-  -H "Authorization: Bearer my-secret-token" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "glossary_hash": "sha256:9f86d0...",
-    "entries": [
-      {"term": "SLA", "definition": "Service Level Agreement — contractual response time", "category": "support", "tags": ["contracts"], "synonyms": ["Service Level Agreement"]},
-      {"term": "P1 Incident", "definition": "Production-critical outage affecting >50% of users", "category": "incidents", "synonyms": ["Priority 1", "Sev1"]}
+    "server_instructions": "Use create_issue to open a ticket; statuses follow Open → In Progress → Done.",
+    "knowledge_articles": [
+      {"id": "workflow", "title": "Issue workflow", "content": "Issues move Open → In Progress → Review → Done."}
     ],
-    "is_continuation_batch": false
+    "keep_plugins": ["jira"]
   }'
 ```
 
-Response: `{"synced":2}`
+Response: `{"queued":true,"action":"sync_actions"}` (the actual write runs on the background worker; poll `GET /api/v1/sync/status`).
 
-If the hash matches the previous sync: `{"skipped":true,"reason":"hash_match"}`
-
-For large glossaries, split into batches. Batch 0 (`is_continuation_batch: false`) deletes old entries and inserts. Batches 1..N (`is_continuation_batch: true`) only insert.
-
-### Hash-based sync skip
-
-Both `sync_actions` and `sync_glossary` support hash-based skip to avoid re-writing unchanged data to Weaviate.
-
-**sync_actions**: add a `hash` field to the payload. The plugin stores the last-seen hash per plugin. On batch 0, if the hash matches, the upsert is skipped (orphan prune via `keep_plugins` still runs).
-
-```json
-{"plugin_name": "jira", "hash": "sha256:abc...", "actions": [...], "keep_plugins": ["jira"]}
-```
-
-**sync_glossary**: the `glossary_hash` field works the same way. On batch 0, if the hash matches, the entire sync is skipped. Continuation batches always upsert.
-
-The hash is opaque to the plugin — the orchestrator computes it over the source data (e.g. SHA-256) and the plugin simply compares strings.
+The server-instructions article is stored with source `mcp:<plugin>`; each `knowledge_articles[]` entry is stored with source `mcp-knowledge:<plugin>:<id>` and slug `<id>`. On batch 0, knowledge sections dropped since the last sync are pruned, and whole plugins absent from `keep_plugins` are pruned. Each document carries a `contentHash`, so an unchanged sync re-vectorizes nothing.
 
 ## Install
 
@@ -360,9 +191,11 @@ make install PREFIX=~/.local/bin
 
 ## Quick start
 
-### Option A — brew (macOS, keyword tests only)
+### Option A — brew (macOS, no vectorizer)
 
-`brew install weaviate` gives you the binary without a vectorizer module, so `search` (nearText) is unavailable but `hybrid_search` with `alpha=0` works fine.
+`brew install weaviate` gives you the binary without a vectorizer module. The
+knowledge retrieval is hybrid (BM25 + vector), so without a vectorizer the
+keyword half still works; semantic relevance is degraded but the suite runs.
 
 ```bash
 brew install weaviate
@@ -374,16 +207,16 @@ PERSISTENCE_DATA_PATH="$TMPDIR/weaviate" \
 weaviate --host 0.0.0.0 --port 8080 --scheme http &
 ```
 
-Run the keyword-only integration tests:
+Run the integration tests:
 
 ```bash
 make test-brew
-# nearText tests are automatically skipped (WEAVIATE_MODULE defaults to "none")
 ```
 
-### Option B — Docker Compose (full suite, includes semantic search)
+### Option B — Docker Compose (full suite, includes semantic vectors)
 
-Starts Weaviate + the multilingual transformer inference service so nearText works:
+Starts Weaviate + the multilingual transformer inference service so the vector
+half of knowledge retrieval works:
 
 ```bash
 make test-docker
@@ -396,7 +229,7 @@ This uses `sentence-transformers-paraphrase-multilingual-MiniLM-L12-v2` (384 dim
 | Variable | Default | Description |
 |---|---|---|
 | `WEAVIATE_HOST` | `localhost:8080` | Address of the running Weaviate instance |
-| `WEAVIATE_MODULE` | `none` | Set to `text2vec-transformers` to enable nearText tests |
+| `WEAVIATE_MODULE` | `none` | Set to `text2vec-transformers` to exercise the vector half of knowledge retrieval |
 
 ## Build
 
@@ -427,54 +260,30 @@ GitHub Actions runs three jobs on every push/PR:
 |---|---|
 | **lint** | `golangci-lint` |
 | **unit** | `go test ./...` (no Weaviate required) |
-| **integration** | Real Weaviate 1.30 + multilingual transformers via Docker service; runs full test suite including nearText |
+| **integration** | Real Weaviate 1.30 + multilingual transformers via Docker service; runs full test suite including vector retrieval |
 
 The integration job uses Docker service containers declared in the workflow — no manual setup needed.
 
 ## Test suite overview
 
-| Test | Needs vectorizer | What it checks |
-|---|---|---|
-| `TestCapabilities` | no | Plugin declares correct name and all 6 actions |
-| `TestConfigure_defaults` | no | Default limit=5, default collection names applied |
-| `TestConfigure_missingCollection` | no | Error returned when collection omitted |
-| `TestConfigure_badJSON` | no | Error returned for malformed config |
-| `TestConfigure_httpRequiresToken` | no | Error when http_addr set without token |
-| `TestConfigure_customCollectionNames` | no | Custom actions/knowledge collection names are applied |
-| `TestConfigure_autoCreateSchema` | no | MCPActions and KnowledgeArticles created on startup |
-| `TestConfigure_autoCreateSchemaIdempotent` | no | Repeated Configure with auto_create_schema does not fail |
-| `TestExecute_unknownAction` | no | Error returned for unrecognised action |
-| `TestHybridSearch_keywordOnly` | no | BM25 (alpha=0) returns the Python article for "python" |
-| `TestHybridSearch_limitOverride` | no | `limit=1` returns exactly one result |
-| `TestHybridSearch_fieldsOverride` | no | Requesting only `title` omits `body` from response |
-| `TestSearch_semantic` | **yes** | nearText "vector database" returns the Weaviate article |
-| `TestSearch_missingQuery` | no | Error returned when query arg is absent |
-| `TestHybridSearch_missingQuery` | no | Error returned when query arg is absent |
-| `TestSyncActions` | no | Sync 2 actions, verify synced count |
-| `TestSyncActions_upsert` | no | Re-sync with updated description succeeds |
-| `TestSyncActions_missingPayload` | no | Error when payload arg is absent |
-| `TestSyncActions_missingPluginName` | no | Error when plugin_name is missing from payload |
-| `TestSyncActions_emptyActions` | no | Empty actions array returns synced:0 |
-| `TestIngest` | no | Ingest single article with all fields |
-| `TestIngest_missingFields` | no | Error when title or content is missing |
-| `TestIngest_noOptionalFields` | no | Ingest with only title and content succeeds |
-| `TestIngestBatch` | no | Batch ingest 3 articles |
-| `TestIngestBatch_missingPayload` | no | Error when payload arg is absent |
-| `TestIngestBatch_skipsInvalid` | no | Invalid articles (missing title/content) are skipped |
-| `TestIngestBatch_badJSON` | no | Error for malformed JSON payload |
-| `TestHTTP_ingestArticle` | no | HTTP POST article with valid token succeeds |
-| `TestHTTP_ingestArticleUnauthorized` | no | HTTP POST without token returns 401 |
-| `TestHTTP_ingestArticleWrongToken` | no | HTTP POST with wrong token returns 401 |
-| `TestHTTP_syncActions` | no | HTTP POST sync_actions with valid token succeeds |
-| `TestHTTP_ingestBatch` | no | HTTP POST batch with valid token succeeds |
-| `TestHTTP_badJSON` | no | HTTP POST with invalid JSON returns 400 |
-| `TestHTTP_noTokenConfigured` | no | Requests pass through when no token is configured |
+Unit tests (no Weaviate, run by `go test ./...`) cover Capabilities classification, config/timeout parsing, the per-doc change-skip decision, and the content-hash helper.
+
+Integration tests (build tag `integration`, need a live Weaviate) cover:
+
+| Area | What it checks |
+|---|---|
+| Capabilities | Plugin declares the correct name and the knowledge-only action set |
+| Configure | Defaults, custom knowledge collection name, bad-JSON error, `http_addr` requires token, auto-schema creation + idempotency |
+| `ask_knowledge` | Semantic search, exact-slug fetch, source filter, limit override, no-results, missing-query error |
+| `list_knowledge_titles` | Returns the slug+title catalog |
+| `sync_actions` (knowledge sync) | Server-instructions + knowledge-article ingestion, stale-section pruning, orphan-plugin pruning, disjoint source-prefix scopes, missing payload/plugin_name errors |
+| `ingest` / `ingest_batch` | Single + batch article ingestion, validation, invalid-skip |
+| HTTP API | Article/batch/sync-actions ingestion with token auth, 401 on bad token, 400 on bad JSON, pass-through when no token configured |
+| `refresh` | Re-creates the knowledge collection |
 
 ## Wiring into OpenTalon
 
-### Tool mode (LLM-callable)
-
-The LLM sees `search` and `hybrid_search` as available tools and calls them when it decides retrieval is useful:
+Enable the HTTP ingestion API and auto-schema creation to build a knowledge base the LLM can pull from via `ask_knowledge` / `list_knowledge_titles`:
 
 ```yaml
 plugins:
@@ -484,57 +293,12 @@ plugins:
     config:
       host: "localhost:8080"
       scheme: "http"
-      collection: "Article"
-      fields: [title, body]
-      limit: 5
-```
-
-### Preparer mode (automatic RAG — retrieval before every LLM call)
-
-Register `weaviate.prepare` as a `content_preparer`. The orchestrator calls it with the raw user message as `text` before the first LLM call, and replaces the message with the enriched version (a `[retrieved_context]` block prepended):
-
-```yaml
-plugins:
-  - name: weaviate
-    plugin: /usr/local/bin/weaviate-plugin
-    enabled: true
-    config:
-      host: "localhost:8080"
-      scheme: "http"
-      collection: "Article"
-      fields: [title, body]
-      limit: 5
-
-content_preparers:
-  - plugin: weaviate
-    action: prepare
-    # arg_key defaults to "text" — matches the prepare action parameter
-    fail_open: true   # Weaviate outage passes the original message through instead of blocking
-```
-
-With `fail_open: true` and the plugin's own fail-open logic, a Weaviate outage never blocks the LLM call.
-
-### Knowledge-augmented RAG mode
-
-Enable the HTTP ingestion API and auto-schema creation to build a knowledge base alongside MCP action indexing:
-
-```yaml
-plugins:
-  - name: weaviate
-    plugin: /usr/local/bin/weaviate-plugin
-    enabled: true
-    config:
-      host: "localhost:8080"
-      scheme: "http"
-      collection: "Article"
-      fields: [title, body]
-      limit: 5
       auto_create_schema: true
       http_addr: ":8081"
       token: "my-secret-token"
 ```
 
-The orchestrator can call `sync_actions` at startup to index all plugin capabilities into the `MCPActions` collection. External systems can push knowledge articles via the HTTP API.
+The orchestrator can call `sync_actions` at startup to ingest each plugin's MCP server instructions and knowledge articles into the `KnowledgeArticles` collection. External systems can push knowledge articles via the HTTP API.
 
 ## Kubernetes Deployment (ArgoCD)
 
@@ -585,7 +349,7 @@ kubectl -n weaviate get pods
 kubectl -n weaviate exec svc/weaviate -- wget -qO- http://localhost:8080/v1/.well-known/ready
 
 # Verify the vectorizer is set correctly on a collection
-kubectl -n weaviate exec svc/weaviate -- wget -qO- http://localhost:8080/v1/schema/MCPActions | python3 -m json.tool
+kubectl -n weaviate exec svc/weaviate -- wget -qO- http://localhost:8080/v1/schema/KnowledgeArticles | python3 -m json.tool
 ```
 
 ### Connect the plugin
@@ -600,9 +364,6 @@ plugins:
     config:
       host: "weaviate.weaviate.svc.cluster.local:8080"
       scheme: "http"
-      collection: "Article"
-      fields: [title, body]
-      limit: 5
       vectorizer: "text2vec-transformers"
       auto_create_schema: true
 ```

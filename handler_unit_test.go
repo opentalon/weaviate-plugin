@@ -1,8 +1,8 @@
 package main
 
 import (
-	"reflect"
 	"testing"
+	"time"
 
 	"github.com/go-openapi/strfmt"
 	"github.com/opentalon/opentalon/pkg/plugin"
@@ -27,8 +27,8 @@ func TestCapabilities_readOnlyAndPinClassification(t *testing.T) {
 		byName[a.Name] = a
 	}
 
-	reads := []string{"search", "hybrid_search", "ask_knowledge", "list_knowledge_titles", "search_instructions", "sync_status"}
-	writes := []string{"sync_actions", "ingest", "ingest_batch", "sync_glossary", "refresh"}
+	reads := []string{"ask_knowledge", "list_knowledge_titles", "search_instructions", "sync_status"}
+	writes := []string{"sync_actions", "ingest", "ingest_batch", "refresh"}
 
 	for _, name := range reads {
 		a, ok := byName[name]
@@ -91,83 +91,6 @@ func TestCapabilities_knowledgeSlugAndCatalog(t *testing.T) {
 	}
 }
 
-// TestDiffNotIn pins the stale-record diff used by the in-place sync prune:
-// given the currently-stored names (a) and the authoritative current set (b),
-// it returns exactly the names to delete (in a, not in b). This is the core of
-// the gap-free sync — a still-valid name that has not been re-upserted yet must
-// never appear as stale. Pure function, no Weaviate, runs in the unit suite.
-func TestDiffNotIn(t *testing.T) {
-	tests := []struct {
-		name     string
-		existing []string
-		keep     []string
-		want     []string
-	}{
-		{
-			name:     "update only — nothing stale",
-			existing: []string{"a", "b", "c"},
-			keep:     []string{"a", "b", "c"},
-			want:     nil,
-		},
-		{
-			name:     "create new — D added, nothing stale",
-			existing: []string{"a", "b", "c"},
-			keep:     []string{"a", "b", "c", "d"},
-			want:     nil,
-		},
-		{
-			name:     "delete outdated — C removed",
-			existing: []string{"a", "b", "c"},
-			keep:     []string{"a", "b"},
-			want:     []string{"c"},
-		},
-		{
-			name:     "rename — old name stale, new name created",
-			existing: []string{"a", "b", "c"},
-			keep:     []string{"a", "b", "c_renamed"},
-			want:     []string{"c"},
-		},
-		{
-			name:     "multi delete",
-			existing: []string{"a", "b", "c"},
-			keep:     []string{"a"},
-			want:     []string{"b", "c"},
-		},
-		{
-			name:     "first sync — nothing stored yet",
-			existing: nil,
-			keep:     []string{"a", "b"},
-			want:     nil,
-		},
-		{
-			name:     "all removed — empty keep deletes everything stored",
-			existing: []string{"a", "b"},
-			keep:     []string{},
-			want:     []string{"a", "b"},
-		},
-		{
-			name:     "partial resync — valid names not yet re-upserted are NOT stale",
-			existing: []string{"a", "b", "c"},
-			keep:     []string{"a", "b", "c", "d", "e"}, // d,e arrive in later batches
-			want:     nil,
-		},
-		{
-			name:     "order of existing is preserved in the result",
-			existing: []string{"c", "a", "b"},
-			keep:     []string{"a"},
-			want:     []string{"c", "b"},
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := diffNotIn(tt.existing, tt.keep)
-			if !reflect.DeepEqual(got, tt.want) {
-				t.Errorf("diffNotIn(%v, %v) = %v, want %v", tt.existing, tt.keep, got, tt.want)
-			}
-		})
-	}
-}
-
 // TestSplitChangedDocs pins the per-doc skip decision that drives re-vectorization:
 // a doc is re-written only when its contentHash is absent from or differs from
 // what's stored, and skipped when it matches exactly. This is the efficiency
@@ -214,5 +137,76 @@ func TestSplitChangedDocs(t *testing.T) {
 	if len(allChanged) != len(candidates) || noneSkipped != 0 {
 		t.Errorf("empty stored: changed=%d skipped=%d, want changed=%d skipped=0",
 			len(allChanged), noneSkipped, len(candidates))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests for timeout config parsing. Configure with auto_create_schema=false
+// touches no network, so these run in the unit suite.
+// ---------------------------------------------------------------------------
+
+func TestConfigureTimeout_default(t *testing.T) {
+	h := &WeaviateHandler{}
+	cfg := `{"host":"localhost:8080","auto_create_schema":false}`
+	if err := h.Configure(cfg); err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+	if h.clientTimeout != 2*time.Minute {
+		t.Errorf("expected default 2m, got %s", h.clientTimeout)
+	}
+}
+
+func TestConfigureTimeout_customDuration(t *testing.T) {
+	h := &WeaviateHandler{}
+	cfg := `{"host":"localhost:8080","auto_create_schema":false,"timeout":"5m"}`
+	if err := h.Configure(cfg); err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+	if h.clientTimeout != 5*time.Minute {
+		t.Errorf("expected 5m, got %s", h.clientTimeout)
+	}
+}
+
+func TestConfigureTimeout_seconds(t *testing.T) {
+	h := &WeaviateHandler{}
+	cfg := `{"host":"localhost:8080","auto_create_schema":false,"timeout":"90s"}`
+	if err := h.Configure(cfg); err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+	if h.clientTimeout != 90*time.Second {
+		t.Errorf("expected 90s, got %s", h.clientTimeout)
+	}
+}
+
+func TestConfigureTimeout_invalidFallsBackToDefault(t *testing.T) {
+	h := &WeaviateHandler{}
+	cfg := `{"host":"localhost:8080","auto_create_schema":false,"timeout":"notaduration"}`
+	if err := h.Configure(cfg); err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+	if h.clientTimeout != 2*time.Minute {
+		t.Errorf("expected default 2m for invalid timeout, got %s", h.clientTimeout)
+	}
+}
+
+func TestConfigureTimeout_zeroFallsBackToDefault(t *testing.T) {
+	h := &WeaviateHandler{}
+	cfg := `{"host":"localhost:8080","auto_create_schema":false,"timeout":"0s"}`
+	if err := h.Configure(cfg); err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+	if h.clientTimeout != 2*time.Minute {
+		t.Errorf("expected default 2m for zero timeout, got %s", h.clientTimeout)
+	}
+}
+
+func TestConfigureTimeout_negativeFallsBackToDefault(t *testing.T) {
+	h := &WeaviateHandler{}
+	cfg := `{"host":"localhost:8080","auto_create_schema":false,"timeout":"-5m"}`
+	if err := h.Configure(cfg); err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+	if h.clientTimeout != 2*time.Minute {
+		t.Errorf("expected default 2m for negative timeout, got %s", h.clientTimeout)
 	}
 }
