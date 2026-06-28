@@ -74,7 +74,6 @@ func TestMain(m *testing.M) {
 
 	bgCtx := context.Background()
 	_ = rawClient.Schema().ClassDeleter().WithClassName(testClass).Do(bgCtx)
-	_ = rawClient.Schema().ClassDeleter().WithClassName(DefaultActionsCollection).Do(bgCtx)
 	_ = rawClient.Schema().ClassDeleter().WithClassName(DefaultKnowledgeCollection).Do(bgCtx)
 	os.Exit(code)
 }
@@ -111,22 +110,7 @@ func setupSchema() {
 
 func setupRAGSchemas() {
 	ctx := context.Background()
-	_ = rawClient.Schema().ClassDeleter().WithClassName(DefaultActionsCollection).Do(ctx)
 	_ = rawClient.Schema().ClassDeleter().WithClassName(DefaultKnowledgeCollection).Do(ctx)
-
-	actions := &wmodels.Class{
-		Class:      DefaultActionsCollection,
-		Vectorizer: vectorizerModule(),
-		Properties: []*wmodels.Property{
-			{Name: "pluginName", DataType: []string{"text"}},
-			{Name: "actionName", DataType: []string{"text"}},
-			{Name: "description", DataType: []string{"text"}},
-			{Name: "parameters", DataType: []string{"text"}},
-		},
-	}
-	if err := rawClient.Schema().ClassCreator().WithClass(actions).Do(ctx); err != nil {
-		panic(fmt.Sprintf("create MCPActions: %v", err))
-	}
 
 	knowledge := &wmodels.Class{
 		Class:      DefaultKnowledgeCollection,
@@ -196,25 +180,6 @@ func seedRAGData() {
 		}
 	}
 
-	// Seed MCP actions with deterministic IDs.
-	mcpActions := []map[string]interface{}{
-		{"pluginName": "jira", "actionName": "create_issue", "description": "Create a new issue in the Jira project tracker"},
-		{"pluginName": "jira", "actionName": "list_issues", "description": "List all open issues in a Jira project"},
-		{"pluginName": "gitlab", "actionName": "create_mr", "description": "Create a merge request in GitLab"},
-		{"pluginName": "gitlab", "actionName": "list_pipelines", "description": "List CI pipelines in a GitLab project"},
-	}
-	for _, a := range mcpActions {
-		id := actionUUID(a["pluginName"].(string), a["actionName"].(string))
-		_, err := rawClient.Data().Creator().
-			WithClassName(DefaultActionsCollection).
-			WithID(id).
-			WithProperties(a).
-			Do(ctx)
-		if err != nil {
-			panic(fmt.Sprintf("seed action %s.%s: %v", a["pluginName"], a["actionName"], err))
-		}
-	}
-
 	time.Sleep(300 * time.Millisecond)
 }
 
@@ -281,7 +246,7 @@ func TestCapabilities(t *testing.T) {
 	for _, a := range caps.Actions {
 		actions[a.Name] = true
 	}
-	for _, want := range []string{"search", "hybrid_search", "prepare", "sync_actions", "ingest", "ingest_batch", "list_knowledge_titles", "sync_status", "refresh"} {
+	for _, want := range []string{"search", "hybrid_search", "sync_actions", "ingest", "ingest_batch", "ask_knowledge", "search_instructions", "list_knowledge_titles", "sync_status", "refresh"} {
 		if !actions[want] {
 			t.Errorf("missing action %q", want)
 		}
@@ -304,166 +269,11 @@ func TestConfigure_defaults(t *testing.T) {
 	if h.collection != testClass {
 		t.Errorf("collection: got %q want %q", h.collection, testClass)
 	}
-	if h.actionsCollection != DefaultActionsCollection {
-		t.Errorf("actions_collection: got %q want %q", h.actionsCollection, DefaultActionsCollection)
-	}
 	if h.knowledgeCollection != DefaultKnowledgeCollection {
 		t.Errorf("knowledge_collection: got %q want %q", h.knowledgeCollection, DefaultKnowledgeCollection)
 	}
-	// Prepare-fan-out defaults must exceed the orchestrator's downstream
-	// budgets, otherwise the `cap_exceeded` dedup reason and Tier 2 tool
-	// promotion become unreachable. See defaultPrepareKnowledgeLimit comment.
-	if h.prepareKnowledgeLimit != defaultPrepareKnowledgeLimit {
-		t.Errorf("prepareKnowledgeLimit: got %d want %d", h.prepareKnowledgeLimit, defaultPrepareKnowledgeLimit)
-	}
-	if h.prepareActionsLimit != defaultPrepareActionsLimit {
-		t.Errorf("prepareActionsLimit: got %d want %d", h.prepareActionsLimit, defaultPrepareActionsLimit)
-	}
-	if h.prepareGlossaryLimit != defaultPrepareGlossaryLimit {
-		t.Errorf("prepareGlossaryLimit: got %d want %d", h.prepareGlossaryLimit, defaultPrepareGlossaryLimit)
-	}
 	if h.client == nil {
 		t.Error("client is nil after Configure")
-	}
-}
-
-func TestConfigure_prepareLimitsOverride(t *testing.T) {
-	// Explicit overrides must be honoured verbatim. Zero / missing falls
-	// back to the default (covered by TestConfigure_defaults); a negative
-	// or zero override is treated as "not set" so a misconfig can't ship
-	// a useless 0-limit query that would silently return nothing.
-	h := &WeaviateHandler{}
-	cfg, _ := json.Marshal(map[string]interface{}{
-		"host":                    weaviateHost(),
-		"collection":              testClass,
-		"auto_create_schema":      false,
-		"prepare_knowledge_limit": 7,
-		"prepare_actions_limit":   33,
-		"prepare_glossary_limit":  4,
-	})
-	if err := h.Configure(string(cfg)); err != nil {
-		t.Fatalf("Configure: %v", err)
-	}
-	if h.prepareKnowledgeLimit != 7 {
-		t.Errorf("prepareKnowledgeLimit: got %d want 7", h.prepareKnowledgeLimit)
-	}
-	if h.prepareActionsLimit != 33 {
-		t.Errorf("prepareActionsLimit: got %d want 33", h.prepareActionsLimit)
-	}
-	if h.prepareGlossaryLimit != 4 {
-		t.Errorf("prepareGlossaryLimit: got %d want 4", h.prepareGlossaryLimit)
-	}
-}
-
-func TestConfigure_prepareLimitsZeroFallsBackToDefault(t *testing.T) {
-	// A zero override is indistinguishable from "not set" once JSON
-	// unmarshal hits a Go int field; the Configure path must treat
-	// it as "fall back to default" rather than ship a 0-limit query.
-	h := &WeaviateHandler{}
-	cfg, _ := json.Marshal(map[string]interface{}{
-		"host":                    weaviateHost(),
-		"collection":              testClass,
-		"auto_create_schema":      false,
-		"prepare_knowledge_limit": 0,
-		"prepare_actions_limit":   0,
-		"prepare_glossary_limit":  0,
-	})
-	if err := h.Configure(string(cfg)); err != nil {
-		t.Fatalf("Configure: %v", err)
-	}
-	if h.prepareKnowledgeLimit != defaultPrepareKnowledgeLimit {
-		t.Errorf("prepareKnowledgeLimit: got %d want %d (default)", h.prepareKnowledgeLimit, defaultPrepareKnowledgeLimit)
-	}
-	if h.prepareActionsLimit != defaultPrepareActionsLimit {
-		t.Errorf("prepareActionsLimit: got %d want %d (default)", h.prepareActionsLimit, defaultPrepareActionsLimit)
-	}
-	if h.prepareGlossaryLimit != defaultPrepareGlossaryLimit {
-		t.Errorf("prepareGlossaryLimit: got %d want %d (default)", h.prepareGlossaryLimit, defaultPrepareGlossaryLimit)
-	}
-}
-
-func TestConfigure_perCollectionMinPrepareScore_FallbacksToUmbrella(t *testing.T) {
-	// When only the umbrella min_prepare_score is set, all three
-	// per-collection thresholds adopt the same value. Pins the
-	// backward-compat path: a deployment that hasn't migrated to the
-	// per-collection knobs keeps the prior single-threshold behaviour.
-	h := &WeaviateHandler{}
-	cfg, _ := json.Marshal(map[string]interface{}{
-		"host":               weaviateHost(),
-		"collection":         testClass,
-		"auto_create_schema": false,
-		"min_prepare_score":  0.55,
-	})
-	if err := h.Configure(string(cfg)); err != nil {
-		t.Fatalf("Configure: %v", err)
-	}
-	if h.minPrepareScore != 0.55 {
-		t.Errorf("umbrella minPrepareScore: got %v want 0.55", h.minPrepareScore)
-	}
-	if h.minPrepareScoreTools != 0.55 {
-		t.Errorf("minPrepareScoreTools fallback: got %v want 0.55", h.minPrepareScoreTools)
-	}
-	if h.minPrepareScoreKnowledge != 0.55 {
-		t.Errorf("minPrepareScoreKnowledge fallback: got %v want 0.55", h.minPrepareScoreKnowledge)
-	}
-	if h.minPrepareScoreGlossary != 0.55 {
-		t.Errorf("minPrepareScoreGlossary fallback: got %v want 0.55", h.minPrepareScoreGlossary)
-	}
-}
-
-func TestConfigure_perCollectionMinPrepareScore_Overrides(t *testing.T) {
-	// Each per-collection knob, when explicitly set, wins over the
-	// umbrella value. Lets a deployment keep a permissive cut-off for
-	// tools (where the orchestrator's tier algorithm relegates noise
-	// to Tier 3 anyway) while gating knowledge-text injection more
-	// strictly — low-score knowledge articles are surfaced as full
-	// text blocks where noise costs LLM tokens + can derail the answer.
-	h := &WeaviateHandler{}
-	cfg, _ := json.Marshal(map[string]interface{}{
-		"host":                        weaviateHost(),
-		"collection":                  testClass,
-		"auto_create_schema":          false,
-		"min_prepare_score":           0.30,
-		"min_prepare_score_tools":     0.40,
-		"min_prepare_score_knowledge": 0.75,
-		"min_prepare_score_glossary":  0.50,
-	})
-	if err := h.Configure(string(cfg)); err != nil {
-		t.Fatalf("Configure: %v", err)
-	}
-	if h.minPrepareScoreTools != 0.40 {
-		t.Errorf("minPrepareScoreTools: got %v want 0.40", h.minPrepareScoreTools)
-	}
-	if h.minPrepareScoreKnowledge != 0.75 {
-		t.Errorf("minPrepareScoreKnowledge: got %v want 0.75", h.minPrepareScoreKnowledge)
-	}
-	if h.minPrepareScoreGlossary != 0.50 {
-		t.Errorf("minPrepareScoreGlossary: got %v want 0.50", h.minPrepareScoreGlossary)
-	}
-}
-
-func TestConfigure_perCollectionMinPrepareScore_AllUnsetUsesDefault(t *testing.T) {
-	// Neither the umbrella nor the per-collection knobs are configured
-	// → all three per-collection fields fall back to
-	// defaultMinPrepareScore. Locks the chain: per-collection unset →
-	// umbrella unset → default.
-	h := &WeaviateHandler{}
-	cfg, _ := json.Marshal(map[string]interface{}{
-		"host":               weaviateHost(),
-		"collection":         testClass,
-		"auto_create_schema": false,
-	})
-	if err := h.Configure(string(cfg)); err != nil {
-		t.Fatalf("Configure: %v", err)
-	}
-	if h.minPrepareScoreTools != defaultMinPrepareScore {
-		t.Errorf("minPrepareScoreTools: got %v want %v (default)", h.minPrepareScoreTools, defaultMinPrepareScore)
-	}
-	if h.minPrepareScoreKnowledge != defaultMinPrepareScore {
-		t.Errorf("minPrepareScoreKnowledge: got %v want %v (default)", h.minPrepareScoreKnowledge, defaultMinPrepareScore)
-	}
-	if h.minPrepareScoreGlossary != defaultMinPrepareScore {
-		t.Errorf("minPrepareScoreGlossary: got %v want %v (default)", h.minPrepareScoreGlossary, defaultMinPrepareScore)
 	}
 }
 
@@ -502,15 +312,14 @@ func TestConfigure_customCollectionNames(t *testing.T) {
 	cfg, _ := json.Marshal(map[string]interface{}{
 		"host":                 weaviateHost(),
 		"collection":           testClass,
-		"actions_collection":   "CustomActions",
 		"knowledge_collection": "CustomKnowledge",
 		"auto_create_schema":   false,
 	})
 	if err := h.Configure(string(cfg)); err != nil {
 		t.Fatalf("Configure: %v", err)
 	}
-	if h.actionsCollection != "CustomActions" {
-		t.Errorf("actions_collection: got %q want %q", h.actionsCollection, "CustomActions")
+	if h.collection != testClass {
+		t.Errorf("collection: got %q want %q", h.collection, testClass)
 	}
 	if h.knowledgeCollection != "CustomKnowledge" {
 		t.Errorf("knowledge_collection: got %q want %q", h.knowledgeCollection, "CustomKnowledge")
@@ -654,11 +463,9 @@ func TestHybridSearch_missingQuery(t *testing.T) {
 
 func TestConfigure_autoCreateSchema(t *testing.T) {
 	ctx := context.Background()
-	tmpActions := "TestAutoActions"
 	tmpKnowledge := "TestAutoKnowledge"
 
 	// Clean up first.
-	_ = rawClient.Schema().ClassDeleter().WithClassName(tmpActions).Do(ctx)
 	_ = rawClient.Schema().ClassDeleter().WithClassName(tmpKnowledge).Do(ctx)
 
 	h := &WeaviateHandler{}
@@ -666,7 +473,6 @@ func TestConfigure_autoCreateSchema(t *testing.T) {
 		"host":                 weaviateHost(),
 		"scheme":               "http",
 		"collection":           testClass,
-		"actions_collection":   tmpActions,
 		"knowledge_collection": tmpKnowledge,
 		"auto_create_schema":   true,
 	})
@@ -674,15 +480,7 @@ func TestConfigure_autoCreateSchema(t *testing.T) {
 		t.Fatalf("Configure: %v", err)
 	}
 
-	exists, err := rawClient.Schema().ClassExistenceChecker().WithClassName(tmpActions).Do(ctx)
-	if err != nil {
-		t.Fatalf("check %s: %v", tmpActions, err)
-	}
-	if !exists {
-		t.Errorf("%s should exist after auto-create", tmpActions)
-	}
-
-	exists, err = rawClient.Schema().ClassExistenceChecker().WithClassName(tmpKnowledge).Do(ctx)
+	exists, err := rawClient.Schema().ClassExistenceChecker().WithClassName(tmpKnowledge).Do(ctx)
 	if err != nil {
 		t.Fatalf("check %s: %v", tmpKnowledge, err)
 	}
@@ -691,7 +489,6 @@ func TestConfigure_autoCreateSchema(t *testing.T) {
 	}
 
 	// Cleanup.
-	_ = rawClient.Schema().ClassDeleter().WithClassName(tmpActions).Do(ctx)
 	_ = rawClient.Schema().ClassDeleter().WithClassName(tmpKnowledge).Do(ctx)
 }
 
@@ -715,83 +512,6 @@ func TestConfigure_autoCreateSchemaIdempotent(t *testing.T) {
 // ---------------------------------------------------------------------------
 // Integration tests — sync_actions
 // ---------------------------------------------------------------------------
-
-func TestSyncActions(t *testing.T) {
-	h := newHandler(t)
-
-	payload, _ := json.Marshal(syncActionsPayload{
-		PluginName: "test-plugin",
-		Actions: []syncActionEntry{
-			{Name: "create_issue", Description: "Create a new issue in the tracker"},
-			{Name: "list_issues", Description: "List all open issues"},
-		},
-	})
-
-	resp := h.Execute(plugin.Request{
-		ID:     "sync-1",
-		Action: "sync_actions",
-		Args:   map[string]string{"payload": string(payload)},
-	})
-
-	if resp.Error != "" {
-		t.Fatalf("Execute error: %s", resp.Error)
-	}
-	if !strings.Contains(resp.Content, `"queued":true`) {
-		t.Errorf("expected queued:true, got: %s", resp.Content)
-	}
-	waitSyncDrain(t, h, 10*time.Second)
-
-	// Verify both actions exist in Weaviate.
-	for _, name := range []string{"create_issue", "list_issues"} {
-		id := actionUUID("test-plugin", name)
-		objs, err := rawClient.Data().ObjectsGetter().WithClassName(DefaultActionsCollection).WithID(id).Do(context.Background())
-		if err != nil || len(objs) == 0 {
-			t.Errorf("action %s missing after sync: err=%v", name, err)
-		}
-	}
-}
-
-func TestSyncActions_upsert(t *testing.T) {
-	h := newHandler(t)
-
-	payload, _ := json.Marshal(syncActionsPayload{
-		PluginName: "upsert-plugin",
-		Actions: []syncActionEntry{
-			{Name: "do_thing", Description: "Original description"},
-		},
-	})
-
-	resp := h.Execute(plugin.Request{
-		ID:     "sync-u1",
-		Action: "sync_actions",
-		Args:   map[string]string{"payload": string(payload)},
-	})
-	if resp.Error != "" {
-		t.Fatalf("first sync error: %s", resp.Error)
-	}
-	waitSyncDrain(t, h, 10*time.Second)
-
-	// Sync again with updated description — should not fail.
-	payload, _ = json.Marshal(syncActionsPayload{
-		PluginName: "upsert-plugin",
-		Actions: []syncActionEntry{
-			{Name: "do_thing", Description: "Updated description"},
-		},
-	})
-
-	resp = h.Execute(plugin.Request{
-		ID:     "sync-u2",
-		Action: "sync_actions",
-		Args:   map[string]string{"payload": string(payload)},
-	})
-	if resp.Error != "" {
-		t.Fatalf("upsert sync error: %s", resp.Error)
-	}
-	if !strings.Contains(resp.Content, `"queued":true`) {
-		t.Errorf("expected queued:true, got: %s", resp.Content)
-	}
-	waitSyncDrain(t, h, 10*time.Second)
-}
 
 func TestSyncActions_missingPayload(t *testing.T) {
 	h := newHandler(t)
@@ -817,287 +537,12 @@ func TestSyncActions_missingPluginName(t *testing.T) {
 	}
 }
 
-func TestSyncActions_deletesStaleActions(t *testing.T) {
-	h := newHandler(t)
-
-	// First sync: two actions.
-	payload, _ := json.Marshal(syncActionsPayload{
-		PluginName: "stale-plugin",
-		Actions: []syncActionEntry{
-			{Name: "old_action", Description: "Will be removed"},
-			{Name: "keep_action", Description: "Will be kept"},
-		},
-	})
-	resp := h.Execute(plugin.Request{
-		ID:     "sync-stale1",
-		Action: "sync_actions",
-		Args:   map[string]string{"payload": string(payload)},
-	})
-	if resp.Error != "" {
-		t.Fatalf("first sync error: %s", resp.Error)
-	}
-	waitSyncDrain(t, h, 10*time.Second)
-	time.Sleep(300 * time.Millisecond)
-
-	// Second sync: only keep_action — old_action should be deleted.
-	payload, _ = json.Marshal(syncActionsPayload{
-		PluginName: "stale-plugin",
-		Actions: []syncActionEntry{
-			{Name: "keep_action", Description: "Updated description"},
-		},
-	})
-	resp = h.Execute(plugin.Request{
-		ID:     "sync-stale2",
-		Action: "sync_actions",
-		Args:   map[string]string{"payload": string(payload)},
-	})
-	if resp.Error != "" {
-		t.Fatalf("second sync error: %s", resp.Error)
-	}
-	waitSyncDrain(t, h, 10*time.Second)
-	time.Sleep(300 * time.Millisecond)
-
-	// Verify old_action no longer exists by searching for it.
-	oldID := actionUUID("stale-plugin", "old_action")
-	objs, err := rawClient.Data().ObjectsGetter().
-		WithClassName(DefaultActionsCollection).
-		WithID(oldID).
-		Do(context.Background())
-	if err == nil && len(objs) > 0 {
-		t.Error("old_action should have been deleted by the second sync, but it still exists")
-	}
-
-	// Verify keep_action still exists.
-	keepID := actionUUID("stale-plugin", "keep_action")
-	objs, err = rawClient.Data().ObjectsGetter().
-		WithClassName(DefaultActionsCollection).
-		WithID(keepID).
-		Do(context.Background())
-	if err != nil {
-		t.Fatalf("check keep_action: %v", err)
-	}
-	if len(objs) == 0 {
-		t.Error("keep_action should still exist after second sync")
-	}
-}
-
-// mustSyncActions runs one sync_actions call and waits for the worker to drain.
-func mustSyncActions(t *testing.T, h *WeaviateHandler, id string, payload syncActionsPayload) {
-	t.Helper()
-	b, _ := json.Marshal(payload)
-	resp := h.Execute(plugin.Request{ID: id, Action: "sync_actions", Args: map[string]string{"payload": string(b)}})
-	if resp.Error != "" {
-		t.Fatalf("sync %s: %s", id, resp.Error)
-	}
-	waitSyncDrain(t, h, 10*time.Second)
-	time.Sleep(300 * time.Millisecond)
-}
-
-// actionRecordExists reports whether the plugin's action is stored in Weaviate.
-func actionRecordExists(t *testing.T, pluginName, actionName string) bool {
-	t.Helper()
-	objs, err := rawClient.Data().ObjectsGetter().
-		WithClassName(DefaultActionsCollection).
-		WithID(actionUUID(pluginName, actionName)).
-		Do(context.Background())
-	return err == nil && len(objs) > 0
-}
-
-// TestSyncActions_keepActionsPreservesUnsentValidActions is the definitive
-// gap-free test: it re-syncs only ONE of three actions but declares all three
-// still valid via keep_actions. The diff prune must keep the two that were not
-// re-upserted in this call — the legacy blanket pre-delete would have wiped
-// them. This is the property that makes a rolling restart's resync invisible to
-// a reader on a peer pod.
-func TestSyncActions_keepActionsPreservesUnsentValidActions(t *testing.T) {
-	h := newHandler(t)
-	const p = "keep-preserve-plugin"
-
-	seedTestPluginActions(t, h, p, []syncActionEntry{
-		{Name: "alpha", Description: "a"},
-		{Name: "bravo", Description: "b"},
-		{Name: "charlie", Description: "c"},
-	})
-
-	mustSyncActions(t, h, "kp-resync", syncActionsPayload{
-		PluginName:  p,
-		Actions:     []syncActionEntry{{Name: "alpha", Description: "a-updated"}},
-		KeepActions: []string{"alpha", "bravo", "charlie"},
-	})
-
-	for _, name := range []string{"alpha", "bravo", "charlie"} {
-		if !actionRecordExists(t, p, name) {
-			t.Errorf("%s should still exist: keep_actions listed it as valid, the diff prune must not delete it", name)
-		}
-	}
-}
-
-// TestSyncActions_keepActionsDeletesStale verifies the diff path still removes a
-// genuinely removed action (present locally, absent from keep_actions).
-func TestSyncActions_keepActionsDeletesStale(t *testing.T) {
-	h := newHandler(t)
-	const p = "keep-stale-plugin"
-
-	seedTestPluginActions(t, h, p, []syncActionEntry{
-		{Name: "alpha", Description: "a"},
-		{Name: "bravo", Description: "b"},
-		{Name: "charlie", Description: "c"},
-	})
-
-	// charlie is dropped from the current set.
-	mustSyncActions(t, h, "ks-resync", syncActionsPayload{
-		PluginName:  p,
-		Actions:     []syncActionEntry{{Name: "alpha", Description: "a"}, {Name: "bravo", Description: "b"}},
-		KeepActions: []string{"alpha", "bravo"},
-	})
-
-	if actionRecordExists(t, p, "charlie") {
-		t.Error("charlie should have been pruned (not in keep_actions)")
-	}
-	for _, name := range []string{"alpha", "bravo"} {
-		if !actionRecordExists(t, p, name) {
-			t.Errorf("%s should still exist after diff sync", name)
-		}
-	}
-}
-
-// TestSyncActions_keepActionsChunked exercises the real chunked flow: batch 0
-// carries the full keep_actions set plus the first chunk; a continuation batch
-// adds the rest. A pre-existing stale action ("zulu", not in keep_actions) must
-// be pruned, and every action in keep_actions must survive — including ones that
-// only arrive in the continuation batch and the batch-0 ones whose peers are
-// still pending when the prune runs.
-func TestSyncActions_keepActionsChunked(t *testing.T) {
-	h := newHandler(t)
-	const p = "keep-chunked-plugin"
-
-	seedTestPluginActions(t, h, p, []syncActionEntry{
-		{Name: "alpha", Description: "a"},
-		{Name: "bravo", Description: "b"},
-		{Name: "charlie", Description: "c"},
-		{Name: "zulu", Description: "stale, dropped this sync"},
-	})
-
-	full := []string{"alpha", "bravo", "charlie", "delta", "echo", "foxtrot"}
-
-	// Batch 0: first chunk + authoritative keep_actions (the full set).
-	mustSyncActions(t, h, "kc-batch0", syncActionsPayload{
-		PluginName: p,
-		Actions: []syncActionEntry{
-			{Name: "alpha", Description: "a"},
-			{Name: "bravo", Description: "b"},
-			{Name: "charlie", Description: "c"},
-		},
-		KeepActions: full,
-	})
-
-	// Continuation batch: remaining chunk, no pre-delete.
-	mustSyncActions(t, h, "kc-batch1", syncActionsPayload{
-		PluginName: p,
-		Actions: []syncActionEntry{
-			{Name: "delta", Description: "d"},
-			{Name: "echo", Description: "e"},
-			{Name: "foxtrot", Description: "f"},
-		},
-		IsContinuationBatch: true,
-	})
-
-	for _, name := range full {
-		if !actionRecordExists(t, p, name) {
-			t.Errorf("%s should be present after chunked diff sync", name)
-		}
-	}
-	if actionRecordExists(t, p, "zulu") {
-		t.Error("zulu should have been pruned by the batch-0 diff (not in keep_actions)")
-	}
-}
-
-// TestSyncActions_continuationBatchSkipsPreDelete verifies the fix for the
-// multi-batch sync truncation bug: when the orchestrator chunks a plugin's
-// actions across multiple sync_actions calls, batches 1..N must NOT pre-delete
-// the plugin's actions (which would wipe what batch 0 inserted). Only batch 0
-// performs the orphan-prune; subsequent batches are pure inserts.
-func TestSyncActions_continuationBatchSkipsPreDelete(t *testing.T) {
-	h := newHandler(t)
-
-	// Batch 0: insert 3 actions, IsContinuationBatch=false (pre-delete + insert).
-	batch0, _ := json.Marshal(syncActionsPayload{
-		PluginName: "multi-batch-plugin",
-		Actions: []syncActionEntry{
-			{Name: "alpha", Description: "Alpha action"},
-			{Name: "bravo", Description: "Bravo action"},
-			{Name: "charlie", Description: "Charlie action"},
-		},
-	})
-	if resp := h.Execute(plugin.Request{
-		ID: "sync-batch-0", Action: "sync_actions", Args: map[string]string{"payload": string(batch0)},
-	}); resp.Error != "" {
-		t.Fatalf("batch 0 error: %s", resp.Error)
-	}
-
-	// Batch 1: insert 3 more actions, IsContinuationBatch=true (insert only).
-	// Without the fix, batch 1's pre-delete would wipe alpha / bravo / charlie.
-	batch1, _ := json.Marshal(syncActionsPayload{
-		PluginName: "multi-batch-plugin",
-		Actions: []syncActionEntry{
-			{Name: "delta", Description: "Delta action"},
-			{Name: "echo", Description: "Echo action"},
-			{Name: "foxtrot", Description: "Foxtrot action"},
-		},
-		IsContinuationBatch: true,
-	})
-	if resp := h.Execute(plugin.Request{
-		ID: "sync-batch-1", Action: "sync_actions", Args: map[string]string{"payload": string(batch1)},
-	}); resp.Error != "" {
-		t.Fatalf("batch 1 error: %s", resp.Error)
-	}
-
-	waitSyncDrain(t, h, 10*time.Second)
-	time.Sleep(300 * time.Millisecond)
-
-	// All six actions from both batches must be present.
-	for _, name := range []string{"alpha", "bravo", "charlie", "delta", "echo", "foxtrot"} {
-		id := actionUUID("multi-batch-plugin", name)
-		objs, err := rawClient.Data().ObjectsGetter().
-			WithClassName(DefaultActionsCollection).
-			WithID(id).
-			Do(context.Background())
-		if err != nil {
-			t.Fatalf("get %s: %v", name, err)
-		}
-		if len(objs) == 0 {
-			t.Errorf("expected %s to be present after multi-batch sync, but it was deleted", name)
-		}
-	}
-}
-
-func TestSyncActions_emptyActions(t *testing.T) {
-	h := newHandler(t)
-	payload, _ := json.Marshal(syncActionsPayload{
-		PluginName: "empty-plugin",
-		Actions:    []syncActionEntry{},
-	})
-	resp := h.Execute(plugin.Request{
-		ID:     "sync-empty",
-		Action: "sync_actions",
-		Args:   map[string]string{"payload": string(payload)},
-	})
-	if resp.Error != "" {
-		t.Fatalf("Execute error: %s", resp.Error)
-	}
-	if !strings.Contains(resp.Content, `"queued":true`) {
-		t.Errorf("expected queued:true, got: %s", resp.Content)
-	}
-	waitSyncDrain(t, h, 10*time.Second)
-}
-
 func TestSyncActions_serverInstructions(t *testing.T) {
 	h := newHandler(t)
 
-	const prose = "Timly MCP server.\n\n## Org-units vs Containers\nA Place is a storage unit; an Org-unit is a structural unit."
+	const prose = "MCP server.\n\n## Org-units vs Containers\nA Place is a storage unit; an Org-unit is a structural unit."
 	payload, _ := json.Marshal(syncActionsPayload{
 		PluginName:         "si-test",
-		Actions:            []syncActionEntry{{Name: "list-items", Description: "List items"}},
 		ServerInstructions: prose,
 	})
 	resp := h.Execute(plugin.Request{ID: "sync-si", Action: "sync_actions", Args: map[string]string{"payload": string(payload)}})
@@ -1131,7 +576,7 @@ func TestSyncActions_serverInstructions(t *testing.T) {
 	}
 
 	// Idempotency: re-syncing with updated prose must overwrite, not duplicate.
-	const newProse = "Timly MCP server.\nUpdated."
+	const newProse = "MCP server.\nUpdated."
 	payload, _ = json.Marshal(syncActionsPayload{
 		PluginName:         "si-test",
 		ServerInstructions: newProse,
@@ -1158,11 +603,11 @@ func TestSyncActions_serverInstructions(t *testing.T) {
 func TestSyncActions_pruneOrphans(t *testing.T) {
 	h := newHandler(t)
 
-	// Seed two plugins (each with one action and instructions).
+	// Seed two plugins, each contributing a server-instructions article. Orphan
+	// pruning now only touches KnowledgeArticles (the "mcp:<plugin>" records).
 	for _, name := range []string{"prune-keep", "prune-orphan"} {
 		payload, _ := json.Marshal(syncActionsPayload{
 			PluginName:         name,
-			Actions:            []syncActionEntry{{Name: "act", Description: "x"}},
 			ServerInstructions: "instructions for " + name,
 		})
 		resp := h.Execute(plugin.Request{ID: "seed-" + name, Action: "sync_actions", Args: map[string]string{"payload": string(payload)}})
@@ -1175,9 +620,9 @@ func TestSyncActions_pruneOrphans(t *testing.T) {
 
 	// Re-sync with keep_plugins listing only the kept plugin — orphan must vanish.
 	payload, _ := json.Marshal(syncActionsPayload{
-		PluginName:  "prune-keep",
-		Actions:     []syncActionEntry{{Name: "act", Description: "x"}},
-		KeepPlugins: []string{"prune-keep"},
+		PluginName:         "prune-keep",
+		ServerInstructions: "instructions for prune-keep",
+		KeepPlugins:        []string{"prune-keep"},
 	})
 	resp := h.Execute(plugin.Request{ID: "prune-call", Action: "sync_actions", Args: map[string]string{"payload": string(payload)}})
 	if resp.Error != "" {
@@ -1186,21 +631,10 @@ func TestSyncActions_pruneOrphans(t *testing.T) {
 	waitSyncDrain(t, h, 10*time.Second)
 	time.Sleep(300 * time.Millisecond)
 
-	// MCPActions: kept plugin's action survives, orphan's action is gone.
-	keepActionID := actionUUID("prune-keep", "act")
-	got, err := rawClient.Data().ObjectsGetter().WithClassName(DefaultActionsCollection).WithID(keepActionID).Do(context.Background())
-	if err != nil || len(got) != 1 {
-		t.Errorf("kept action missing: err=%v len=%d", err, len(got))
-	}
-	orphanActionID := actionUUID("prune-orphan", "act")
-	got, err = rawClient.Data().ObjectsGetter().WithClassName(DefaultActionsCollection).WithID(orphanActionID).Do(context.Background())
-	if err == nil && len(got) != 0 {
-		t.Errorf("orphan action still present after prune: %d records", len(got))
-	}
-
-	// KnowledgeArticles: kept plugin's article survives, orphan's article is gone.
+	// KnowledgeArticles: kept plugin's server-instructions article survives,
+	// orphan's article is gone.
 	keepArticleID := serverInstructionsUUID("prune-keep")
-	got, err = rawClient.Data().ObjectsGetter().WithClassName(DefaultKnowledgeCollection).WithID(keepArticleID).Do(context.Background())
+	got, err := rawClient.Data().ObjectsGetter().WithClassName(DefaultKnowledgeCollection).WithID(keepArticleID).Do(context.Background())
 	if err != nil || len(got) != 1 {
 		t.Errorf("kept article missing: err=%v len=%d", err, len(got))
 	}
@@ -1214,10 +648,10 @@ func TestSyncActions_pruneOrphans(t *testing.T) {
 func TestSyncActions_emptyKeepPluginsSkipsPrune(t *testing.T) {
 	h := newHandler(t)
 
-	// Seed one record.
+	// Seed one server-instructions article.
 	payload, _ := json.Marshal(syncActionsPayload{
-		PluginName: "skip-prune",
-		Actions:    []syncActionEntry{{Name: "act", Description: "x"}},
+		PluginName:         "skip-prune",
+		ServerInstructions: "instructions for skip-prune",
 	})
 	resp := h.Execute(plugin.Request{ID: "seed-skip", Action: "sync_actions", Args: map[string]string{"payload": string(payload)}})
 	if resp.Error != "" {
@@ -1227,9 +661,9 @@ func TestSyncActions_emptyKeepPluginsSkipsPrune(t *testing.T) {
 
 	// Send an empty keep_plugins — must NOT trigger a delete-everything-in-class.
 	payload, _ = json.Marshal(syncActionsPayload{
-		PluginName:  "skip-prune",
-		Actions:     []syncActionEntry{{Name: "act", Description: "x"}},
-		KeepPlugins: []string{},
+		PluginName:         "skip-prune",
+		ServerInstructions: "instructions for skip-prune",
+		KeepPlugins:        []string{},
 	})
 	resp = h.Execute(plugin.Request{ID: "skip-prune-call", Action: "sync_actions", Args: map[string]string{"payload": string(payload)}})
 	if resp.Error != "" {
@@ -1239,48 +673,10 @@ func TestSyncActions_emptyKeepPluginsSkipsPrune(t *testing.T) {
 	time.Sleep(300 * time.Millisecond)
 
 	// Verify the seeded record still exists.
-	id := actionUUID("skip-prune", "act")
-	got, err := rawClient.Data().ObjectsGetter().WithClassName(DefaultActionsCollection).WithID(id).Do(context.Background())
+	id := serverInstructionsUUID("skip-prune")
+	got, err := rawClient.Data().ObjectsGetter().WithClassName(DefaultKnowledgeCollection).WithID(id).Do(context.Background())
 	if err != nil || len(got) != 1 {
 		t.Errorf("record was pruned despite empty keep_plugins: err=%v len=%d", err, len(got))
-	}
-}
-
-func TestSyncActions_pruneAlsoWithoutInstructions(t *testing.T) {
-	// Verify a sync_actions call with keep_plugins works even when the new
-	// optional fields aren't present together — only KeepPlugins set, no
-	// ServerInstructions on this call.
-	h := newHandler(t)
-
-	// Seed an orphan.
-	payload, _ := json.Marshal(syncActionsPayload{
-		PluginName: "no-instr-orphan",
-		Actions:    []syncActionEntry{{Name: "act", Description: "x"}},
-	})
-	resp := h.Execute(plugin.Request{ID: "seed-noinstr", Action: "sync_actions", Args: map[string]string{"payload": string(payload)}})
-	if resp.Error != "" {
-		t.Fatalf("seed: %s", resp.Error)
-	}
-	waitSyncDrain(t, h, 10*time.Second)
-	time.Sleep(300 * time.Millisecond)
-
-	// Now sync a different plugin and prune.
-	payload, _ = json.Marshal(syncActionsPayload{
-		PluginName:  "no-instr-keep",
-		Actions:     []syncActionEntry{{Name: "act", Description: "x"}},
-		KeepPlugins: []string{"no-instr-keep"},
-	})
-	resp = h.Execute(plugin.Request{ID: "prune-noinstr", Action: "sync_actions", Args: map[string]string{"payload": string(payload)}})
-	if resp.Error != "" {
-		t.Fatalf("prune call: %s", resp.Error)
-	}
-	waitSyncDrain(t, h, 10*time.Second)
-	time.Sleep(300 * time.Millisecond)
-
-	orphanID := actionUUID("no-instr-orphan", "act")
-	got, err := rawClient.Data().ObjectsGetter().WithClassName(DefaultActionsCollection).WithID(orphanID).Do(context.Background())
-	if err == nil && len(got) != 0 {
-		t.Errorf("orphan still present without ServerInstructions path: %d records", len(got))
 	}
 }
 
@@ -1495,7 +891,7 @@ func TestHTTP_ingestArticleWrongToken(t *testing.T) {
 func TestHTTP_syncActions(t *testing.T) {
 	h := newHandlerWithToken(t, "test-secret")
 
-	body := `{"plugin_name":"http-plugin","actions":[{"name":"http_action","description":"An action synced via HTTP"}]}`
+	body := `{"plugin_name":"http-plugin","server_instructions":"Server prose synced via HTTP.","knowledge_articles":[{"id":"http-topic","title":"HTTP Topic","content":"A knowledge section synced via HTTP."}]}`
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/actions/sync", strings.NewReader(body))
 	req.Header.Set("Authorization", "Bearer test-secret")
 	req.Header.Set("Content-Type", "application/json")
@@ -1561,262 +957,6 @@ func TestHTTP_noTokenConfigured(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Integration tests — prepare (Phase 2: dual-collection RAG)
-// ---------------------------------------------------------------------------
-
-func TestPrepare_dualCollection(t *testing.T) {
-	h := newHandler(t)
-
-	resp := h.Execute(plugin.Request{
-		ID:     "prepare-1",
-		Action: "prepare",
-		Args:   map[string]string{"text": "create jira issue"},
-	})
-
-	if resp.Error != "" {
-		t.Fatalf("Execute error: %s", resp.Error)
-	}
-
-	var result prepareResponse
-	if err := json.Unmarshal([]byte(resp.Content), &result); err != nil {
-		t.Fatalf("unmarshal prepare response: %v\nraw: %s", err, resp.Content)
-	}
-	if !result.SendToLLM {
-		t.Error("expected send_to_llm=true")
-	}
-	if result.Message == "" {
-		t.Error("expected non-empty message")
-	}
-	if !strings.Contains(result.Message, "create jira issue") {
-		t.Error("expected original text in message")
-	}
-	// Actions should NOT be in message — relevant_tools handles filtering.
-	if strings.Contains(result.Message, "[actions]") {
-		t.Error("message should NOT contain [actions] block")
-	}
-}
-
-func TestPrepare_returnsRelevantTools(t *testing.T) {
-	h := newHandler(t)
-
-	// Post fail-closed-default pivot, prepare REQUIRES an explicit
-	// allowed_tools palette injected by the orchestrator. Earlier
-	// integration tests in this suite mutate MCPActions (sync_actions
-	// upserts, pre-deletions), so the seed jira/gitlab actions may
-	// have been replaced by the time this test runs. Sync the FQNs we
-	// will assert on directly so the test owns its data.
-	seedTestPluginActions(t, h, "prepare-test-plugin", []syncActionEntry{
-		{Name: "create_issue", Description: "Create a new issue in the Jira project tracker"},
-		{Name: "list_issues", Description: "List all open issues in a Jira project"},
-	})
-
-	allowedTools, _ := json.Marshal([]string{
-		"prepare-test-plugin.create_issue",
-		"prepare-test-plugin.list_issues",
-	})
-	resp := h.Execute(plugin.Request{
-		ID:     "prepare-tools",
-		Action: "prepare",
-		Args: map[string]string{
-			"text":          "Create a new issue in the Jira project tracker list open issues",
-			"allowed_tools": string(allowedTools),
-		},
-	})
-
-	if resp.Error != "" {
-		t.Fatalf("Execute error: %s", resp.Error)
-	}
-
-	var result prepareResponse
-	if err := json.Unmarshal([]byte(resp.Content), &result); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-
-	if len(result.RelevantTools) == 0 {
-		t.Logf("prepare response: %s", resp.Content)
-		t.Fatal("expected relevant_tools to be populated")
-	}
-
-	// Verify tool names are in "plugin.action" format.
-	for _, tool := range result.RelevantTools {
-		if !strings.Contains(tool, ".") {
-			t.Errorf("tool %q should be in 'plugin.action' format", tool)
-		}
-	}
-}
-
-func TestPrepare_allowedPlugins(t *testing.T) {
-	h := newHandler(t)
-
-	allowed, _ := json.Marshal([]string{"jira"})
-	resp := h.Execute(plugin.Request{
-		ID:     "prepare-filter",
-		Action: "prepare",
-		Args: map[string]string{
-			"text":            "create issue or merge request",
-			"allowed_plugins": string(allowed),
-		},
-	})
-
-	if resp.Error != "" {
-		t.Fatalf("Execute error: %s", resp.Error)
-	}
-
-	var result prepareResponse
-	if err := json.Unmarshal([]byte(resp.Content), &result); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-
-	// All returned tools should be from jira (or the always-included ask_knowledge), not gitlab.
-	for _, tool := range result.RelevantTools {
-		if !strings.HasPrefix(tool, "jira.") && tool != "weaviate.ask_knowledge" {
-			t.Errorf("expected only jira tools (+ ask_knowledge) with allowed_plugins=[jira], got %q", tool)
-		}
-	}
-}
-
-func TestPrepare_emptyText(t *testing.T) {
-	h := newHandler(t)
-
-	resp := h.Execute(plugin.Request{
-		ID:     "prepare-empty",
-		Action: "prepare",
-		Args:   map[string]string{"text": ""},
-	})
-
-	if resp.Error != "" {
-		t.Fatalf("Execute error: %s", resp.Error)
-	}
-
-	var result prepareResponse
-	if err := json.Unmarshal([]byte(resp.Content), &result); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	if !result.SendToLLM {
-		t.Error("expected send_to_llm=true")
-	}
-	if result.Message != "" {
-		t.Errorf("expected empty message for empty text, got %q", result.Message)
-	}
-	if len(result.RelevantTools) != 0 {
-		t.Errorf("expected empty relevant_tools, got %v", result.RelevantTools)
-	}
-}
-
-func TestPrepare_noTextArg(t *testing.T) {
-	h := newHandler(t)
-
-	resp := h.Execute(plugin.Request{
-		ID:     "prepare-notext",
-		Action: "prepare",
-		Args:   map[string]string{},
-	})
-
-	if resp.Error != "" {
-		t.Fatalf("Execute error: %s", resp.Error)
-	}
-
-	var result prepareResponse
-	if err := json.Unmarshal([]byte(resp.Content), &result); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	if !result.SendToLLM {
-		t.Error("expected send_to_llm=true")
-	}
-}
-
-func TestPrepare_structuredJSONFormat(t *testing.T) {
-	h := newHandler(t)
-
-	resp := h.Execute(plugin.Request{
-		ID:     "prepare-json",
-		Action: "prepare",
-		Args:   map[string]string{"text": "deploy kubernetes"},
-	})
-
-	if resp.Error != "" {
-		t.Fatalf("Execute error: %s", resp.Error)
-	}
-
-	// Verify the response is valid JSON with expected fields.
-	var raw map[string]interface{}
-	if err := json.Unmarshal([]byte(resp.Content), &raw); err != nil {
-		t.Fatalf("response is not valid JSON: %v", err)
-	}
-
-	if _, ok := raw["send_to_llm"]; !ok {
-		t.Error("missing send_to_llm field")
-	}
-	if _, ok := raw["message"]; !ok {
-		t.Error("missing message field")
-	}
-	if _, ok := raw["relevant_tools"]; !ok {
-		t.Error("missing relevant_tools field")
-	}
-}
-
-func TestPrepare_knowledgeContextAndRelevantTools(t *testing.T) {
-	h := newHandler(t)
-
-	// Self-seed for the same cross-test-pollution reason as
-	// TestPrepare_returnsRelevantTools above.
-	seedTestPluginActions(t, h, "prepare-blocks-plugin", []syncActionEntry{
-		{Name: "create_issue", Description: "Create a new issue in the Jira project tracker"},
-		{Name: "list_issues", Description: "List all open issues in a Jira project"},
-	})
-	allowedTools, _ := json.Marshal([]string{
-		"prepare-blocks-plugin.create_issue",
-		"prepare-blocks-plugin.list_issues",
-	})
-	resp := h.Execute(plugin.Request{
-		ID:     "prepare-blocks",
-		Action: "prepare",
-		Args: map[string]string{
-			"text":          "jira issue workflow",
-			"allowed_tools": string(allowedTools),
-		},
-	})
-
-	if resp.Error != "" {
-		t.Fatalf("Execute error: %s", resp.Error)
-	}
-
-	var result prepareResponse
-	if err := json.Unmarshal([]byte(resp.Content), &result); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-
-	// Action context must NOT be in the message — relevant_tools handles tool filtering.
-	if strings.Contains(result.Message, "[actions]") {
-		t.Error("message should NOT contain [actions] block — tool filtering uses relevant_tools")
-	}
-
-	// relevant_tools should be populated with matched actions above score threshold.
-	if result.RelevantTools == nil {
-		t.Error("relevant_tools should not be nil")
-	}
-}
-
-// seedTestPluginActions syncs the given action descriptors under pluginName
-// and waits for the background sync worker to drain. Used by integration
-// tests that need MCPActions data that survives cross-test mutation by
-// earlier sync_actions tests in the suite.
-func seedTestPluginActions(t *testing.T, h *WeaviateHandler, pluginName string, actions []syncActionEntry) {
-	t.Helper()
-	payload, _ := json.Marshal(syncActionsPayload{PluginName: pluginName, Actions: actions})
-	resp := h.Execute(plugin.Request{
-		ID:     "seed-" + pluginName,
-		Action: "sync_actions",
-		Args:   map[string]string{"payload": string(payload)},
-	})
-	if resp.Error != "" {
-		t.Fatalf("seed sync for %s: %s", pluginName, resp.Error)
-	}
-	waitSyncDrain(t, h, 10*time.Second)
-	time.Sleep(300 * time.Millisecond)
-}
-
-// ---------------------------------------------------------------------------
 // Integration tests — ask_knowledge (Phase 3)
 // ---------------------------------------------------------------------------
 
@@ -1842,24 +982,6 @@ func TestAskKnowledge(t *testing.T) {
 	}
 }
 
-func TestAskKnowledge_returnsTools(t *testing.T) {
-	h := newHandler(t)
-
-	resp := h.Execute(plugin.Request{
-		ID:     "ask-tools",
-		Action: "ask_knowledge",
-		Args:   map[string]string{"query": "Create a new issue in the Jira project tracker"},
-	})
-
-	if resp.Error != "" {
-		t.Fatalf("Execute error: %s", resp.Error)
-	}
-	if !strings.Contains(resp.Content, "Available Tools") {
-		t.Logf("response: %s", resp.Content)
-		t.Error("expected Available Tools section in response")
-	}
-}
-
 func TestAskKnowledge_missingQuery(t *testing.T) {
 	h := newHandler(t)
 
@@ -1870,28 +992,6 @@ func TestAskKnowledge_missingQuery(t *testing.T) {
 	})
 	if resp.Error == "" {
 		t.Error("expected error for missing query, got none")
-	}
-}
-
-func TestAskKnowledge_pluginFilter(t *testing.T) {
-	h := newHandler(t)
-
-	resp := h.Execute(plugin.Request{
-		ID:     "ask-plugin",
-		Action: "ask_knowledge",
-		Args: map[string]string{
-			"query":  "create issue merge request",
-			"plugin": "jira",
-		},
-	})
-
-	if resp.Error != "" {
-		t.Fatalf("Execute error: %s", resp.Error)
-	}
-
-	// Should not contain gitlab tools when filtered to jira.
-	if strings.Contains(resp.Content, "gitlab.") {
-		t.Error("expected no gitlab tools when plugin=jira")
 	}
 }
 
@@ -1913,29 +1013,6 @@ func TestAskKnowledge_sourceFilter(t *testing.T) {
 	// Should succeed; source filter narrows to wiki articles.
 	if resp.Content == "" {
 		t.Fatal("expected non-empty response")
-	}
-}
-
-func TestAskKnowledge_allowedPlugins(t *testing.T) {
-	h := newHandler(t)
-
-	allowed, _ := json.Marshal([]string{"gitlab"})
-	resp := h.Execute(plugin.Request{
-		ID:     "ask-allowed",
-		Action: "ask_knowledge",
-		Args: map[string]string{
-			"query":           "create issue merge request pipelines",
-			"allowed_plugins": string(allowed),
-		},
-	})
-
-	if resp.Error != "" {
-		t.Fatalf("Execute error: %s", resp.Error)
-	}
-
-	// Should not contain jira tools when allowed_plugins=["gitlab"].
-	if strings.Contains(resp.Content, "jira.") {
-		t.Error("expected no jira tools when allowed_plugins=[gitlab]")
 	}
 }
 
@@ -2099,43 +1176,6 @@ func TestCapabilities_includesAskKnowledge(t *testing.T) {
 	}
 	if !actions["ask_knowledge"] {
 		t.Error("missing ask_knowledge action in capabilities")
-	}
-}
-
-// TestCapabilities_injectContextArgs pins the declarative context-arg path:
-// `allowed_plugins` is orchestrator-managed and must be delivered via
-// InjectContextArgs, not via the LLM-visible Parameters list. This guards
-// against an accidental revert of the consolidation that routed the value
-// through the host's ContextArgProvider registry instead of an open
-// parameter on the tool schema.
-func TestCapabilities_injectContextArgs(t *testing.T) {
-	caps := (&WeaviateHandler{}).Capabilities()
-
-	byName := make(map[string]plugin.ActionMsg, len(caps.Actions))
-	for _, a := range caps.Actions {
-		byName[a.Name] = a
-	}
-
-	for _, name := range []string{"prepare", "ask_knowledge"} {
-		action, ok := byName[name]
-		if !ok {
-			t.Fatalf("action %q missing from capabilities", name)
-		}
-		found := false
-		for _, ica := range action.InjectContextArgs {
-			if ica == "allowed_plugins" {
-				found = true
-				break
-			}
-		}
-		if !found {
-			t.Errorf("action %q: InjectContextArgs missing %q (got %v)", name, "allowed_plugins", action.InjectContextArgs)
-		}
-		for _, p := range action.Parameters {
-			if p.Name == "allowed_plugins" {
-				t.Errorf("action %q: %q is now an InjectContextArg and must not also appear in Parameters", name, "allowed_plugins")
-			}
-		}
 	}
 }
 
@@ -2410,40 +1450,5 @@ func TestSyncActions_pruneScopesAreDisjointAcrossSourcePrefixes(t *testing.T) {
 	got, err = rawClient.Data().ObjectsGetter().WithClassName(DefaultKnowledgeCollection).WithID(orphanKnowledgeID).Do(context.Background())
 	if err == nil && len(got) != 0 {
 		t.Errorf("orphan knowledge-section article still present: %d records", len(got))
-	}
-}
-
-func TestSyncActions_knowledgeArticlesPrepareNotFiltered(t *testing.T) {
-	h := newHandler(t)
-
-	// A knowledge article with content that the prepare path can match against
-	// a related query ("places", "containers").
-	payload, _ := json.Marshal(syncActionsPayload{
-		PluginName: "ka-prepare-test",
-		KnowledgeArticles: []knowledgeArticleEntry{
-			{ID: "org-units-vs-containers", Title: "Org-units vs Containers (Places)", Content: "A Place is a storage unit (container, garage, cabinet, box) — discovered via list-containers."},
-		},
-	})
-	resp := h.Execute(plugin.Request{ID: "prep-seed", Action: "sync_actions", Args: map[string]string{"payload": string(payload)}})
-	if resp.Error != "" {
-		t.Fatalf("seed: %s", resp.Error)
-	}
-	waitSyncDrain(t, h, 10*time.Second)
-	time.Sleep(300 * time.Millisecond)
-
-	// Article must be retrievable directly (sanity).
-	id := knowledgeArticleUUID("ka-prepare-test", "org-units-vs-containers")
-	got, err := rawClient.Data().ObjectsGetter().WithClassName(DefaultKnowledgeCollection).WithID(id).Do(context.Background())
-	if err != nil || len(got) != 1 {
-		t.Fatalf("article missing: err=%v len=%d", err, len(got))
-	}
-	src, _ := got[0].Properties.(map[string]interface{})["source"].(string)
-
-	// filterOutMCPItems is what the prepare path uses to drop the always-injected
-	// "mcp:" records. mcp-knowledge:* records must NOT be filtered out — they're
-	// the whole point of the per-section split.
-	filtered := filterOutMCPItems([]map[string]interface{}{{"source": src, "title": "x"}})
-	if len(filtered) != 1 {
-		t.Errorf("filterOutMCPItems dropped a knowledge article (source=%q); knowledge sections must reach [knowledge_context]", src)
 	}
 }

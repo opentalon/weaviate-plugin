@@ -57,10 +57,6 @@ func TestJoinTitleAndContent(t *testing.T) {
 	}
 }
 
-func mkScore(s string) map[string]interface{} {
-	return map[string]interface{}{"score": s}
-}
-
 func mkArticle(id, title, content, source, score string) map[string]interface{} {
 	return map[string]interface{}{
 		"title":       title,
@@ -160,97 +156,6 @@ func TestExtractKnowledgeCandidates_contentSHA256MatchesTitleAndContentJoin(t *t
 	wantHash := contentSHA256(wantBody)
 	if got[0].ContentSHA256 != wantHash {
 		t.Errorf("ContentSHA256 = %q, want %q (hash of %q)", got[0].ContentSHA256, wantHash, wantBody)
-	}
-}
-
-func TestExtractGlossaryCandidates_dropsItemWithoutBothFields(t *testing.T) {
-	items := []map[string]interface{}{
-		{"term": "Item", "_additional": mkScore("1.0")}, // missing definition
-		{"definition": "x", "_additional": mkScore("1.0")}, // missing term
-		{"term": "Tool", "definition": "An action you can call", "_additional": mkScore("1.0")},
-	}
-	got := extractGlossaryCandidates(items, 0.0)
-	if len(got) != 1 || got[0].Term != "Tool" {
-		t.Errorf("glossary candidates = %+v, want exactly one Tool entry", got)
-	}
-}
-
-func TestExtractGlossaryCandidates_contentIsDefinition(t *testing.T) {
-	items := []map[string]interface{}{
-		{"term": "Item", "definition": "Physical asset", "_additional": mkScore("1.0")},
-	}
-	got := extractGlossaryCandidates(items, 0.0)
-	if got[0].Content != "Physical asset" {
-		t.Errorf("Content = %q, want %q (definition body only)", got[0].Content, "Physical asset")
-	}
-	if got[0].ContentSHA256 != contentSHA256("Physical asset") {
-		t.Errorf("ContentSHA256 mismatch")
-	}
-}
-
-// fakeGraphQLResult mirrors the shape Weaviate's go client returns —
-// a top-level Data map keyed by "Get", then by className, with a slice
-// of result objects. extractItems reaches in through that shape, so the
-// fixture has to follow it exactly.
-type fakeGraphQLResult struct {
-	Data map[string]interface{} `json:"data"`
-}
-
-func fakeResult(className string, items []map[string]interface{}) interface{} {
-	return &fakeGraphQLResult{
-		Data: map[string]interface{}{
-			"Get": map[string]interface{}{
-				className: items,
-			},
-		},
-	}
-}
-
-func TestExtractToolCandidatesFromResult_buildsPluginDotAction(t *testing.T) {
-	items := []map[string]interface{}{
-		{"pluginName": "timly", "actionName": "list-items", "_additional": mkScore("0.80")},
-		{"pluginName": "weaviate", "actionName": "ask_knowledge", "_additional": mkScore("0.10")}, // below
-		{"pluginName": "timly", "actionName": "show-item", "_additional": mkScore("0.60")},
-	}
-	got := extractToolCandidatesFromResult(fakeResult("MCPActions", items), "MCPActions", actionFilter{minScore: 0.25})
-	if len(got) != 2 {
-		t.Fatalf("got %d tool candidates, want 2", len(got))
-	}
-	if got[0].ToolName != "timly.list-items" {
-		t.Errorf("first ToolName = %q, want %q", got[0].ToolName, "timly.list-items")
-	}
-	if got[1].ToolName != "timly.show-item" {
-		t.Errorf("second ToolName = %q, want %q", got[1].ToolName, "timly.show-item")
-	}
-	if got[0].PositionInResults != 1 || got[1].PositionInResults != 2 {
-		t.Errorf("positions = [%d, %d], want [1, 2]", got[0].PositionInResults, got[1].PositionInResults)
-	}
-}
-
-// TestExtractToolCandidatesFromResult_emptyClassReturnsNonNilEmpty pins the
-// sibling-symmetry convention with extractToolNames: both walkRetrievedActions
-// consumers return a non-nil empty slice on "filter ran, found nothing".
-// Callers that need a nil signal (e.g. prepare's "no relevant tools active")
-// normalize at the call site, not in these helpers.
-func TestExtractToolCandidatesFromResult_emptyClassReturnsNonNilEmpty(t *testing.T) {
-	got := extractToolCandidatesFromResult(fakeResult("MCPActions", nil), "MCPActions", actionFilter{})
-	if got == nil {
-		t.Errorf("expected non-nil empty slice for sibling-symmetry with extractToolNames, got nil")
-	}
-	if len(got) != 0 {
-		t.Errorf("expected empty slice, got %d entries: %+v", len(got), got)
-	}
-}
-
-func TestExtractToolCandidatesFromResult_dropsItemWithoutPluginOrActionName(t *testing.T) {
-	items := []map[string]interface{}{
-		{"pluginName": "timly", "_additional": mkScore("0.9")}, // missing action
-		{"actionName": "list-items", "_additional": mkScore("0.9")}, // missing plugin
-		{"pluginName": "timly", "actionName": "show-item", "_additional": mkScore("0.9")},
-	}
-	got := extractToolCandidatesFromResult(fakeResult("MCPActions", items), "MCPActions", actionFilter{})
-	if len(got) != 1 || got[0].ToolName != "timly.show-item" {
-		t.Errorf("tool candidates = %+v, want exactly one timly.show-item entry", got)
 	}
 }
 

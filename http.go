@@ -6,21 +6,18 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
-	"time"
 
 	"github.com/opentalon/opentalon/pkg/plugin"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"github.com/weaviate/weaviate-go-client/v5/weaviate/filters"
-	"github.com/weaviate/weaviate-go-client/v5/weaviate/graphql"
 )
 
 // listenHTTP starts the token-protected HTTP ingestion server.
 //
 // /metrics is intentionally OPEN (no token) so a Prometheus scrape job
-// running in another namespace can collect the translator + plugin
-// metrics without sharing the ingestion bearer token. Scrape access is
-// limited at the network layer via the existing weaviate / opentalon
-// NetworkPolicies, same pattern as Weaviate itself uses.
+// running in another namespace can collect the plugin metrics without
+// sharing the ingestion bearer token. Scrape access is limited at the
+// network layer via the existing weaviate / opentalon NetworkPolicies,
+// same pattern as Weaviate itself uses.
 func (h *WeaviateHandler) listenHTTP() error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/v1/health", h.handleHealth)
@@ -30,9 +27,7 @@ func (h *WeaviateHandler) listenHTTP() error {
 	mux.HandleFunc("DELETE /api/v1/articles/{id}", h.requireToken(h.handleDeleteArticle))
 	mux.HandleFunc("DELETE /api/v1/articles", h.requireToken(h.handleDeleteArticlesBySource))
 	mux.HandleFunc("POST /api/v1/actions/sync", h.requireToken(h.handleSyncActions))
-	mux.HandleFunc("POST /api/v1/glossary/sync", h.requireToken(h.handleSyncGlossary))
 	mux.HandleFunc("GET /api/v1/sync/status", h.requireToken(h.handleSyncStatus))
-	mux.HandleFunc("POST /api/v1/debug/prepare", h.requireToken(h.handleDebugPrepare))
 	return http.ListenAndServe(h.httpAddr, mux)
 }
 
@@ -142,23 +137,6 @@ func (h *WeaviateHandler) handleSyncActions(w http.ResponseWriter, r *http.Reque
 	writePluginResponse(w, resp)
 }
 
-func (h *WeaviateHandler) handleSyncGlossary(w http.ResponseWriter, r *http.Request) {
-	var body syncGlossaryPayload
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid JSON: %v", err))
-		return
-	}
-
-	payload, _ := json.Marshal(body)
-	resp := h.Execute(plugin.Request{
-		ID:     "http",
-		Action: "sync_glossary",
-		Args:   map[string]string{"payload": string(payload)},
-	})
-
-	writePluginResponse(w, resp)
-}
-
 func writePluginResponse(w http.ResponseWriter, resp plugin.Response) {
 	w.Header().Set("Content-Type", "application/json")
 	if resp.Error != "" {
@@ -189,230 +167,6 @@ func (h *WeaviateHandler) handleHealth(w http.ResponseWriter, _ *http.Request) {
 		return
 	}
 	_, _ = fmt.Fprint(w, `{"status":"ok"}`)
-}
-
-// debugPrepareRequest is the body of POST /api/v1/debug/prepare.
-//
-// `allowed_tools` mirrors the per-session palette the orchestrator's
-// ContextArgProvider injects at runtime. Setting it here lets an operator
-// rehearse the post-retrieval chokepoint filter for an arbitrary FQN list
-// without standing up a full session — useful for "what would Claude Code
-// see if the session palette is X?" investigations.
-//
-// Defense-safe default: omitting the field fails CLOSED, exactly like
-// production. matched_tools will be empty; inspect actions_top in the
-// response to see the unfiltered score-passing retrieval, and pass an
-// explicit allowed_tools list to test the palette filter behaviour.
-type debugPrepareRequest struct {
-	Text           string   `json:"text"`
-	AllowedPlugins []string `json:"allowed_plugins,omitempty"`
-	AllowedTools   []string `json:"allowed_tools,omitempty"`
-}
-
-// debugPrepareResponse exposes the full pre/post-translator pipeline so
-// operators can reproduce a single user query end-to-end without fishing
-// in pod logs. Surfaces the translation, the actual query string sent to
-// Weaviate, and the top results from both collections with scores. Only
-// reachable when http_addr is configured AND the bearer token is supplied.
-type debugPrepareResponse struct {
-	Original         string             `json:"original"`
-	SearchText       string             `json:"search_text"`
-	Translated       bool               `json:"translated"`
-	TranslatorMs     float64            `json:"translator_ms"`
-	MinPrepareScore  float64            `json:"min_prepare_score"`
-	MatchedTools     []string           `json:"matched_tools"`
-	ActionsTop       []debugScoredEntry `json:"actions_top"`
-	KnowledgeTop     []debugScoredEntry `json:"knowledge_top"`
-	GlossaryTop      []debugScoredEntry `json:"glossary_top"`
-	WeaviateMs       float64            `json:"weaviate_ms"`
-	KnowledgeQuery   string             `json:"knowledge_query"`
-	ActionsCollWhere string             `json:"actions_where,omitempty"`
-	// FilteredOutByPalette enumerates FQNs that passed the score threshold
-	// in the raw retrieval (visible under actions_top) but were rejected by
-	// the allowed_tools palette. Empty / omitted when no palette was set or
-	// nothing was filtered — populated only when the operator supplied
-	// allowed_tools, so this field doubles as proof the palette filter ran.
-	FilteredOutByPalette []string `json:"filtered_out_by_palette,omitempty"`
-}
-
-type debugScoredEntry struct {
-	Score      float64 `json:"score"`
-	PluginName string  `json:"plugin_name,omitempty"`
-	ActionName string  `json:"action_name,omitempty"`
-	Title      string  `json:"title,omitempty"`
-	Source     string  `json:"source,omitempty"`
-	Term       string  `json:"term,omitempty"`
-}
-
-// handleDebugPrepare runs the SAME pipeline as Execute("prepare", ...) but
-// returns a structured trace rather than the LLM-bound message envelope.
-// Useful for "what got sent to Weaviate for THIS query?" investigations.
-func (h *WeaviateHandler) handleDebugPrepare(w http.ResponseWriter, r *http.Request) {
-	var body debugPrepareRequest
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid JSON: %v", err))
-		return
-	}
-	if strings.TrimSpace(body.Text) == "" {
-		writeJSONError(w, http.StatusBadRequest, "text is required")
-		return
-	}
-
-	ctx := r.Context()
-
-	tStart := time.Now()
-	searchText, _ := h.translateQuery(ctx, body.Text, "debug_prepare")
-	translatorMs := float64(time.Since(tStart).Microseconds()) / 1000.0
-
-	knowledgeQuery := searchText
-	if len(body.AllowedPlugins) > 0 {
-		knowledgeQuery = searchText + " " + strings.Join(body.AllowedPlugins, " ")
-	}
-
-	knowledgeFields := []graphql.Field{
-		{Name: "title"}, {Name: "content"}, {Name: "source"},
-		{Name: "_additional", Fields: []graphql.Field{{Name: "score"}}},
-	}
-	actionFields := []graphql.Field{
-		{Name: "pluginName"}, {Name: "actionName"},
-		{Name: "_additional", Fields: []graphql.Field{{Name: "score"}}},
-	}
-
-	var actionsWhere *filters.WhereBuilder
-	whereLabel := ""
-	if len(body.AllowedPlugins) > 0 {
-		actionsWhere = filters.Where().
-			WithPath([]string{"pluginName"}).
-			WithOperator(filters.ContainsAny).
-			WithValueText(body.AllowedPlugins...)
-		whereLabel = "pluginName ContainsAny " + strings.Join(body.AllowedPlugins, ",")
-	}
-
-	glossaryFields := []graphql.Field{
-		{Name: "term"}, {Name: "definition"},
-		{Name: "_additional", Fields: []graphql.Field{{Name: "score"}}},
-	}
-
-	wStart := time.Now()
-	knowledgeResult, _ := h.searchCollection(ctx, h.knowledgeCollection, knowledgeFields, knowledgeQuery, 5, nil, nil)
-	// Mirror production prepare(): the tools search uses the configured alpha.
-	actionsResult, _ := h.searchCollection(ctx, h.actionsCollection, actionFields, searchText, 10, actionsWhere, &h.prepareActionsAlpha)
-	glossaryResult, _ := h.searchCollection(ctx, h.glossaryCollection, glossaryFields, searchText, 5, nil, nil)
-	weaviateMs := float64(time.Since(wStart).Microseconds()) / 1000.0
-
-	// Apply the same filter chokepoint as the production prepare(): minScore
-	// baseline + per-session allowed_tools palette, defense-safe default.
-	//
-	//   - field omitted (body.AllowedTools is nil) → fail-closed empty map →
-	//     every retrieved action filtered out. Mirrors the production rule
-	//     so operator rehearsals see the same outcome as a real session
-	//     where the orchestrator never injected the arg.
-	//   - field [] (non-nil empty) → fail-closed (same outcome).
-	//   - field [x, y] → strict subset.
-	//
-	// To inspect raw retrieval without palette filtering, read actions_top
-	// in the response — it carries the score-passing items independently of
-	// the palette result.
-	availableTools := make(map[string]struct{}, len(body.AllowedTools))
-	for _, name := range body.AllowedTools {
-		availableTools[name] = struct{}{}
-	}
-	// Use minPrepareScoreTools (the per-collection tools cutoff) to match
-	// production prepare(). The legacy h.minPrepareScore is the global
-	// fallback Configure leaves on minPrepareScoreTools when the operator
-	// has not split them, so reading the per-collection field stays
-	// equivalent on default configs and stays correct when an operator
-	// tightens just the tools threshold (the common case post-RFC #249).
-	filter := actionFilter{minScore: h.minPrepareScoreTools, availableTools: availableTools}
-	tools := extractToolNames(actionsResult, h.actionsCollection, filter)
-
-	// Surface what the palette rejected. Operators see "score said yes,
-	// palette said no" — the defense-in-depth audit trail in one field.
-	// availableTools is always non-nil after the defense-safe default;
-	// compute filtered_out unconditionally.
-	var filteredOut []string
-	{
-		matched := make(map[string]struct{}, len(tools))
-		for _, t := range tools {
-			matched[t] = struct{}{}
-		}
-		scoreOnlyFilter := actionFilter{minScore: h.minPrepareScoreTools}
-		for _, fqn := range extractToolNames(actionsResult, h.actionsCollection, scoreOnlyFilter) {
-			if _, kept := matched[fqn]; !kept {
-				filteredOut = append(filteredOut, fqn)
-			}
-		}
-	}
-
-	resp := debugPrepareResponse{
-		Original:             body.Text,
-		SearchText:           searchText,
-		Translated:           searchText != body.Text,
-		TranslatorMs:         translatorMs,
-		MinPrepareScore:      h.minPrepareScoreTools,
-		MatchedTools:         tools,
-		ActionsTop:           extractScoredActions(actionsResult, h.actionsCollection),
-		KnowledgeTop:         extractScoredKnowledge(knowledgeResult, h.knowledgeCollection),
-		GlossaryTop:          extractScoredGlossary(glossaryResult, h.glossaryCollection),
-		WeaviateMs:           weaviateMs,
-		KnowledgeQuery:       knowledgeQuery,
-		ActionsCollWhere:     whereLabel,
-		FilteredOutByPalette: filteredOut,
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	enc := json.NewEncoder(w)
-	enc.SetIndent("", "  ")
-	_ = enc.Encode(resp)
-}
-
-func extractScoredActions(result interface{}, className string) []debugScoredEntry {
-	items := extractItems(result, className)
-	out := make([]debugScoredEntry, 0, len(items))
-	for _, item := range items {
-		entry := debugScoredEntry{Score: extractScore(item)}
-		entry.PluginName, _ = item["pluginName"].(string)
-		entry.ActionName, _ = item["actionName"].(string)
-		out = append(out, entry)
-	}
-	return out
-}
-
-func extractScoredKnowledge(result interface{}, className string) []debugScoredEntry {
-	items := extractItems(result, className)
-	out := make([]debugScoredEntry, 0, len(items))
-	for _, item := range items {
-		entry := debugScoredEntry{Score: extractScore(item)}
-		entry.Title, _ = item["title"].(string)
-		entry.Source, _ = item["source"].(string)
-		out = append(out, entry)
-	}
-	return out
-}
-
-func extractScoredGlossary(result interface{}, className string) []debugScoredEntry {
-	items := extractItems(result, className)
-	out := make([]debugScoredEntry, 0, len(items))
-	for _, item := range items {
-		entry := debugScoredEntry{Score: extractScore(item)}
-		entry.Term, _ = item["term"].(string)
-		out = append(out, entry)
-	}
-	return out
-}
-
-func extractScore(obj map[string]interface{}) float64 {
-	additional, _ := obj["_additional"].(map[string]interface{})
-	if additional == nil {
-		return 0
-	}
-	scoreStr, _ := additional["score"].(string)
-	if scoreStr == "" {
-		return 0
-	}
-	var score float64
-	_, _ = fmt.Sscanf(scoreStr, "%f", &score)
-	return score
 }
 
 func writeJSONError(w http.ResponseWriter, code int, msg string) {
