@@ -2,14 +2,12 @@
 
 [![CI](https://github.com/opentalon/weaviate-plugin/actions/workflows/ci.yml/badge.svg)](https://github.com/opentalon/weaviate-plugin/actions/workflows/ci.yml)
 
-An [OpenTalon](https://github.com/opentalon/opentalon) plugin that serves a [Weaviate](https://github.com/weaviate/weaviate)-backed knowledge base. It performs semantic and hybrid search, lets the LLM pull knowledge articles on demand, and ingests a plugin's MCP server instructions and knowledge articles into the knowledge collection.
+An [OpenTalon](https://github.com/opentalon/opentalon) plugin that serves a [Weaviate](https://github.com/weaviate/weaviate)-backed knowledge base. It lets the LLM pull knowledge articles on demand and ingests a plugin's MCP server instructions and knowledge articles into the knowledge collection.
 
 ## Actions
 
 | Action | Mode | Description |
 |---|---|---|
-| `weaviate.search` | LLM tool | nearText semantic search — the LLM calls this when it decides retrieval is needed |
-| `weaviate.hybrid_search` | LLM tool | Hybrid BM25 + vector. `alpha`: `0` = keyword only, `1` = vector only (default `0.5`) |
 | `weaviate.ask_knowledge` | LLM tool | Search the knowledge base by `query`, or fetch one article exactly by `slug` |
 | `weaviate.list_knowledge_titles` | LLM tool | List the slug + title of every knowledge article (the always-on catalog) |
 | `weaviate.search_instructions` | LLM tool | Search synced MCP server-instruction articles |
@@ -19,10 +17,9 @@ An [OpenTalon](https://github.com/opentalon/opentalon) plugin that serves a [Wea
 | `weaviate.ingest_batch` | LLM tool / API | Batch insert multiple knowledge articles |
 | `weaviate.refresh` | orchestrator | Re-create the `KnowledgeArticles` collection if deleted externally |
 
-`search` and `hybrid_search` accept `limit` and `fields` per-call overrides.
-
 > Tool retrieval lives in the orchestrator's tool registry; this plugin serves
-> knowledge only. There is no preparer / RAG pre-pass action.
+> knowledge only. There is no preparer / RAG pre-pass action and no generic
+> search over an arbitrary collection.
 
 ## Configuration
 
@@ -36,12 +33,6 @@ plugins:
     config:
       host: "localhost:8080"       # Weaviate address
       scheme: "http"               # "http" or "https"
-      collection: "Article"        # Weaviate class for search/hybrid_search
-      fields:                      # fields to return in search results
-        - title
-        - body
-        - url
-      limit: 5                     # default result count
 
       # Vectorizer (default: "text2vec-transformers")
       vectorizer: "text2vec-transformers"
@@ -59,7 +50,7 @@ plugins:
       token: "my-secret-token"     # Bearer token — required when http_addr is set
 ```
 
-The `collection` field is required. All others have defaults (`host: localhost:8080`, `scheme: http`, `limit: 5`, `vectorizer: text2vec-transformers`).
+All config fields have defaults (`host: localhost:8080`, `scheme: http`, `knowledge_collection: KnowledgeArticles`, `vectorizer: text2vec-transformers`).
 
 ### Observability
 
@@ -200,9 +191,11 @@ make install PREFIX=~/.local/bin
 
 ## Quick start
 
-### Option A — brew (macOS, keyword tests only)
+### Option A — brew (macOS, no vectorizer)
 
-`brew install weaviate` gives you the binary without a vectorizer module, so `search` (nearText) is unavailable but `hybrid_search` with `alpha=0` works fine.
+`brew install weaviate` gives you the binary without a vectorizer module. The
+knowledge retrieval is hybrid (BM25 + vector), so without a vectorizer the
+keyword half still works; semantic relevance is degraded but the suite runs.
 
 ```bash
 brew install weaviate
@@ -214,16 +207,16 @@ PERSISTENCE_DATA_PATH="$TMPDIR/weaviate" \
 weaviate --host 0.0.0.0 --port 8080 --scheme http &
 ```
 
-Run the keyword-only integration tests:
+Run the integration tests:
 
 ```bash
 make test-brew
-# nearText tests are automatically skipped (WEAVIATE_MODULE defaults to "none")
 ```
 
-### Option B — Docker Compose (full suite, includes semantic search)
+### Option B — Docker Compose (full suite, includes semantic vectors)
 
-Starts Weaviate + the multilingual transformer inference service so nearText works:
+Starts Weaviate + the multilingual transformer inference service so the vector
+half of knowledge retrieval works:
 
 ```bash
 make test-docker
@@ -236,7 +229,7 @@ This uses `sentence-transformers-paraphrase-multilingual-MiniLM-L12-v2` (384 dim
 | Variable | Default | Description |
 |---|---|---|
 | `WEAVIATE_HOST` | `localhost:8080` | Address of the running Weaviate instance |
-| `WEAVIATE_MODULE` | `none` | Set to `text2vec-transformers` to enable nearText tests |
+| `WEAVIATE_MODULE` | `none` | Set to `text2vec-transformers` to exercise the vector half of knowledge retrieval |
 
 ## Build
 
@@ -267,21 +260,20 @@ GitHub Actions runs three jobs on every push/PR:
 |---|---|
 | **lint** | `golangci-lint` |
 | **unit** | `go test ./...` (no Weaviate required) |
-| **integration** | Real Weaviate 1.30 + multilingual transformers via Docker service; runs full test suite including nearText |
+| **integration** | Real Weaviate 1.30 + multilingual transformers via Docker service; runs full test suite including vector retrieval |
 
 The integration job uses Docker service containers declared in the workflow — no manual setup needed.
 
 ## Test suite overview
 
-Unit tests (no Weaviate, run by `go test ./...`) cover Capabilities classification, config/timeout parsing, the per-doc change-skip decision, and the knowledge-candidate extractor.
+Unit tests (no Weaviate, run by `go test ./...`) cover Capabilities classification, config/timeout parsing, the per-doc change-skip decision, and the content-hash helper.
 
 Integration tests (build tag `integration`, need a live Weaviate) cover:
 
 | Area | What it checks |
 |---|---|
 | Capabilities | Plugin declares the correct name and the knowledge-only action set |
-| Configure | Defaults, custom/knowledge collection names, missing-collection + bad-JSON errors, `http_addr` requires token, auto-schema creation + idempotency |
-| `search` / `hybrid_search` | nearText (needs vectorizer) + BM25 keyword, limit/fields overrides, missing-query errors |
+| Configure | Defaults, custom knowledge collection name, bad-JSON error, `http_addr` requires token, auto-schema creation + idempotency |
 | `ask_knowledge` | Semantic search, exact-slug fetch, source filter, limit override, no-results, missing-query error |
 | `list_knowledge_titles` | Returns the slug+title catalog |
 | `sync_actions` (knowledge sync) | Server-instructions + knowledge-article ingestion, stale-section pruning, orphan-plugin pruning, disjoint source-prefix scopes, missing payload/plugin_name errors |
@@ -290,25 +282,6 @@ Integration tests (build tag `integration`, need a live Weaviate) cover:
 | `refresh` | Re-creates the knowledge collection |
 
 ## Wiring into OpenTalon
-
-### Tool mode (LLM-callable)
-
-The LLM sees `search` and `hybrid_search` as available tools and calls them when it decides retrieval is useful:
-
-```yaml
-plugins:
-  - name: weaviate
-    plugin: /usr/local/bin/weaviate-plugin
-    enabled: true
-    config:
-      host: "localhost:8080"
-      scheme: "http"
-      collection: "Article"
-      fields: [title, body]
-      limit: 5
-```
-
-### Knowledge base mode
 
 Enable the HTTP ingestion API and auto-schema creation to build a knowledge base the LLM can pull from via `ask_knowledge` / `list_knowledge_titles`:
 
@@ -320,9 +293,6 @@ plugins:
     config:
       host: "localhost:8080"
       scheme: "http"
-      collection: "Article"
-      fields: [title, body]
-      limit: 5
       auto_create_schema: true
       http_addr: ":8081"
       token: "my-secret-token"
@@ -394,9 +364,6 @@ plugins:
     config:
       host: "weaviate.weaviate.svc.cluster.local:8080"
       scheme: "http"
-      collection: "Article"
-      fields: [title, body]
-      limit: 5
       vectorizer: "text2vec-transformers"
       auto_create_schema: true
 ```

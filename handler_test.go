@@ -36,8 +36,6 @@ func vectorizerModule() string {
 	return "none"
 }
 
-const testClass = "Article"
-
 var rawClient *weaviate.Client
 
 // ---------------------------------------------------------------------------
@@ -65,15 +63,12 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 
-	setupSchema()
 	setupRAGSchemas()
-	seedData()
 	seedRAGData()
 
 	code := m.Run()
 
 	bgCtx := context.Background()
-	_ = rawClient.Schema().ClassDeleter().WithClassName(testClass).Do(bgCtx)
 	_ = rawClient.Schema().ClassDeleter().WithClassName(DefaultKnowledgeCollection).Do(bgCtx)
 	os.Exit(code)
 }
@@ -88,23 +83,6 @@ func waitReady(ctx context.Context) error {
 			return fmt.Errorf("weaviate at %s not ready within 30s", weaviateHost())
 		case <-time.After(500 * time.Millisecond):
 		}
-	}
-}
-
-func setupSchema() {
-	ctx := context.Background()
-	_ = rawClient.Schema().ClassDeleter().WithClassName(testClass).Do(ctx)
-
-	class := &wmodels.Class{
-		Class:      testClass,
-		Vectorizer: vectorizerModule(),
-		Properties: []*wmodels.Property{
-			{Name: "title", DataType: []string{"text"}},
-			{Name: "body", DataType: []string{"text"}},
-		},
-	}
-	if err := rawClient.Schema().ClassCreator().WithClass(class).Do(ctx); err != nil {
-		panic(fmt.Sprintf("create schema: %v", err))
 	}
 }
 
@@ -125,40 +103,6 @@ func setupRAGSchemas() {
 	if err := rawClient.Schema().ClassCreator().WithClass(knowledge).Do(ctx); err != nil {
 		panic(fmt.Sprintf("create KnowledgeArticles: %v", err))
 	}
-}
-
-type article struct{ Title, Body string }
-
-var corpus = []article{
-	{
-		Title: "Introduction to Go programming",
-		Body:  "Go is a statically typed compiled language designed at Google for building reliable and efficient software.",
-	},
-	{
-		Title: "Python for data science",
-		Body:  "Python is widely used in machine learning and data analysis due to its simple syntax and rich ecosystem.",
-	},
-	{
-		Title: "Weaviate vector database",
-		Body:  "Weaviate is an open-source vector database that stores and retrieves objects by their semantic meaning.",
-	},
-}
-
-func seedData() {
-	ctx := context.Background()
-	for _, a := range corpus {
-		_, err := rawClient.Data().Creator().
-			WithClassName(testClass).
-			WithProperties(map[string]interface{}{
-				"title": a.Title,
-				"body":  a.Body,
-			}).
-			Do(ctx)
-		if err != nil {
-			panic(fmt.Sprintf("seed %q: %v", a.Title, err))
-		}
-	}
-	time.Sleep(300 * time.Millisecond)
 }
 
 func seedRAGData() {
@@ -212,9 +156,6 @@ func newHandler(t *testing.T) *WeaviateHandler {
 	cfg, _ := json.Marshal(map[string]interface{}{
 		"host":               weaviateHost(),
 		"scheme":             "http",
-		"collection":         testClass,
-		"fields":             []string{"title", "body"},
-		"limit":              5,
 		"auto_create_schema": false,
 	})
 	h := &WeaviateHandler{}
@@ -222,13 +163,6 @@ func newHandler(t *testing.T) *WeaviateHandler {
 		t.Fatalf("Configure: %v", err)
 	}
 	return h
-}
-
-func requiresVectorizer(t *testing.T) {
-	t.Helper()
-	if vectorizerModule() == "none" {
-		t.Skip("nearText requires a vectorizer; set WEAVIATE_MODULE=text2vec-transformers and run docker compose up -d")
-	}
 }
 
 // ---------------------------------------------------------------------------
@@ -246,7 +180,7 @@ func TestCapabilities(t *testing.T) {
 	for _, a := range caps.Actions {
 		actions[a.Name] = true
 	}
-	for _, want := range []string{"search", "hybrid_search", "sync_actions", "ingest", "ingest_batch", "ask_knowledge", "search_instructions", "list_knowledge_titles", "sync_status", "refresh"} {
+	for _, want := range []string{"sync_actions", "ingest", "ingest_batch", "ask_knowledge", "search_instructions", "list_knowledge_titles", "sync_status", "refresh"} {
 		if !actions[want] {
 			t.Errorf("missing action %q", want)
 		}
@@ -257,30 +191,16 @@ func TestConfigure_defaults(t *testing.T) {
 	h := &WeaviateHandler{}
 	cfg, _ := json.Marshal(map[string]interface{}{
 		"host":               weaviateHost(),
-		"collection":         testClass,
 		"auto_create_schema": false,
 	})
 	if err := h.Configure(string(cfg)); err != nil {
 		t.Fatalf("unexpected error: %v", err)
-	}
-	if h.limit != 5 {
-		t.Errorf("default limit: got %d want 5", h.limit)
-	}
-	if h.collection != testClass {
-		t.Errorf("collection: got %q want %q", h.collection, testClass)
 	}
 	if h.knowledgeCollection != DefaultKnowledgeCollection {
 		t.Errorf("knowledge_collection: got %q want %q", h.knowledgeCollection, DefaultKnowledgeCollection)
 	}
 	if h.client == nil {
 		t.Error("client is nil after Configure")
-	}
-}
-
-func TestConfigure_missingCollection(t *testing.T) {
-	err := (&WeaviateHandler{}).Configure(`{"host":"localhost:8080","auto_create_schema":false}`)
-	if err == nil {
-		t.Fatal("expected error for missing collection, got nil")
 	}
 }
 
@@ -294,7 +214,6 @@ func TestConfigure_badJSON(t *testing.T) {
 func TestConfigure_httpRequiresToken(t *testing.T) {
 	cfg, _ := json.Marshal(map[string]interface{}{
 		"host":               weaviateHost(),
-		"collection":         testClass,
 		"auto_create_schema": false,
 		"http_addr":          ":9999",
 	})
@@ -307,19 +226,15 @@ func TestConfigure_httpRequiresToken(t *testing.T) {
 	}
 }
 
-func TestConfigure_customCollectionNames(t *testing.T) {
+func TestConfigure_customKnowledgeCollectionName(t *testing.T) {
 	h := &WeaviateHandler{}
 	cfg, _ := json.Marshal(map[string]interface{}{
 		"host":                 weaviateHost(),
-		"collection":           testClass,
 		"knowledge_collection": "CustomKnowledge",
 		"auto_create_schema":   false,
 	})
 	if err := h.Configure(string(cfg)); err != nil {
 		t.Fatalf("Configure: %v", err)
-	}
-	if h.collection != testClass {
-		t.Errorf("collection: got %q want %q", h.collection, testClass)
 	}
 	if h.knowledgeCollection != "CustomKnowledge" {
 		t.Errorf("knowledge_collection: got %q want %q", h.knowledgeCollection, "CustomKnowledge")
@@ -331,129 +246,6 @@ func TestExecute_unknownAction(t *testing.T) {
 	resp := h.Execute(plugin.Request{ID: "x", Action: "delete_everything"})
 	if resp.Error == "" {
 		t.Error("expected error for unknown action, got none")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Integration tests — search (existing)
-// ---------------------------------------------------------------------------
-
-func TestHybridSearch_keywordOnly(t *testing.T) {
-	h := newHandler(t)
-
-	resp := h.Execute(plugin.Request{
-		ID:     "hybrid-1",
-		Action: "hybrid_search",
-		Args: map[string]string{
-			"query": "python",
-			"alpha": "0",
-		},
-	})
-
-	if resp.Error != "" {
-		t.Fatalf("Execute error: %s", resp.Error)
-	}
-	if resp.CallID != "hybrid-1" {
-		t.Errorf("CallID: got %q want %q", resp.CallID, "hybrid-1")
-	}
-	if !strings.Contains(strings.ToLower(resp.Content), "python") {
-		t.Errorf("expected python article in results; got:\n%s", resp.Content)
-	}
-}
-
-func TestHybridSearch_limitOverride(t *testing.T) {
-	h := newHandler(t)
-
-	resp := h.Execute(plugin.Request{
-		ID:     "hybrid-2",
-		Action: "hybrid_search",
-		Args: map[string]string{
-			"query": "go",
-			"alpha": "0",
-			"limit": "1",
-		},
-	})
-
-	if resp.Error != "" {
-		t.Fatalf("Execute error: %s", resp.Error)
-	}
-
-	var data map[string]interface{}
-	if err := json.Unmarshal([]byte(resp.Content), &data); err != nil {
-		t.Fatalf("unmarshal response: %v", err)
-	}
-
-	get, _ := data["Get"].(map[string]interface{})
-	items, _ := get[testClass].([]interface{})
-	if len(items) > 1 {
-		t.Errorf("limit=1 returned %d items", len(items))
-	}
-}
-
-func TestHybridSearch_fieldsOverride(t *testing.T) {
-	h := newHandler(t)
-
-	resp := h.Execute(plugin.Request{
-		ID:     "hybrid-3",
-		Action: "hybrid_search",
-		Args: map[string]string{
-			"query":  "go",
-			"alpha":  "0",
-			"fields": "title",
-		},
-	})
-
-	if resp.Error != "" {
-		t.Fatalf("Execute error: %s", resp.Error)
-	}
-	if strings.Contains(strings.ToLower(resp.Content), `"body"`) {
-		t.Error("expected no 'body' field when fields=title")
-	}
-}
-
-func TestSearch_semantic(t *testing.T) {
-	requiresVectorizer(t)
-
-	h := newHandler(t)
-	resp := h.Execute(plugin.Request{
-		ID:     "search-1",
-		Action: "search",
-		Args: map[string]string{
-			"query": "vector database semantic meaning",
-			"limit": "3",
-		},
-	})
-
-	if resp.Error != "" {
-		t.Fatalf("Execute error: %s", resp.Error)
-	}
-	if !strings.Contains(strings.ToLower(resp.Content), "weaviate") {
-		t.Logf("full response:\n%s", resp.Content)
-		t.Error("expected Weaviate article in top results for 'vector database' query")
-	}
-}
-
-func TestSearch_missingQuery(t *testing.T) {
-	h := newHandler(t)
-	resp := h.Execute(plugin.Request{
-		ID:     "search-err",
-		Action: "search",
-		Args:   map[string]string{},
-	})
-	if resp.Error == "" {
-		t.Error("expected error for missing query, got none")
-	}
-}
-
-func TestHybridSearch_missingQuery(t *testing.T) {
-	h := newHandler(t)
-	resp := h.Execute(plugin.Request{
-		ID:     "hybrid-err",
-		Action: "hybrid_search",
-		Args:   map[string]string{},
-	})
-	if resp.Error == "" {
-		t.Error("expected error for missing query, got none")
 	}
 }
 
@@ -472,7 +264,6 @@ func TestConfigure_autoCreateSchema(t *testing.T) {
 	cfg, _ := json.Marshal(map[string]interface{}{
 		"host":                 weaviateHost(),
 		"scheme":               "http",
-		"collection":           testClass,
 		"knowledge_collection": tmpKnowledge,
 		"auto_create_schema":   true,
 	})
@@ -498,7 +289,6 @@ func TestConfigure_autoCreateSchemaIdempotent(t *testing.T) {
 	cfg, _ := json.Marshal(map[string]interface{}{
 		"host":               weaviateHost(),
 		"scheme":             "http",
-		"collection":         testClass,
 		"auto_create_schema": true,
 	})
 	if err := h.Configure(string(cfg)); err != nil {

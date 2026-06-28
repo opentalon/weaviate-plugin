@@ -27,7 +27,7 @@ func TestCapabilities_readOnlyAndPinClassification(t *testing.T) {
 		byName[a.Name] = a
 	}
 
-	reads := []string{"search", "hybrid_search", "ask_knowledge", "list_knowledge_titles", "search_instructions", "sync_status"}
+	reads := []string{"ask_knowledge", "list_knowledge_titles", "search_instructions", "sync_status"}
 	writes := []string{"sync_actions", "ingest", "ingest_batch", "refresh"}
 
 	for _, name := range reads {
@@ -147,7 +147,7 @@ func TestSplitChangedDocs(t *testing.T) {
 
 func TestConfigureTimeout_default(t *testing.T) {
 	h := &WeaviateHandler{}
-	cfg := `{"host":"localhost:8080","collection":"Test","auto_create_schema":false}`
+	cfg := `{"host":"localhost:8080","auto_create_schema":false}`
 	if err := h.Configure(cfg); err != nil {
 		t.Fatalf("Configure: %v", err)
 	}
@@ -158,7 +158,7 @@ func TestConfigureTimeout_default(t *testing.T) {
 
 func TestConfigureTimeout_customDuration(t *testing.T) {
 	h := &WeaviateHandler{}
-	cfg := `{"host":"localhost:8080","collection":"Test","auto_create_schema":false,"timeout":"5m"}`
+	cfg := `{"host":"localhost:8080","auto_create_schema":false,"timeout":"5m"}`
 	if err := h.Configure(cfg); err != nil {
 		t.Fatalf("Configure: %v", err)
 	}
@@ -169,7 +169,7 @@ func TestConfigureTimeout_customDuration(t *testing.T) {
 
 func TestConfigureTimeout_seconds(t *testing.T) {
 	h := &WeaviateHandler{}
-	cfg := `{"host":"localhost:8080","collection":"Test","auto_create_schema":false,"timeout":"90s"}`
+	cfg := `{"host":"localhost:8080","auto_create_schema":false,"timeout":"90s"}`
 	if err := h.Configure(cfg); err != nil {
 		t.Fatalf("Configure: %v", err)
 	}
@@ -180,7 +180,7 @@ func TestConfigureTimeout_seconds(t *testing.T) {
 
 func TestConfigureTimeout_invalidFallsBackToDefault(t *testing.T) {
 	h := &WeaviateHandler{}
-	cfg := `{"host":"localhost:8080","collection":"Test","auto_create_schema":false,"timeout":"notaduration"}`
+	cfg := `{"host":"localhost:8080","auto_create_schema":false,"timeout":"notaduration"}`
 	if err := h.Configure(cfg); err != nil {
 		t.Fatalf("Configure: %v", err)
 	}
@@ -191,7 +191,7 @@ func TestConfigureTimeout_invalidFallsBackToDefault(t *testing.T) {
 
 func TestConfigureTimeout_zeroFallsBackToDefault(t *testing.T) {
 	h := &WeaviateHandler{}
-	cfg := `{"host":"localhost:8080","collection":"Test","auto_create_schema":false,"timeout":"0s"}`
+	cfg := `{"host":"localhost:8080","auto_create_schema":false,"timeout":"0s"}`
 	if err := h.Configure(cfg); err != nil {
 		t.Fatalf("Configure: %v", err)
 	}
@@ -202,7 +202,7 @@ func TestConfigureTimeout_zeroFallsBackToDefault(t *testing.T) {
 
 func TestConfigureTimeout_negativeFallsBackToDefault(t *testing.T) {
 	h := &WeaviateHandler{}
-	cfg := `{"host":"localhost:8080","collection":"Test","auto_create_schema":false,"timeout":"-5m"}`
+	cfg := `{"host":"localhost:8080","auto_create_schema":false,"timeout":"-5m"}`
 	if err := h.Configure(cfg); err != nil {
 		t.Fatalf("Configure: %v", err)
 	}

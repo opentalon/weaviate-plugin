@@ -20,16 +20,6 @@ import (
 	wmodels "github.com/weaviate/weaviate/entities/models"
 )
 
-// Orchestrator context-arg wire names. Declared as constants here so a
-// typo at any of the call sites (Capability InjectContextArgs +
-// Execute-time req.Args reads) fails to compile rather than silently
-// drifting and leaving the arg unread. Canonical cross-repo source of
-// truth is opentalon/pkg/plugin/contextargs - kept as a local const here
-// to avoid pinning this plugin to an unreleased opentalon revision
-// while the matching PR is in flight. Bump in lock-step with that
-// package; both sides MUST agree on the wire name.
-const ctxArgAllowedPlugins = "allowed_plugins"
-
 // DefaultKnowledgeCollection is the default class name for the knowledge base.
 const DefaultKnowledgeCollection = "KnowledgeArticles"
 
@@ -54,10 +44,7 @@ const MCPKnowledgeSourcePrefix = "mcp-knowledge:"
 type Config struct {
 	Host                string         `json:"host"`
 	Scheme              string         `json:"scheme"`
-	Collection          string         `json:"collection"`
 	KnowledgeCollection string         `json:"knowledge_collection"`
-	Fields              []string       `json:"fields"`
-	Limit               int            `json:"limit"`
 	AutoCreateSchema    *bool          `json:"auto_create_schema"`
 	HTTPAddr            string         `json:"http_addr"`
 	Token               string         `json:"token"`
@@ -84,10 +71,7 @@ type syncStatusState struct {
 // WeaviateHandler implements plugin.Handler.
 type WeaviateHandler struct {
 	client              *weaviate.Client
-	collection          string
 	knowledgeCollection string
-	fields              []string
-	limit               int
 	httpAddr            string
 	token               string
 	vectorizer          string
@@ -115,15 +99,11 @@ func (h *WeaviateHandler) Configure(configJSON string) error {
 	cfg := Config{
 		Host:   "localhost:8080",
 		Scheme: "http",
-		Limit:  5,
 	}
 	if configJSON != "" {
 		if err := json.Unmarshal([]byte(configJSON), &cfg); err != nil {
 			return fmt.Errorf("parse config: %w", err)
 		}
-	}
-	if cfg.Collection == "" {
-		return fmt.Errorf("config.collection is required")
 	}
 
 	log.Printf("weaviate-plugin: connecting to %s://%s", cfg.Scheme, cfg.Host)
@@ -148,12 +128,6 @@ func (h *WeaviateHandler) Configure(configJSON string) error {
 
 	h.client = client
 	h.clientTimeout = clientTimeout
-	h.collection = cfg.Collection
-	h.fields = cfg.Fields
-	h.limit = cfg.Limit
-	if h.limit <= 0 {
-		h.limit = 5
-	}
 
 	h.knowledgeCollection = cfg.KnowledgeCollection
 	if h.knowledgeCollection == "" {
@@ -173,9 +147,7 @@ func (h *WeaviateHandler) Configure(configJSON string) error {
 		return fmt.Errorf("config.token is required when http_addr is set")
 	}
 
-	log.Printf("weaviate-plugin: collection=%s vectorizer=%s limit=%d fields=%v",
-		h.collection, h.vectorizer, h.limit, h.fields)
-	log.Printf("weaviate-plugin: knowledge_collection=%s", h.knowledgeCollection)
+	log.Printf("weaviate-plugin: vectorizer=%s knowledge_collection=%s", h.vectorizer, h.knowledgeCollection)
 
 	autoCreate := cfg.AutoCreateSchema == nil || *cfg.AutoCreateSchema
 	if autoCreate {
@@ -200,8 +172,8 @@ func (h *WeaviateHandler) Configure(configJSON string) error {
 		}()
 	}
 
-	log.Printf("weaviate-plugin: init done (Configure) host=%s://%s collection=%s http=%s",
-		cfg.Scheme, cfg.Host, h.collection, h.httpAddr)
+	log.Printf("weaviate-plugin: init done (Configure) host=%s://%s knowledge_collection=%s http=%s",
+		cfg.Scheme, cfg.Host, h.knowledgeCollection, h.httpAddr)
 
 	return nil
 }
@@ -303,32 +275,11 @@ func (h *WeaviateHandler) ensureProperties(ctx context.Context, name string, wan
 func (h *WeaviateHandler) Capabilities() plugin.CapabilitiesMsg {
 	return plugin.CapabilitiesMsg{
 		Name:        "weaviate",
-		Description: "Retrieval plugin for Weaviate vector database. Performs semantic and hybrid search, manages MCP action indexing, and knowledge article ingestion.",
+		Description: "Knowledge plugin for a Weaviate-backed knowledge base. Ingests and retrieves product docs and knowledge articles: semantic search and exact-slug fetch via ask_knowledge, the slug+title catalog via list_knowledge_titles, MCP server-instruction search, and the per-plugin knowledge sync.",
 		Actions: []plugin.ActionMsg{
 			{
-				Name:        "search",
-				Description: "Semantic nearText search — finds objects whose meaning is closest to the query.",
-				Parameters: []plugin.ParameterMsg{
-					{Name: "query", Description: "Natural language query", Type: "string", Required: true},
-					{Name: "limit", Description: "Maximum number of results (overrides config default)", Type: "integer", Required: false},
-					{Name: "fields", Description: "Comma-separated list of fields to return (overrides config default)", Type: "string", Required: false},
-				},
-				ReadOnly: true, // pure search — no state mutation
-			},
-			{
-				Name:        "hybrid_search",
-				Description: "Hybrid search combining vector similarity and BM25 keyword matching. Alpha controls the blend: 0 = keyword only, 1 = vector only (default 0.5).",
-				Parameters: []plugin.ParameterMsg{
-					{Name: "query", Description: "Search query", Type: "string", Required: true},
-					{Name: "alpha", Description: "Float 0–1, balance between keyword (0) and vector (1). Default 0.5", Type: "number", Required: false},
-					{Name: "limit", Description: "Maximum number of results (overrides config default)", Type: "integer", Required: false},
-					{Name: "fields", Description: "Comma-separated list of fields to return (overrides config default)", Type: "string", Required: false},
-				},
-				ReadOnly: true, // pure search — no state mutation
-			},
-			{
 				Name:        "sync_actions",
-				Description: "Sync a plugin's MCP server instructions and knowledge articles into the KnowledgeArticles collection.",
+				Description: "Ingest a plugin's MCP server instructions and knowledge articles into the KnowledgeArticles collection.",
 				Parameters: []plugin.ParameterMsg{
 					{Name: "payload", Description: `JSON: {"plugin_name":"...","server_instructions":"...","knowledge_articles":[{"id":"...","title":"...","content":"..."}]}`, Type: "string", Required: true},
 				},
@@ -352,7 +303,7 @@ func (h *WeaviateHandler) Capabilities() plugin.CapabilitiesMsg {
 			},
 			{
 				Name:        "ask_knowledge",
-				Description: "Search the knowledge base for product docs, how-to guides, and tool descriptions. Use BEFORE asking the user when you need more context. Pass `slug` to fetch one specific article exactly (slugs come from the knowledge catalog); pass `query` for a semantic search.",
+				Description: "Search the knowledge base for product docs, how-to guides, and knowledge articles. Use BEFORE asking the user when you need more context. Pass `slug` to fetch one specific article exactly (slugs come from the knowledge catalog); pass `query` for a semantic search.",
 				Parameters: []plugin.ParameterMsg{
 					{Name: "query", Description: "Natural language question for knowledge base search. Required unless `slug` is given.", Type: "string", Required: false},
 					{Name: "slug", Description: "Exact knowledge-article slug (from the catalog) to fetch its full body deterministically. Takes precedence over query.", Type: "string", Required: false},
@@ -390,7 +341,7 @@ func (h *WeaviateHandler) Capabilities() plugin.CapabilitiesMsg {
 			},
 			{
 				Name:        "refresh",
-				Description: "Re-create Weaviate collections if they were deleted externally. Called automatically on session clear.",
+				Description: "Re-create the KnowledgeArticles collection if it was deleted externally. Called automatically on session clear.",
 				Parameters:  []plugin.ParameterMsg{},
 			},
 		},
@@ -403,10 +354,6 @@ func (h *WeaviateHandler) Execute(req plugin.Request) plugin.Response {
 		return plugin.Response{CallID: req.ID, Error: "weaviate client not initialised — check plugin config"}
 	}
 	switch req.Action {
-	case "search":
-		return h.search(req)
-	case "hybrid_search":
-		return h.hybridSearch(req)
 	case "sync_actions":
 		return h.enqueueSyncActions(req)
 	case "ingest":
@@ -429,57 +376,8 @@ func (h *WeaviateHandler) Execute(req plugin.Request) plugin.Response {
 }
 
 // ---------------------------------------------------------------------------
-// Search actions (existing)
+// Knowledge search helpers
 // ---------------------------------------------------------------------------
-
-func (h *WeaviateHandler) search(req plugin.Request) plugin.Response {
-	query, ok := req.Args["query"]
-	if !ok || query == "" {
-		return plugin.Response{CallID: req.ID, Error: "query is required"}
-	}
-
-	ctx := context.Background()
-
-	result, err := h.client.GraphQL().Get().
-		WithClassName(h.collection).
-		WithFields(h.resolveFields(req.Args)...).
-		WithNearText(h.client.GraphQL().NearTextArgBuilder().WithConcepts([]string{query})).
-		WithLimit(h.resolveLimit(req.Args)).
-		Do(ctx)
-
-	if err != nil {
-		return plugin.Response{CallID: req.ID, Error: fmt.Sprintf("weaviate search: %v", err)}
-	}
-	return marshalResponse(req.ID, result)
-}
-
-func (h *WeaviateHandler) hybridSearch(req plugin.Request) plugin.Response {
-	query, ok := req.Args["query"]
-	if !ok || query == "" {
-		return plugin.Response{CallID: req.ID, Error: "query is required"}
-	}
-
-	ctx := context.Background()
-
-	hybrid := h.client.GraphQL().HybridArgumentBuilder().WithQuery(query)
-	if v, ok := req.Args["alpha"]; ok && v != "" {
-		if alpha, err := strconv.ParseFloat(v, 32); err == nil {
-			hybrid = hybrid.WithAlpha(float32(alpha))
-		}
-	}
-
-	result, err := h.client.GraphQL().Get().
-		WithClassName(h.collection).
-		WithFields(h.resolveFields(req.Args)...).
-		WithHybrid(hybrid).
-		WithLimit(h.resolveLimit(req.Args)).
-		Do(ctx)
-
-	if err != nil {
-		return plugin.Response{CallID: req.ID, Error: fmt.Sprintf("weaviate hybrid_search: %v", err)}
-	}
-	return marshalResponse(req.ID, result)
-}
 
 // searchCollection performs a hybrid (BM25 + vector) search on the given
 // collection with an optional where filter. When alpha is non-nil it sets the
@@ -543,24 +441,6 @@ func (h *WeaviateHandler) fetchObjects(
 		return nil, fmt.Errorf("%s", result.Errors[0].Message)
 	}
 	return result, nil
-}
-
-// aboveScore checks whether a GraphQL result object's _additional.score
-// meets the minimum threshold.
-func aboveScore(obj map[string]interface{}, minScore float64) bool {
-	additional, _ := obj["_additional"].(map[string]interface{})
-	if additional == nil {
-		return true // no score info → include by default
-	}
-	scoreStr, _ := additional["score"].(string)
-	if scoreStr == "" {
-		return true
-	}
-	score, err := strconv.ParseFloat(scoreStr, 64)
-	if err != nil {
-		return true
-	}
-	return score >= minScore
 }
 
 // ---------------------------------------------------------------------------
@@ -1344,43 +1224,6 @@ func (h *WeaviateHandler) ingestBatch(req plugin.Request) plugin.Response {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-func (h *WeaviateHandler) resolveLimit(args map[string]string) int {
-	if v, ok := args["limit"]; ok && v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			return n
-		}
-	}
-	return h.limit
-}
-
-func (h *WeaviateHandler) resolveFields(args map[string]string) []graphql.Field {
-	var names []string
-
-	if v, ok := args["fields"]; ok && v != "" {
-		names = splitCSV(v)
-	} else if len(h.fields) > 0 {
-		names = h.fields
-	}
-
-	fields := make([]graphql.Field, 0, len(names)+1)
-	for _, name := range names {
-		fields = append(fields, graphql.Field{Name: name})
-	}
-	fields = append(fields, graphql.Field{
-		Name:   "_additional",
-		Fields: []graphql.Field{{Name: "distance"}, {Name: "score"}},
-	})
-	return fields
-}
-
-func marshalResponse(callID string, result interface{}) plugin.Response {
-	b, err := json.MarshalIndent(result, "", "  ")
-	if err != nil {
-		return plugin.Response{CallID: callID, Error: fmt.Sprintf("marshal result: %v", err)}
-	}
-	return plugin.Response{CallID: callID, Content: string(b)}
-}
 
 func splitCSV(s string) []string {
 	parts := strings.Split(s, ",")
