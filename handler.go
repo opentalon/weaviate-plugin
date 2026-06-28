@@ -192,7 +192,15 @@ func (h *WeaviateHandler) ensureSchemas(ctx context.Context) error {
 		// value exactly — the key behind ask_knowledge(slug=…) and the catalog.
 		{Name: "slug", DataType: []string{"text"}, Tokenization: "field"},
 		{Name: "content", DataType: []string{"text"}},
-		{Name: "source", DataType: []string{"text"}},
+		// source carries the exact provenance key ("mcp:<plugin>" or
+		// "mcp-knowledge:<plugin>:<slug>"). Field-tokenized so a WHERE Equal
+		// matches the whole value exactly — the prune path deletes one source
+		// at a time via Equal, and with default word tokenization Equal matches
+		// per-token (all query tokens present), so deleting "mcp:foo" would also
+		// hit "mcp-knowledge:foo:bar" (both contain the tokens mcp+foo) and prune
+		// a kept plugin's article. Field tokenization makes Equal an exact match
+		// and keeps the Like "<prefix>*" discovery scopes whole-value prefixed.
+		{Name: "source", DataType: []string{"text"}, Tokenization: "field"},
 		{Name: "tags", DataType: []string{"text[]"}},
 		h.contentHashProperty(),
 	})

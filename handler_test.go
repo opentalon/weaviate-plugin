@@ -96,7 +96,11 @@ func setupRAGSchemas() {
 		Properties: []*wmodels.Property{
 			{Name: "title", DataType: []string{"text"}},
 			{Name: "content", DataType: []string{"text"}},
-			{Name: "source", DataType: []string{"text"}},
+			// Field-tokenized so a WHERE Equal on source is an exact whole-value
+			// match (matches production ensureSchemas). With default word
+			// tokenization Equal matches per-token, so pruning "mcp:foo" would
+			// over-match "mcp-knowledge:foo:bar" and delete a kept article.
+			{Name: "source", DataType: []string{"text"}, Tokenization: "field"},
 			{Name: "tags", DataType: []string{"text[]"}},
 		},
 	}
