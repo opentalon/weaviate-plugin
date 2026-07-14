@@ -228,7 +228,9 @@ func TestActionUUID_deterministicAndDistinct(t *testing.T) {
 	// Deterministic: the same plugin/action pair always maps to the same object
 	// id — the property that lets a re-sync upsert in place (and lets this
 	// restored writer heal a corpus written by an older deployment).
-	if actionUUID("timly", "list-items") != actionUUID("timly", "list-items") {
+	first := actionUUID("timly", "list-items")
+	second := actionUUID("timly", "list-items")
+	if first != second {
 		t.Error("actionUUID must be deterministic")
 	}
 	if actionUUID("timly", "list-items") == actionUUID("timly", "list-assignments") {
