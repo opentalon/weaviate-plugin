@@ -69,6 +69,7 @@ func TestMain(m *testing.M) {
 	code := m.Run()
 
 	bgCtx := context.Background()
+	_ = rawClient.Schema().ClassDeleter().WithClassName(DefaultActionsCollection).Do(bgCtx)
 	_ = rawClient.Schema().ClassDeleter().WithClassName(DefaultKnowledgeCollection).Do(bgCtx)
 	os.Exit(code)
 }
@@ -88,7 +89,22 @@ func waitReady(ctx context.Context) error {
 
 func setupRAGSchemas() {
 	ctx := context.Background()
+	_ = rawClient.Schema().ClassDeleter().WithClassName(DefaultActionsCollection).Do(ctx)
 	_ = rawClient.Schema().ClassDeleter().WithClassName(DefaultKnowledgeCollection).Do(ctx)
+
+	actions := &wmodels.Class{
+		Class:      DefaultActionsCollection,
+		Vectorizer: vectorizerModule(),
+		Properties: []*wmodels.Property{
+			{Name: "pluginName", DataType: []string{"text"}},
+			{Name: "actionName", DataType: []string{"text"}},
+			{Name: "description", DataType: []string{"text"}},
+			{Name: "parameters", DataType: []string{"text"}},
+		},
+	}
+	if err := rawClient.Schema().ClassCreator().WithClass(actions).Do(ctx); err != nil {
+		panic(fmt.Sprintf("create MCPActions: %v", err))
+	}
 
 	knowledge := &wmodels.Class{
 		Class:      DefaultKnowledgeCollection,
@@ -202,6 +218,9 @@ func TestConfigure_defaults(t *testing.T) {
 	}
 	if h.knowledgeCollection != DefaultKnowledgeCollection {
 		t.Errorf("knowledge_collection: got %q want %q", h.knowledgeCollection, DefaultKnowledgeCollection)
+	}
+	if h.actionsCollection != DefaultActionsCollection {
+		t.Errorf("actions_collection: got %q want %q", h.actionsCollection, DefaultActionsCollection)
 	}
 	if h.client == nil {
 		t.Error("client is nil after Configure")
@@ -331,6 +350,411 @@ func TestSyncActions_missingPluginName(t *testing.T) {
 	}
 }
 
+func TestSyncActions(t *testing.T) {
+	h := newHandler(t)
+
+	payload, _ := json.Marshal(syncActionsPayload{
+		PluginName: "test-plugin",
+		Actions: []syncActionEntry{
+			{Name: "create_issue", Description: "Create a new issue in the tracker"},
+			{Name: "list_issues", Description: "List all open issues"},
+		},
+	})
+
+	resp := h.Execute(plugin.Request{
+		ID:     "sync-1",
+		Action: "sync_actions",
+		Args:   map[string]string{"payload": string(payload)},
+	})
+
+	if resp.Error != "" {
+		t.Fatalf("Execute error: %s", resp.Error)
+	}
+	if !strings.Contains(resp.Content, `"queued":true`) {
+		t.Errorf("expected queued:true, got: %s", resp.Content)
+	}
+	waitSyncDrain(t, h, 10*time.Second)
+
+	// Verify both actions exist in Weaviate.
+	for _, name := range []string{"create_issue", "list_issues"} {
+		id := actionUUID("test-plugin", name)
+		objs, err := rawClient.Data().ObjectsGetter().WithClassName(DefaultActionsCollection).WithID(id).Do(context.Background())
+		if err != nil || len(objs) == 0 {
+			t.Errorf("action %s missing after sync: err=%v", name, err)
+		}
+	}
+}
+
+func TestSyncActions_upsert(t *testing.T) {
+	h := newHandler(t)
+
+	payload, _ := json.Marshal(syncActionsPayload{
+		PluginName: "upsert-plugin",
+		Actions: []syncActionEntry{
+			{Name: "do_thing", Description: "Original description"},
+		},
+	})
+
+	resp := h.Execute(plugin.Request{
+		ID:     "sync-u1",
+		Action: "sync_actions",
+		Args:   map[string]string{"payload": string(payload)},
+	})
+	if resp.Error != "" {
+		t.Fatalf("first sync error: %s", resp.Error)
+	}
+	waitSyncDrain(t, h, 10*time.Second)
+
+	// Sync again with updated description — should not fail.
+	payload, _ = json.Marshal(syncActionsPayload{
+		PluginName: "upsert-plugin",
+		Actions: []syncActionEntry{
+			{Name: "do_thing", Description: "Updated description"},
+		},
+	})
+
+	resp = h.Execute(plugin.Request{
+		ID:     "sync-u2",
+		Action: "sync_actions",
+		Args:   map[string]string{"payload": string(payload)},
+	})
+	if resp.Error != "" {
+		t.Fatalf("upsert sync error: %s", resp.Error)
+	}
+	if !strings.Contains(resp.Content, `"queued":true`) {
+		t.Errorf("expected queued:true, got: %s", resp.Content)
+	}
+	waitSyncDrain(t, h, 10*time.Second)
+}
+
+func TestSyncActions_deletesStaleActions(t *testing.T) {
+	h := newHandler(t)
+
+	// First sync: two actions.
+	payload, _ := json.Marshal(syncActionsPayload{
+		PluginName: "stale-plugin",
+		Actions: []syncActionEntry{
+			{Name: "old_action", Description: "Will be removed"},
+			{Name: "keep_action", Description: "Will be kept"},
+		},
+	})
+	resp := h.Execute(plugin.Request{
+		ID:     "sync-stale1",
+		Action: "sync_actions",
+		Args:   map[string]string{"payload": string(payload)},
+	})
+	if resp.Error != "" {
+		t.Fatalf("first sync error: %s", resp.Error)
+	}
+	waitSyncDrain(t, h, 10*time.Second)
+	time.Sleep(300 * time.Millisecond)
+
+	// Second sync: only keep_action — old_action should be deleted.
+	payload, _ = json.Marshal(syncActionsPayload{
+		PluginName: "stale-plugin",
+		Actions: []syncActionEntry{
+			{Name: "keep_action", Description: "Updated description"},
+		},
+	})
+	resp = h.Execute(plugin.Request{
+		ID:     "sync-stale2",
+		Action: "sync_actions",
+		Args:   map[string]string{"payload": string(payload)},
+	})
+	if resp.Error != "" {
+		t.Fatalf("second sync error: %s", resp.Error)
+	}
+	waitSyncDrain(t, h, 10*time.Second)
+	time.Sleep(300 * time.Millisecond)
+
+	// Verify old_action no longer exists by searching for it.
+	oldID := actionUUID("stale-plugin", "old_action")
+	objs, err := rawClient.Data().ObjectsGetter().
+		WithClassName(DefaultActionsCollection).
+		WithID(oldID).
+		Do(context.Background())
+	if err == nil && len(objs) > 0 {
+		t.Error("old_action should have been deleted by the second sync, but it still exists")
+	}
+
+	// Verify keep_action still exists.
+	keepID := actionUUID("stale-plugin", "keep_action")
+	objs, err = rawClient.Data().ObjectsGetter().
+		WithClassName(DefaultActionsCollection).
+		WithID(keepID).
+		Do(context.Background())
+	if err != nil {
+		t.Fatalf("check keep_action: %v", err)
+	}
+	if len(objs) == 0 {
+		t.Error("keep_action should still exist after second sync")
+	}
+}
+
+// mustSyncActions runs one sync_actions call and waits for the worker to drain.
+func mustSyncActions(t *testing.T, h *WeaviateHandler, id string, payload syncActionsPayload) {
+	t.Helper()
+	b, _ := json.Marshal(payload)
+	resp := h.Execute(plugin.Request{ID: id, Action: "sync_actions", Args: map[string]string{"payload": string(b)}})
+	if resp.Error != "" {
+		t.Fatalf("sync %s: %s", id, resp.Error)
+	}
+	waitSyncDrain(t, h, 10*time.Second)
+	time.Sleep(300 * time.Millisecond)
+}
+
+// actionRecordExists reports whether the plugin's action is stored in Weaviate.
+func actionRecordExists(t *testing.T, pluginName, actionName string) bool {
+	t.Helper()
+	objs, err := rawClient.Data().ObjectsGetter().
+		WithClassName(DefaultActionsCollection).
+		WithID(actionUUID(pluginName, actionName)).
+		Do(context.Background())
+	return err == nil && len(objs) > 0
+}
+
+// seedTestPluginActions seeds a plugin's action set via a normal sync call.
+func seedTestPluginActions(t *testing.T, h *WeaviateHandler, pluginName string, actions []syncActionEntry) {
+	t.Helper()
+	payload, _ := json.Marshal(syncActionsPayload{PluginName: pluginName, Actions: actions})
+	resp := h.Execute(plugin.Request{
+		ID:     "seed-" + pluginName,
+		Action: "sync_actions",
+		Args:   map[string]string{"payload": string(payload)},
+	})
+	if resp.Error != "" {
+		t.Fatalf("seed sync for %s: %s", pluginName, resp.Error)
+	}
+	waitSyncDrain(t, h, 10*time.Second)
+	time.Sleep(300 * time.Millisecond)
+}
+
+// TestSyncActions_keepActionsPreservesUnsentValidActions is the definitive
+// gap-free test: it re-syncs only ONE of three actions but declares all three
+// still valid via keep_actions. The diff prune must keep the two that were not
+// re-upserted in this call — the legacy blanket pre-delete would have wiped
+// them. This is the property that makes a rolling restart's resync invisible to
+// a reader on a peer pod.
+func TestSyncActions_keepActionsPreservesUnsentValidActions(t *testing.T) {
+	h := newHandler(t)
+	const p = "keep-preserve-plugin"
+
+	seedTestPluginActions(t, h, p, []syncActionEntry{
+		{Name: "alpha", Description: "a"},
+		{Name: "bravo", Description: "b"},
+		{Name: "charlie", Description: "c"},
+	})
+
+	mustSyncActions(t, h, "kp-resync", syncActionsPayload{
+		PluginName:  p,
+		Actions:     []syncActionEntry{{Name: "alpha", Description: "a-updated"}},
+		KeepActions: []string{"alpha", "bravo", "charlie"},
+	})
+
+	for _, name := range []string{"alpha", "bravo", "charlie"} {
+		if !actionRecordExists(t, p, name) {
+			t.Errorf("%s should still exist: keep_actions listed it as valid, the diff prune must not delete it", name)
+		}
+	}
+}
+
+// TestSyncActions_keepActionsDeletesStale verifies the diff path still removes a
+// genuinely removed action (present locally, absent from keep_actions).
+func TestSyncActions_keepActionsDeletesStale(t *testing.T) {
+	h := newHandler(t)
+	const p = "keep-stale-plugin"
+
+	seedTestPluginActions(t, h, p, []syncActionEntry{
+		{Name: "alpha", Description: "a"},
+		{Name: "bravo", Description: "b"},
+		{Name: "charlie", Description: "c"},
+	})
+
+	// charlie is dropped from the current set.
+	mustSyncActions(t, h, "ks-resync", syncActionsPayload{
+		PluginName:  p,
+		Actions:     []syncActionEntry{{Name: "alpha", Description: "a"}, {Name: "bravo", Description: "b"}},
+		KeepActions: []string{"alpha", "bravo"},
+	})
+
+	if actionRecordExists(t, p, "charlie") {
+		t.Error("charlie should have been pruned (not in keep_actions)")
+	}
+	for _, name := range []string{"alpha", "bravo"} {
+		if !actionRecordExists(t, p, name) {
+			t.Errorf("%s should still exist after diff sync", name)
+		}
+	}
+}
+
+// TestSyncActions_keepActionsChunked exercises the real chunked flow: batch 0
+// carries the full keep_actions set plus the first chunk; a continuation batch
+// adds the rest. A pre-existing stale action ("zulu", not in keep_actions) must
+// be pruned, and every action in keep_actions must survive — including ones that
+// only arrive in the continuation batch and the batch-0 ones whose peers are
+// still pending when the prune runs.
+func TestSyncActions_keepActionsChunked(t *testing.T) {
+	h := newHandler(t)
+	const p = "keep-chunked-plugin"
+
+	seedTestPluginActions(t, h, p, []syncActionEntry{
+		{Name: "alpha", Description: "a"},
+		{Name: "bravo", Description: "b"},
+		{Name: "charlie", Description: "c"},
+		{Name: "zulu", Description: "stale, dropped this sync"},
+	})
+
+	full := []string{"alpha", "bravo", "charlie", "delta", "echo", "foxtrot"}
+
+	// Batch 0: first chunk + authoritative keep_actions (the full set).
+	mustSyncActions(t, h, "kc-batch0", syncActionsPayload{
+		PluginName: p,
+		Actions: []syncActionEntry{
+			{Name: "alpha", Description: "a"},
+			{Name: "bravo", Description: "b"},
+			{Name: "charlie", Description: "c"},
+		},
+		KeepActions: full,
+	})
+
+	// Continuation batch: remaining chunk, no pre-delete.
+	mustSyncActions(t, h, "kc-batch1", syncActionsPayload{
+		PluginName: p,
+		Actions: []syncActionEntry{
+			{Name: "delta", Description: "d"},
+			{Name: "echo", Description: "e"},
+			{Name: "foxtrot", Description: "f"},
+		},
+		IsContinuationBatch: true,
+	})
+
+	for _, name := range full {
+		if !actionRecordExists(t, p, name) {
+			t.Errorf("%s should be present after chunked diff sync", name)
+		}
+	}
+	if actionRecordExists(t, p, "zulu") {
+		t.Error("zulu should have been pruned by the batch-0 diff (not in keep_actions)")
+	}
+}
+
+// TestSyncActions_continuationBatchSkipsPreDelete verifies the fix for the
+// multi-batch sync truncation bug: when the orchestrator chunks a plugin's
+// actions across multiple sync_actions calls, batches 1..N must NOT pre-delete
+// the plugin's actions (which would wipe what batch 0 inserted). Only batch 0
+// performs the orphan-prune; subsequent batches are pure inserts.
+func TestSyncActions_continuationBatchSkipsPreDelete(t *testing.T) {
+	h := newHandler(t)
+
+	// Batch 0: insert 3 actions, IsContinuationBatch=false (pre-delete + insert).
+	batch0, _ := json.Marshal(syncActionsPayload{
+		PluginName: "multi-batch-plugin",
+		Actions: []syncActionEntry{
+			{Name: "alpha", Description: "Alpha action"},
+			{Name: "bravo", Description: "Bravo action"},
+			{Name: "charlie", Description: "Charlie action"},
+		},
+	})
+	if resp := h.Execute(plugin.Request{
+		ID: "sync-batch-0", Action: "sync_actions", Args: map[string]string{"payload": string(batch0)},
+	}); resp.Error != "" {
+		t.Fatalf("batch 0 error: %s", resp.Error)
+	}
+
+	// Batch 1: insert 3 more actions, IsContinuationBatch=true (insert only).
+	// Without the fix, batch 1's pre-delete would wipe alpha / bravo / charlie.
+	batch1, _ := json.Marshal(syncActionsPayload{
+		PluginName: "multi-batch-plugin",
+		Actions: []syncActionEntry{
+			{Name: "delta", Description: "Delta action"},
+			{Name: "echo", Description: "Echo action"},
+			{Name: "foxtrot", Description: "Foxtrot action"},
+		},
+		IsContinuationBatch: true,
+	})
+	if resp := h.Execute(plugin.Request{
+		ID: "sync-batch-1", Action: "sync_actions", Args: map[string]string{"payload": string(batch1)},
+	}); resp.Error != "" {
+		t.Fatalf("batch 1 error: %s", resp.Error)
+	}
+
+	waitSyncDrain(t, h, 10*time.Second)
+	time.Sleep(300 * time.Millisecond)
+
+	// All six actions from both batches must be present.
+	for _, name := range []string{"alpha", "bravo", "charlie", "delta", "echo", "foxtrot"} {
+		id := actionUUID("multi-batch-plugin", name)
+		objs, err := rawClient.Data().ObjectsGetter().
+			WithClassName(DefaultActionsCollection).
+			WithID(id).
+			Do(context.Background())
+		if err != nil {
+			t.Fatalf("get %s: %v", name, err)
+		}
+		if len(objs) == 0 {
+			t.Errorf("expected %s to be present after multi-batch sync, but it was deleted", name)
+		}
+	}
+}
+
+func TestSyncActions_emptyActions(t *testing.T) {
+	h := newHandler(t)
+	payload, _ := json.Marshal(syncActionsPayload{
+		PluginName: "empty-plugin",
+		Actions:    []syncActionEntry{},
+	})
+	resp := h.Execute(plugin.Request{
+		ID:     "sync-empty",
+		Action: "sync_actions",
+		Args:   map[string]string{"payload": string(payload)},
+	})
+	if resp.Error != "" {
+		t.Fatalf("Execute error: %s", resp.Error)
+	}
+	if !strings.Contains(resp.Content, `"queued":true`) {
+		t.Errorf("expected queued:true, got: %s", resp.Content)
+	}
+	waitSyncDrain(t, h, 10*time.Second)
+}
+
+func TestSyncActions_pruneAlsoWithoutInstructions(t *testing.T) {
+	// Verify a sync_actions call with keep_plugins works even when the new
+	// optional fields aren't present together — only KeepPlugins set, no
+	// ServerInstructions on this call.
+	h := newHandler(t)
+
+	// Seed an orphan.
+	payload, _ := json.Marshal(syncActionsPayload{
+		PluginName: "no-instr-orphan",
+		Actions:    []syncActionEntry{{Name: "act", Description: "x"}},
+	})
+	resp := h.Execute(plugin.Request{ID: "seed-noinstr", Action: "sync_actions", Args: map[string]string{"payload": string(payload)}})
+	if resp.Error != "" {
+		t.Fatalf("seed: %s", resp.Error)
+	}
+	waitSyncDrain(t, h, 10*time.Second)
+	time.Sleep(300 * time.Millisecond)
+
+	// Now sync a different plugin and prune.
+	payload, _ = json.Marshal(syncActionsPayload{
+		PluginName:  "no-instr-keep",
+		Actions:     []syncActionEntry{{Name: "act", Description: "x"}},
+		KeepPlugins: []string{"no-instr-keep"},
+	})
+	resp = h.Execute(plugin.Request{ID: "prune-noinstr", Action: "sync_actions", Args: map[string]string{"payload": string(payload)}})
+	if resp.Error != "" {
+		t.Fatalf("prune call: %s", resp.Error)
+	}
+	waitSyncDrain(t, h, 10*time.Second)
+	time.Sleep(300 * time.Millisecond)
+
+	orphanID := actionUUID("no-instr-orphan", "act")
+	got, err := rawClient.Data().ObjectsGetter().WithClassName(DefaultActionsCollection).WithID(orphanID).Do(context.Background())
+	if err == nil && len(got) != 0 {
+		t.Errorf("orphan still present without ServerInstructions path: %d records", len(got))
+	}
+}
+
 func TestSyncActions_serverInstructions(t *testing.T) {
 	h := newHandler(t)
 
@@ -397,11 +821,11 @@ func TestSyncActions_serverInstructions(t *testing.T) {
 func TestSyncActions_pruneOrphans(t *testing.T) {
 	h := newHandler(t)
 
-	// Seed two plugins, each contributing a server-instructions article. Orphan
-	// pruning now only touches KnowledgeArticles (the "mcp:<plugin>" records).
+	// Seed two plugins (each with one action and instructions).
 	for _, name := range []string{"prune-keep", "prune-orphan"} {
 		payload, _ := json.Marshal(syncActionsPayload{
 			PluginName:         name,
+			Actions:            []syncActionEntry{{Name: "act", Description: "x"}},
 			ServerInstructions: "instructions for " + name,
 		})
 		resp := h.Execute(plugin.Request{ID: "seed-" + name, Action: "sync_actions", Args: map[string]string{"payload": string(payload)}})
@@ -414,9 +838,9 @@ func TestSyncActions_pruneOrphans(t *testing.T) {
 
 	// Re-sync with keep_plugins listing only the kept plugin — orphan must vanish.
 	payload, _ := json.Marshal(syncActionsPayload{
-		PluginName:         "prune-keep",
-		ServerInstructions: "instructions for prune-keep",
-		KeepPlugins:        []string{"prune-keep"},
+		PluginName:  "prune-keep",
+		Actions:     []syncActionEntry{{Name: "act", Description: "x"}},
+		KeepPlugins: []string{"prune-keep"},
 	})
 	resp := h.Execute(plugin.Request{ID: "prune-call", Action: "sync_actions", Args: map[string]string{"payload": string(payload)}})
 	if resp.Error != "" {
@@ -425,10 +849,21 @@ func TestSyncActions_pruneOrphans(t *testing.T) {
 	waitSyncDrain(t, h, 10*time.Second)
 	time.Sleep(300 * time.Millisecond)
 
-	// KnowledgeArticles: kept plugin's server-instructions article survives,
-	// orphan's article is gone.
+	// MCPActions: kept plugin's action survives, orphan's action is gone.
+	keepActionID := actionUUID("prune-keep", "act")
+	got, err := rawClient.Data().ObjectsGetter().WithClassName(DefaultActionsCollection).WithID(keepActionID).Do(context.Background())
+	if err != nil || len(got) != 1 {
+		t.Errorf("kept action missing: err=%v len=%d", err, len(got))
+	}
+	orphanActionID := actionUUID("prune-orphan", "act")
+	got, err = rawClient.Data().ObjectsGetter().WithClassName(DefaultActionsCollection).WithID(orphanActionID).Do(context.Background())
+	if err == nil && len(got) != 0 {
+		t.Errorf("orphan action still present after prune: %d records", len(got))
+	}
+
+	// KnowledgeArticles: kept plugin's article survives, orphan's article is gone.
 	keepArticleID := serverInstructionsUUID("prune-keep")
-	got, err := rawClient.Data().ObjectsGetter().WithClassName(DefaultKnowledgeCollection).WithID(keepArticleID).Do(context.Background())
+	got, err = rawClient.Data().ObjectsGetter().WithClassName(DefaultKnowledgeCollection).WithID(keepArticleID).Do(context.Background())
 	if err != nil || len(got) != 1 {
 		t.Errorf("kept article missing: err=%v len=%d", err, len(got))
 	}
@@ -442,9 +877,10 @@ func TestSyncActions_pruneOrphans(t *testing.T) {
 func TestSyncActions_emptyKeepPluginsSkipsPrune(t *testing.T) {
 	h := newHandler(t)
 
-	// Seed one server-instructions article.
+	// Seed one action and one server-instructions article.
 	payload, _ := json.Marshal(syncActionsPayload{
 		PluginName:         "skip-prune",
+		Actions:            []syncActionEntry{{Name: "act", Description: "x"}},
 		ServerInstructions: "instructions for skip-prune",
 	})
 	resp := h.Execute(plugin.Request{ID: "seed-skip", Action: "sync_actions", Args: map[string]string{"payload": string(payload)}})
@@ -456,6 +892,7 @@ func TestSyncActions_emptyKeepPluginsSkipsPrune(t *testing.T) {
 	// Send an empty keep_plugins — must NOT trigger a delete-everything-in-class.
 	payload, _ = json.Marshal(syncActionsPayload{
 		PluginName:         "skip-prune",
+		Actions:            []syncActionEntry{{Name: "act", Description: "x"}},
 		ServerInstructions: "instructions for skip-prune",
 		KeepPlugins:        []string{},
 	})
@@ -466,7 +903,10 @@ func TestSyncActions_emptyKeepPluginsSkipsPrune(t *testing.T) {
 	waitSyncDrain(t, h, 10*time.Second)
 	time.Sleep(300 * time.Millisecond)
 
-	// Verify the seeded record still exists.
+	// Verify both seeded records still exist.
+	if !actionRecordExists(t, "skip-prune", "act") {
+		t.Error("action was pruned despite empty keep_plugins")
+	}
 	id := serverInstructionsUUID("skip-prune")
 	got, err := rawClient.Data().ObjectsGetter().WithClassName(DefaultKnowledgeCollection).WithID(id).Do(context.Background())
 	if err != nil || len(got) != 1 {
@@ -1095,7 +1535,9 @@ func TestSyncActions_knowledgeArticlesStaleSectionRemoved(t *testing.T) {
 	waitSyncDrain(t, h, 10*time.Second)
 	time.Sleep(300 * time.Millisecond)
 
-	// Re-sync without section-b — it must be cleared by the per-plugin pre-delete.
+	// Re-sync without section-b — it must be cleared by the stale-section diff
+	// prune (pruneStaleKnowledgeSections), which drops stored sections whose slug
+	// is no longer in this sync's knowledge_articles set.
 	payload, _ = json.Marshal(syncActionsPayload{
 		PluginName: "ka-stale-test",
 		KnowledgeArticles: []knowledgeArticleEntry{

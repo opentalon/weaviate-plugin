@@ -210,3 +210,37 @@ func TestConfigureTimeout_negativeFallsBackToDefault(t *testing.T) {
 		t.Errorf("expected default 2m for negative timeout, got %s", h.clientTimeout)
 	}
 }
+
+func TestDiffNotIn(t *testing.T) {
+	got := diffNotIn([]string{"a", "b", "c"}, []string{"b"})
+	if len(got) != 2 || got[0] != "a" || got[1] != "c" {
+		t.Errorf("diffNotIn: got %v, want [a c]", got)
+	}
+	if out := diffNotIn(nil, []string{"x"}); out != nil {
+		t.Errorf("diffNotIn(nil): got %v, want nil", out)
+	}
+	if out := diffNotIn([]string{"a"}, nil); len(out) != 1 || out[0] != "a" {
+		t.Errorf("diffNotIn empty keep: got %v, want [a]", out)
+	}
+}
+
+func TestActionUUID_deterministicAndDistinct(t *testing.T) {
+	// Deterministic: the same plugin/action pair always maps to the same object
+	// id — the property that lets a re-sync upsert in place (and lets this
+	// restored writer heal a corpus written by an older deployment).
+	first := actionUUID("timly", "list-items")
+	second := actionUUID("timly", "list-items")
+	if first != second {
+		t.Error("actionUUID must be deterministic")
+	}
+	if actionUUID("timly", "list-items") == actionUUID("timly", "list-assignments") {
+		t.Error("different actions must map to different ids")
+	}
+	if actionUUID("timly", "list-items") == actionUUID("other", "list-items") {
+		t.Error("different plugins must map to different ids")
+	}
+	// Distinct namespace from the knowledge ids: the two id spaces never collide.
+	if actionUUID("timly", "x") == knowledgeArticleUUID("timly", "x") {
+		t.Error("action and knowledge id spaces must be disjoint")
+	}
+}
