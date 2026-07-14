@@ -23,10 +23,25 @@ import (
 // DefaultKnowledgeCollection is the default class name for the knowledge base.
 const DefaultKnowledgeCollection = "KnowledgeArticles"
 
+// DefaultActionsCollection is the default class name for the MCP tool corpus —
+// one record per plugin action (tool schema), kept in lockstep with the
+// orchestrator's registry by the periodic capability sync. The corpus is the
+// semantically searchable copy of every tool description; execution and the
+// prompt catalog read the registry, not this class.
+const DefaultActionsCollection = "MCPActions"
+
 // articleNS is a UUID v5 namespace for deterministic KnowledgeArticles IDs
 // generated from the knowledge sync (e.g. one article per plugin's MCP server
 // instructions, one per contributed knowledge section).
 var articleNS = uuid.MustParse("e5f9a2b3-6c4d-5e7f-a0b1-2c3d4e5f6a7b")
+
+// actionNS is a UUID v5 namespace for deterministic MCP action object IDs.
+// The value is unchanged from the original tool sync, so upserts from this
+// restored path address the very same objects an older deployment wrote — a
+// stale corpus self-heals in place on the first sync cycle (changed docs
+// rewritten via the contentHash diff, missing ones inserted, removed ones
+// pruned) without any manual data migration.
+var actionNS = uuid.MustParse("d4e8f1a2-5b3c-4d6e-9f0a-1b2c3d4e5f6a")
 
 // MCPSourcePrefix tags KnowledgeArticles records that were generated from a
 // plugin's MCP server-instructions text rather than authored manually. Used
@@ -45,6 +60,7 @@ type Config struct {
 	Host                string         `json:"host"`
 	Scheme              string         `json:"scheme"`
 	KnowledgeCollection string         `json:"knowledge_collection"`
+	ActionsCollection   string         `json:"actions_collection"`
 	AutoCreateSchema    *bool          `json:"auto_create_schema"`
 	HTTPAddr            string         `json:"http_addr"`
 	Token               string         `json:"token"`
@@ -72,6 +88,7 @@ type syncStatusState struct {
 type WeaviateHandler struct {
 	client              *weaviate.Client
 	knowledgeCollection string
+	actionsCollection   string
 	httpAddr            string
 	token               string
 	vectorizer          string
@@ -134,6 +151,11 @@ func (h *WeaviateHandler) Configure(configJSON string) error {
 		h.knowledgeCollection = DefaultKnowledgeCollection
 	}
 
+	h.actionsCollection = cfg.ActionsCollection
+	if h.actionsCollection == "" {
+		h.actionsCollection = DefaultActionsCollection
+	}
+
 	h.httpAddr = cfg.HTTPAddr
 	h.token = cfg.Token
 
@@ -147,7 +169,8 @@ func (h *WeaviateHandler) Configure(configJSON string) error {
 		return fmt.Errorf("config.token is required when http_addr is set")
 	}
 
-	log.Printf("weaviate-plugin: vectorizer=%s knowledge_collection=%s", h.vectorizer, h.knowledgeCollection)
+	log.Printf("weaviate-plugin: vectorizer=%s knowledge_collection=%s actions_collection=%s",
+		h.vectorizer, h.knowledgeCollection, h.actionsCollection)
 
 	autoCreate := cfg.AutoCreateSchema == nil || *cfg.AutoCreateSchema
 	if autoCreate {
@@ -158,8 +181,8 @@ func (h *WeaviateHandler) Configure(configJSON string) error {
 		log.Println("weaviate-plugin: schemas ready")
 	}
 
-	// Start the background sync worker. All knowledge-sync calls are enqueued
-	// here so the orchestrator returns immediately.
+	// Start the background sync worker. All corpus-sync calls (tool schemas +
+	// knowledge) are enqueued here so the orchestrator returns immediately.
 	h.syncJobCh = make(chan syncJob, 64)
 	go h.runSyncWorker(context.Background())
 
@@ -172,19 +195,44 @@ func (h *WeaviateHandler) Configure(configJSON string) error {
 		}()
 	}
 
-	log.Printf("weaviate-plugin: init done (Configure) host=%s://%s knowledge_collection=%s http=%s",
-		cfg.Scheme, cfg.Host, h.knowledgeCollection, h.httpAddr)
+	log.Printf("weaviate-plugin: init done (Configure) host=%s://%s knowledge_collection=%s actions_collection=%s http=%s",
+		cfg.Scheme, cfg.Host, h.knowledgeCollection, h.actionsCollection, h.httpAddr)
 
 	return nil
 }
 
-// ensureSchemas creates the KnowledgeArticles collection if it doesn't exist.
+// ensureSchemas creates the MCPActions and KnowledgeArticles collections if
+// they don't exist.
 func (h *WeaviateHandler) ensureSchemas(ctx context.Context) error {
 	// Serialize against a concurrent caller (startup vs. refresh) so the
 	// read-then-add-missing-property reconcile in ensureClass is atomic.
 	h.schemaMu.Lock()
 	defer h.schemaMu.Unlock()
 
+	// Property set matches the class as originally created, so ensureClass on a
+	// live deployment that still carries the old MCPActions class reconciles to
+	// a no-op instead of fighting the existing schema.
+	//
+	// pluginName is word-tokenized (NOT field-tokenized like KnowledgeArticles'
+	// source). The action prunes filter on it with Equal, and Weaviate's Equal
+	// on word-tokenized text matches per-token — so if one plugin's name were a
+	// token-subset of another's (e.g. "timly" vs "timly-admin"), a prune scoped
+	// to the shorter name could also hit the longer plugin's rows. Left as-is on
+	// purpose: it matches the class the live corpus already carries (changing the
+	// tokenization would break the reconcile-no-op above), no current plugin
+	// names token-overlap, and a wrongly wiped kept plugin self-heals on its next
+	// sync. If plugin names ever risk overlap, add a client-side exact-match
+	// guard on the delete paths (the pattern KnowledgeArticles' prunes already
+	// use for source) rather than re-tokenizing.
+	if err := h.ensureClass(ctx, h.actionsCollection, []*wmodels.Property{
+		{Name: "pluginName", DataType: []string{"text"}},
+		{Name: "actionName", DataType: []string{"text"}},
+		{Name: "description", DataType: []string{"text"}},
+		{Name: "parameters", DataType: []string{"text"}},
+		h.contentHashProperty(),
+	}); err != nil {
+		return err
+	}
 	return h.ensureClass(ctx, h.knowledgeCollection, []*wmodels.Property{
 		{Name: "title", DataType: []string{"text"}},
 		// slug is the stable per-article identifier (the MCP server's article
@@ -207,9 +255,9 @@ func (h *WeaviateHandler) ensureSchemas(ctx context.Context) error {
 }
 
 // contentHashProperty is the per-doc change-detection digest stored on every
-// knowledge record. It is excluded from the embedding (skip): it's an opaque
-// hex digest, not semantic content, so vectorizing it would only add noise to
-// retrieval.
+// corpus record (actions and knowledge alike). It is excluded from the
+// embedding (skip): it's an opaque hex digest, not semantic content, so
+// vectorizing it would only add noise to retrieval.
 func (h *WeaviateHandler) contentHashProperty() *wmodels.Property {
 	return &wmodels.Property{
 		Name:     "contentHash",
@@ -283,13 +331,13 @@ func (h *WeaviateHandler) ensureProperties(ctx context.Context, name string, wan
 func (h *WeaviateHandler) Capabilities() plugin.CapabilitiesMsg {
 	return plugin.CapabilitiesMsg{
 		Name:        "weaviate",
-		Description: "Knowledge plugin for a Weaviate-backed knowledge base. Ingests and retrieves product docs and knowledge articles: semantic search and exact-slug fetch via ask_knowledge, the slug+title catalog via list_knowledge_titles, MCP server-instruction search, and the per-plugin knowledge sync.",
+		Description: "Corpus plugin for a Weaviate-backed vector store. Keeps the searchable copies in sync: every plugin's tool schemas in MCPActions and its knowledge in KnowledgeArticles (semantic search and exact-slug fetch via ask_knowledge, the slug+title catalog via list_knowledge_titles, MCP server-instruction search).",
 		Actions: []plugin.ActionMsg{
 			{
 				Name:        "sync_actions",
-				Description: "Ingest a plugin's MCP server instructions and knowledge articles into the KnowledgeArticles collection.",
+				Description: "Upsert a plugin's tool schemas into the MCPActions collection and its MCP server instructions + knowledge articles into KnowledgeArticles. Stale entries are diff-pruned.",
 				Parameters: []plugin.ParameterMsg{
-					{Name: "payload", Description: `JSON: {"plugin_name":"...","server_instructions":"...","knowledge_articles":[{"id":"...","title":"...","content":"..."}]}`, Type: "string", Required: true},
+					{Name: "payload", Description: `JSON: {"plugin_name":"...","actions":[{"name":"...","description":"...","parameters":...}],"keep_actions":["..."],"server_instructions":"...","knowledge_articles":[{"id":"...","title":"...","content":"..."}]}`, Type: "string", Required: true},
 				},
 			},
 			{
@@ -349,7 +397,7 @@ func (h *WeaviateHandler) Capabilities() plugin.CapabilitiesMsg {
 			},
 			{
 				Name:        "refresh",
-				Description: "Re-create the KnowledgeArticles collection if it was deleted externally. Called automatically on session clear.",
+				Description: "Re-create the MCPActions / KnowledgeArticles collections if they were deleted externally. Called automatically on session clear.",
 				Parameters:  []plugin.ParameterMsg{},
 			},
 		},
@@ -699,13 +747,14 @@ func extractItems(result interface{}, className string) []map[string]interface{}
 // RAG ingestion actions
 // ---------------------------------------------------------------------------
 
-// syncActionsPayload mirrors the JSON shape sent by opentalon's orchestrator.
-// The plugin only ingests the knowledge fields (server instructions + per-section
-// knowledge articles); any tool-schema fields the orchestrator still sends are
-// ignored. All fields except plugin_name are optional.
+// syncActionsPayload mirrors the JSON shape sent by opentalon's orchestrator:
+// the plugin's tool schemas (actions, chunked across batches) plus its
+// knowledge fields (server instructions + per-section knowledge articles).
+// All fields except plugin_name are optional.
 type syncActionsPayload struct {
-	PluginName         string `json:"plugin_name"`
-	ServerInstructions string `json:"server_instructions,omitempty"`
+	PluginName         string            `json:"plugin_name"`
+	Actions            []syncActionEntry `json:"actions,omitempty"`
+	ServerInstructions string            `json:"server_instructions,omitempty"`
 	// KnowledgeArticles ships per-section knowledge contributed by the plugin
 	// via the MCP `initialize._meta.knowledge_articles` field. Each entry is
 	// stored as one KnowledgeArticles record with source
@@ -720,6 +769,25 @@ type syncActionsPayload struct {
 	// false) keeps the orphan-prune semantic. Older orchestrators omit the
 	// field entirely — default false matches the legacy single-batch behaviour.
 	IsContinuationBatch bool `json:"is_continuation_batch,omitempty"`
+	// KeepActions is the authoritative full list of the plugin's current action
+	// names. The action set is chunked across batches, so no single call sees
+	// every action — the orchestrator therefore sends the complete list on
+	// batch 0. When present, the pre-sync cleanup deletes only stored actions
+	// NOT in this list (an in-place diff) instead of the legacy
+	// delete-all-then-reinsert. A still-valid action that has not been
+	// re-upserted yet (it arrives in a later batch) is matched by name and left
+	// in place, so a reader on a peer pod never sees the plugin's tools briefly
+	// vanish during a resync. Older orchestrators omit it — the plugin then
+	// falls back to the blanket pre-delete (correct, but with the old window).
+	KeepActions []string `json:"keep_actions,omitempty"`
+}
+
+// syncActionEntry is one tool schema in sync_actions's actions[]: the wire
+// name, the full description, and the raw JSON parameter schema.
+type syncActionEntry struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description"`
+	Parameters  json.RawMessage `json:"parameters"`
 }
 
 // knowledgeArticleEntry is one section payload from sync_actions's
@@ -761,10 +829,10 @@ func (h *WeaviateHandler) enqueueSyncActions(req plugin.Request) plugin.Response
 	return plugin.Response{CallID: req.ID, Content: `{"queued":true,"action":"sync_actions"}`}
 }
 
-// syncActionsWork performs the actual knowledge-sync Weaviate operations.
-// Called by the background worker goroutine. It ingests the plugin's MCP
-// server instructions and its per-section knowledge articles into the
-// KnowledgeArticles collection; tool schemas are not stored.
+// syncActionsWork performs the actual corpus-sync Weaviate operations.
+// Called by the background worker goroutine. It upserts the plugin's tool
+// schemas into the MCPActions collection and its MCP server instructions +
+// per-section knowledge articles into the KnowledgeArticles collection.
 func (h *WeaviateHandler) syncActionsWork(reqID string, raw string) error {
 	var payload syncActionsPayload
 	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
@@ -773,11 +841,74 @@ func (h *WeaviateHandler) syncActionsWork(reqID string, raw string) error {
 
 	ctx := context.Background()
 
-	// Build candidate docs (server instructions + knowledge sections), each
-	// tagged with a contentHash over its own canonical content. The per-doc skip
-	// below re-vectorizes only the docs whose content actually changed. Stale
-	// sections are diff-pruned on batch 0 (knowledge is not chunked); whole
-	// removed plugins are pruned via pruneOrphans below.
+	// Remove the plugin's removed/renamed actions before re-upserting so they
+	// don't linger as stale entries. Two strategies, chosen by whether the
+	// orchestrator sent the authoritative action list (keep_actions):
+	//
+	//   - Diff prune (keep_actions present): delete only the stored actions that
+	//     are no longer in the current set. Actions that still exist — including
+	//     ones that have not been re-upserted yet because they arrive in a later
+	//     continuation batch — are matched by name and left untouched. There is
+	//     no moment where the plugin's actions are absent, so a reader on a peer
+	//     pod always sees a complete tool set during a resync.
+	//
+	//   - Blanket pre-delete (keep_actions absent — older orchestrator, or a
+	//     plugin that dropped to zero actions but still ships instructions or
+	//     knowledge this sync): delete everything for the plugin; the per-doc
+	//     pass below then re-writes the current set from scratch (every doc reads
+	//     as new). Legacy behaviour with a brief actions-absent window; kept for
+	//     back-compat. NB: a plugin that drops to zero actions AND zero
+	//     instructions AND zero knowledge sends no sync at all (the orchestrator
+	//     short-circuits), so its now-stale action rows are cleaned only by the
+	//     inter-plugin pruneOrphans when it also leaves keep_plugins — an
+	//     orchestrator-side edge, not handled here.
+	//
+	// Both run only on batch 0 (IsContinuationBatch=false): batch 0 carries the
+	// authoritative keep_actions, and the diff is order-independent, so later
+	// batches only need to send their chunk.
+	if !payload.IsContinuationBatch {
+		if payload.KeepActions != nil {
+			if err := h.pruneStaleActions(ctx, payload.PluginName, payload.KeepActions); err != nil {
+				log.Printf("weaviate-plugin: sync_actions: prune stale actions for %s failed: %v", payload.PluginName, err)
+			}
+		} else {
+			_, delErr := h.client.Batch().ObjectsBatchDeleter().
+				WithClassName(h.actionsCollection).
+				WithWhere(filters.Where().
+					WithPath([]string{"pluginName"}).
+					WithOperator(filters.Equal).
+					WithValueText(payload.PluginName)).
+				Do(ctx)
+			if delErr != nil {
+				log.Printf("weaviate-plugin: sync_actions: failed to delete old actions for %s: %v", payload.PluginName, delErr)
+			}
+		}
+	}
+
+	// Build candidate docs (actions + server instructions + knowledge sections),
+	// each tagged with a contentHash over its own canonical content. The per-doc
+	// skip below re-vectorizes only the docs whose content actually changed.
+	// Stale actions/sections are diff-pruned on batch 0; whole removed plugins
+	// are pruned via pruneOrphans below.
+	actionObjs := make([]*wmodels.Object, 0, len(payload.Actions))
+	for _, a := range payload.Actions {
+		params := ""
+		if len(a.Parameters) > 0 {
+			params = string(a.Parameters)
+		}
+		actionObjs = append(actionObjs, &wmodels.Object{
+			Class: h.actionsCollection,
+			ID:    strfmt.UUID(actionUUID(payload.PluginName, a.Name)),
+			Properties: map[string]interface{}{
+				"pluginName":  payload.PluginName,
+				"actionName":  a.Name,
+				"description": a.Description,
+				"parameters":  params,
+				"contentHash": contentSHA256(a.Name + "\x00" + a.Description + "\x00" + params),
+			},
+		})
+	}
+
 	knowledgeObjs := make([]*wmodels.Object, 0, len(payload.KnowledgeArticles)+1)
 
 	// The plugin's server-level instructions text (e.g. an MCP server's
@@ -841,12 +972,14 @@ func (h *WeaviateHandler) syncActionsWork(reqID string, raw string) error {
 	// (absent → written), changed doc (hash differs → rewritten), unchanged doc
 	// (hash equal → skipped) — and makes an unchanged restart a no-op, because the
 	// hashes live in Weaviate and survive a process restart. Stale docs (no longer
-	// in the source) are removed by the prunes above (sections) and below
+	// in the source) are removed by the prunes above (actions/sections) and below
 	// (whole plugins).
+	changedActions, skippedActions := h.filterUnchangedDocs(ctx, h.actionsCollection, actionObjs)
 	changedKnowledge, skippedKnowledge := h.filterUnchangedDocs(ctx, h.knowledgeCollection, knowledgeObjs)
 
-	if len(changedKnowledge) > 0 {
-		results, err := h.client.Batch().ObjectsBatcher().WithObjects(changedKnowledge...).Do(ctx)
+	objects := append(changedActions, changedKnowledge...)
+	if len(objects) > 0 {
+		results, err := h.client.Batch().ObjectsBatcher().WithObjects(objects...).Do(ctx)
 		if err != nil {
 			return fmt.Errorf("batch sync: %v", err)
 		}
@@ -865,8 +998,9 @@ func (h *WeaviateHandler) syncActionsWork(reqID string, raw string) error {
 		pruned = n
 	}
 
-	log.Printf("weaviate-plugin: sync_actions: completed for %s (req=%s knowledge_written=%d/%d instructions=%v skipped=%d pruned=%d)",
-		payload.PluginName, reqID, len(changedKnowledge), len(knowledgeObjs), hasInstructions, skippedKnowledge, pruned)
+	log.Printf("weaviate-plugin: sync_actions: completed for %s (req=%s actions_written=%d/%d knowledge_written=%d/%d instructions=%v skipped=%d pruned=%d)",
+		payload.PluginName, reqID, len(changedActions), len(actionObjs), len(changedKnowledge), len(knowledgeObjs),
+		hasInstructions, skippedActions+skippedKnowledge, pruned)
 	return nil
 }
 
@@ -987,9 +1121,9 @@ func (h *WeaviateHandler) getSyncStatus(req plugin.Request) plugin.Response {
 	return plugin.Response{CallID: req.ID, Content: string(body)}
 }
 
-// pruneOrphans deletes any auto-generated KnowledgeArticles (those with source
-// matching MCPSourcePrefix or MCPKnowledgeSourcePrefix) whose plugin is NOT in
-// keep.
+// pruneOrphans deletes any MCPActions and any auto-generated KnowledgeArticles
+// (those with source matching MCPSourcePrefix or MCPKnowledgeSourcePrefix)
+// whose plugin is NOT in keep.
 //
 // Implementation note: instead of a single batch-delete with a NotEqual filter
 // (Weaviate's NotEqual on tokenized text fields produces unreliable results
@@ -1010,6 +1144,22 @@ func (h *WeaviateHandler) pruneOrphans(ctx context.Context, keep []string) (int,
 
 	total := 0
 	var firstErr error
+
+	// MCPActions: discover distinct pluginNames, delete each orphan by Equal.
+	plugins, err := h.distinctValues(ctx, h.actionsCollection, "pluginName", nil)
+	if err != nil {
+		firstErr = fmt.Errorf("MCPActions distinct: %w", err)
+	}
+	for _, p := range plugins {
+		if keepSet[p] {
+			continue
+		}
+		n, err := h.batchDeleteEqual(ctx, h.actionsCollection, "pluginName", p)
+		total += n
+		if err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("MCPActions delete %s: %w", p, err)
+		}
+	}
 
 	// KnowledgeArticles, server-instructions records: scope to MCP-managed
 	// (source LIKE "mcp:*"), discover distinct sources, delete each orphan
@@ -1132,6 +1282,13 @@ func (h *WeaviateHandler) batchDeleteEqual(ctx context.Context, class, path, val
 	return 0, nil
 }
 
+// actionUUID returns a deterministic UUID v5 for one plugin action, so a
+// re-synced action upserts its existing MCPActions record in place instead of
+// accumulating duplicates.
+func actionUUID(pluginName, actionName string) string {
+	return uuid.NewSHA1(actionNS, []byte(pluginName+"/"+actionName)).String()
+}
+
 // serverInstructionsUUID returns a deterministic UUID v5 for the
 // per-plugin server-instructions article. Re-runs upsert in place.
 func serverInstructionsUUID(pluginName string) string {
@@ -1239,6 +1396,57 @@ func splitCSV(s string) []string {
 	for _, p := range parts {
 		if p = strings.TrimSpace(p); p != "" {
 			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// pruneStaleActions deletes the plugin's stored actions whose name is no
+// longer in keep — the in-place diff behind the keep_actions contract (see
+// syncActionsPayload.KeepActions).
+func (h *WeaviateHandler) pruneStaleActions(ctx context.Context, pluginName string, keep []string) error {
+	pluginScope := filters.Where().
+		WithPath([]string{"pluginName"}).
+		WithOperator(filters.Equal).
+		WithValueText(pluginName)
+	existing, err := h.distinctValues(ctx, h.actionsCollection, "actionName", pluginScope)
+	if err != nil {
+		return fmt.Errorf("list existing actions: %w", err)
+	}
+	stale := diffNotIn(existing, keep)
+	// Best-effort, matching pruneOrphans: keep deleting the rest even if one
+	// delete fails, so a single un-deletable record can't permanently block the
+	// cleanup of every record after it. Surface the first error to the caller.
+	pruned := 0
+	var firstErr error
+	for _, name := range stale {
+		if err := h.client.Data().Deleter().
+			WithClassName(h.actionsCollection).
+			WithID(actionUUID(pluginName, name)).
+			Do(ctx); err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("delete stale action %q: %w", name, err)
+			}
+			continue
+		}
+		pruned++
+	}
+	if pruned > 0 {
+		log.Printf("weaviate-plugin: sync_actions: pruned %d stale action(s) for %s", pruned, pluginName)
+	}
+	return firstErr
+}
+
+// diffNotIn returns the elements of a that are not in b.
+func diffNotIn(a, b []string) []string {
+	keep := make(map[string]struct{}, len(b))
+	for _, v := range b {
+		keep[v] = struct{}{}
+	}
+	var out []string
+	for _, v := range a {
+		if _, ok := keep[v]; !ok {
+			out = append(out, v)
 		}
 	}
 	return out

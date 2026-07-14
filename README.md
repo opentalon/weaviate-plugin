@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/opentalon/weaviate-plugin/actions/workflows/ci.yml/badge.svg)](https://github.com/opentalon/weaviate-plugin/actions/workflows/ci.yml)
 
-An [OpenTalon](https://github.com/opentalon/opentalon) plugin that serves a [Weaviate](https://github.com/weaviate/weaviate)-backed knowledge base. It lets the LLM pull knowledge articles on demand and ingests a plugin's MCP server instructions and knowledge articles into the knowledge collection.
+An [OpenTalon](https://github.com/opentalon/opentalon) plugin that serves a [Weaviate](https://github.com/weaviate/weaviate)-backed corpus. It lets the LLM pull knowledge articles on demand, and keeps the searchable copies in sync: every plugin's tool schemas land in the `MCPActions` collection, its MCP server instructions and knowledge articles in `KnowledgeArticles`.
 
 ## Actions
 
@@ -11,15 +11,17 @@ An [OpenTalon](https://github.com/opentalon/opentalon) plugin that serves a [Wea
 | `weaviate.ask_knowledge` | LLM tool | Search the knowledge base by `query`, or fetch one article exactly by `slug` |
 | `weaviate.list_knowledge_titles` | LLM tool | List the slug + title of every knowledge article (the always-on catalog) |
 | `weaviate.search_instructions` | LLM tool | Search synced MCP server-instruction articles |
-| `weaviate.sync_actions` | orchestrator | Syncs a plugin's MCP server instructions + knowledge articles into the `KnowledgeArticles` collection. Per-doc hash skip + orphan prune |
+| `weaviate.sync_actions` | orchestrator | Syncs a plugin's tool schemas into `MCPActions` and its MCP server instructions + knowledge articles into `KnowledgeArticles`. Per-doc hash skip + stale/orphan prune |
 | `weaviate.sync_status` | orchestrator | Background sync worker counters |
 | `weaviate.ingest` | LLM tool / API | Insert a single knowledge article into the `KnowledgeArticles` collection |
 | `weaviate.ingest_batch` | LLM tool / API | Batch insert multiple knowledge articles |
-| `weaviate.refresh` | orchestrator | Re-create the `KnowledgeArticles` collection if deleted externally |
+| `weaviate.refresh` | orchestrator | Re-create the `MCPActions` / `KnowledgeArticles` collections if deleted externally |
 
-> Tool retrieval lives in the orchestrator's tool registry; this plugin serves
-> knowledge only. There is no preparer / RAG pre-pass action and no generic
-> search over an arbitrary collection.
+> Tool *execution* and the prompt catalog live in the orchestrator's tool
+> registry; `MCPActions` is the semantically searchable copy of every tool
+> description, kept in lockstep by the periodic capability sync. There is no
+> preparer / RAG pre-pass action and no generic search over an arbitrary
+> collection.
 
 ## Configuration
 
@@ -40,7 +42,8 @@ plugins:
 
       # Knowledge base
       knowledge_collection: "KnowledgeArticles"  # collection for knowledge articles (default)
-      auto_create_schema: true                   # auto-create KnowledgeArticles on startup (default true)
+      actions_collection: "MCPActions"           # collection for synced tool schemas (default)
+      auto_create_schema: true                   # auto-create MCPActions + KnowledgeArticles on startup (default true)
 
       # Client timeout
       timeout: "2m"                # Weaviate HTTP client timeout (default 2m); increase for large batch syncs
@@ -50,7 +53,7 @@ plugins:
       token: "my-secret-token"     # Bearer token — required when http_addr is set
 ```
 
-All config fields have defaults (`host: localhost:8080`, `scheme: http`, `knowledge_collection: KnowledgeArticles`, `vectorizer: text2vec-transformers`).
+All config fields have defaults (`host: localhost:8080`, `scheme: http`, `knowledge_collection: KnowledgeArticles`, `actions_collection: MCPActions`, `vectorizer: text2vec-transformers`).
 
 ### Observability
 
@@ -110,13 +113,14 @@ Weaviate's legacy English-only word-embedding vectorizer. Not recommended for Ge
 
 ### Auto-schema creation
 
-When `auto_create_schema` is `true` (the default), the plugin creates the knowledge collection on startup if it doesn't already exist:
+When `auto_create_schema` is `true` (the default), the plugin creates both corpus collections on startup if they don't already exist:
 
 | Collection | Properties | Purpose |
 |---|---|---|
+| `MCPActions` | `pluginName`, `actionName`, `description`, `parameters`, `contentHash` | The searchable copy of every plugin's tool schemas, kept in lockstep with the orchestrator's registry by the capability sync |
 | `KnowledgeArticles` | `title`, `slug`, `content`, `source`, `tags`, `contentHash` | Domain knowledge, how-to guides, and synced MCP server instructions |
 
-The collection is created with the configured `vectorizer` and `module_config`. Set `auto_create_schema: false` to manage the schema manually.
+Both collections are created with the configured `vectorizer` and `module_config`. Set `auto_create_schema: false` to manage the schema manually.
 
 ## HTTP Ingestion API
 
@@ -155,7 +159,7 @@ Response: `{"ingested":2}`
 
 ### POST /api/v1/actions/sync
 
-Sync a plugin's MCP server instructions and knowledge articles into the KnowledgeArticles collection. Uses deterministic UUIDs so repeated syncs upsert rather than duplicate.
+Sync a plugin's tool schemas into the `MCPActions` collection and its MCP server instructions + knowledge articles into `KnowledgeArticles`. Uses deterministic UUIDs so repeated syncs upsert rather than duplicate.
 
 ```bash
 curl -X POST http://localhost:8081/api/v1/actions/sync \
@@ -163,6 +167,10 @@ curl -X POST http://localhost:8081/api/v1/actions/sync \
   -H "Content-Type: application/json" \
   -d '{
     "plugin_name": "jira",
+    "actions": [
+      {"name": "create_issue", "description": "Open a ticket", "parameters": {"type":"object"}}
+    ],
+    "keep_actions": ["create_issue"],
     "server_instructions": "Use create_issue to open a ticket; statuses follow Open → In Progress → Done.",
     "knowledge_articles": [
       {"id": "workflow", "title": "Issue workflow", "content": "Issues move Open → In Progress → Review → Done."}
@@ -173,7 +181,7 @@ curl -X POST http://localhost:8081/api/v1/actions/sync \
 
 Response: `{"queued":true,"action":"sync_actions"}` (the actual write runs on the background worker; poll `GET /api/v1/sync/status`).
 
-The server-instructions article is stored with source `mcp:<plugin>`; each `knowledge_articles[]` entry is stored with source `mcp-knowledge:<plugin>:<id>` and slug `<id>`. On batch 0, knowledge sections dropped since the last sync are pruned, and whole plugins absent from `keep_plugins` are pruned. Each document carries a `contentHash`, so an unchanged sync re-vectorizes nothing.
+Each `actions[]` entry is upserted into `MCPActions` (deterministic per-plugin/action UUID); the server-instructions article is stored with source `mcp:<plugin>` and each `knowledge_articles[]` entry with source `mcp-knowledge:<plugin>:<id>` and slug `<id>`. On batch 0, actions absent from `keep_actions` are diff-pruned (or, when `keep_actions` is omitted, the plugin's actions are pre-deleted then re-inserted), knowledge sections dropped since the last sync are pruned, and whole plugins absent from `keep_plugins` are pruned. Each document carries a `contentHash`, so an unchanged sync re-vectorizes nothing.
 
 ## Install
 
@@ -272,14 +280,14 @@ Integration tests (build tag `integration`, need a live Weaviate) cover:
 
 | Area | What it checks |
 |---|---|
-| Capabilities | Plugin declares the correct name and the knowledge-only action set |
+| Capabilities | Plugin declares the correct name and action set |
 | Configure | Defaults, custom knowledge collection name, bad-JSON error, `http_addr` requires token, auto-schema creation + idempotency |
 | `ask_knowledge` | Semantic search, exact-slug fetch, source filter, limit override, no-results, missing-query error |
 | `list_knowledge_titles` | Returns the slug+title catalog |
-| `sync_actions` (knowledge sync) | Server-instructions + knowledge-article ingestion, stale-section pruning, orphan-plugin pruning, disjoint source-prefix scopes, missing payload/plugin_name errors |
+| `sync_actions` (corpus sync) | Tool-schema upsert into `MCPActions` (insert, hash-skip, update, stale-action + orphan-plugin pruning), server-instructions + knowledge-article ingestion, stale-section pruning, disjoint source-prefix scopes, missing payload/plugin_name errors |
 | `ingest` / `ingest_batch` | Single + batch article ingestion, validation, invalid-skip |
 | HTTP API | Article/batch/sync-actions ingestion with token auth, 401 on bad token, 400 on bad JSON, pass-through when no token configured |
-| `refresh` | Re-creates the knowledge collection |
+| `refresh` | Re-creates both collections |
 
 ## Wiring into OpenTalon
 
@@ -298,7 +306,7 @@ plugins:
       token: "my-secret-token"
 ```
 
-The orchestrator can call `sync_actions` at startup to ingest each plugin's MCP server instructions and knowledge articles into the `KnowledgeArticles` collection. External systems can push knowledge articles via the HTTP API.
+The orchestrator calls `sync_actions` on every capability refresh (~15 min) to keep each plugin's tool schemas in `MCPActions` and its MCP server instructions + knowledge articles in `KnowledgeArticles`. External systems can push knowledge articles via the HTTP API.
 
 ## Kubernetes Deployment (ArgoCD)
 
